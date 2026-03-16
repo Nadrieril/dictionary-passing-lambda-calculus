@@ -96,21 +96,34 @@ fn parse_lambda(input: &str) -> IResult<&str, Expr> {
     .parse(input)
 }
 
-/// `fn(x: A) -> B`
+/// `fn(x: A) -> B` or `fn(A) -> B` (shorthand for `fn(_: A) -> B`)
 fn parse_pi(input: &str) -> IResult<&str, Expr> {
-    map(
-        (
-            keyword("fn"),
-            ws(nom_char('(')),
-            variable,
-            ws(nom_char(':')),
-            parse_expr,
-            ws(nom_char(')')),
-            ws(tag("->")),
-            parse_expr,
+    alt((
+        map(
+            (
+                keyword("fn"),
+                ws(nom_char('(')),
+                variable,
+                ws(nom_char(':')),
+                parse_expr,
+                ws(nom_char(')')),
+                ws(tag("->")),
+                parse_expr,
+            ),
+            |(_, _, x, _, t, _, _, e)| Pi(__((x, t, e))),
         ),
-        |(_, _, x, _, t, _, _, e)| Pi(__((x, t, e))),
-    )
+        map(
+            (
+                keyword("fn"),
+                ws(nom_char('(')),
+                parse_expr,
+                ws(nom_char(')')),
+                ws(tag("->")),
+                parse_expr,
+            ),
+            |(_, _, t, _, _, e)| Pi(__((Variable::User("_"), t, e))),
+        ),
+    ))
     .parse(input)
 }
 
@@ -276,5 +289,15 @@ mod tests {
             let output = expr.to_string();
             assert_eq!(output, input, "roundtrip failed for {input:?}");
         }
+    }
+
+    #[test]
+    fn test_pi_shorthand() {
+        // `fn(A) -> B` parses as `fn(_: A) -> B`
+        assert_eq!(parse("fn(N) -> N").unwrap().to_string(), "fn(_: N) -> N");
+        assert_eq!(
+            parse("fn(fn(A) -> B) -> C").unwrap().to_string(),
+            "fn(_: fn(_: A) -> B) -> C"
+        );
     }
 }
