@@ -255,7 +255,7 @@ impl Context {
     /// Typecheck then normalize the value.
     fn normalize(&mut self, e: Expr) -> Expr {
         let _ = self.infer_type(e);
-        self.normalize_only(e)
+        self.normalize_no_typeck(e)
     }
     /// Weak head normal form: reduce the outermost redex only.
     fn whnf(&mut self, e: Expr) -> Expr {
@@ -289,28 +289,35 @@ impl Context {
         }
     }
     /// Full normalization to normal form. Uses whnf first, then recurses.
-    fn normalize_only(&mut self, e: Expr) -> Expr {
+    fn normalize_no_typeck(&mut self, e: Expr) -> Expr {
         match self.whnf(e) {
             Var(x) => Var(x),
             Type(k) => Type(k),
-            App(e1, e2) => App(__(self.normalize_only(*e1)), __(self.normalize_only(*e2))),
+            App(e1, e2) => App(
+                __(self.normalize_no_typeck(*e1)),
+                __(self.normalize_no_typeck(*e2)),
+            ),
             Pi(a) => Pi(self.normalize_abstraction(a)),
             Lambda(a) => Lambda(self.normalize_abstraction(a)),
             Struct(fields) => Struct(self.normalize_fields(fields)),
             StructTy(fields) => StructTy(self.normalize_fields(fields)),
-            Field(e, name) => Field(__(self.normalize_only(*e)), name),
-            Eq(a, b) => Eq(__(self.normalize_only(*a)), __(self.normalize_only(*b))),
-            Refl(a) => Refl(__(self.normalize_only(*a))),
-            Transport((eq, f)) => {
-                Transport(__((self.normalize_only(*eq), self.normalize_only(*f))))
-            }
+            Field(e, name) => Field(__(self.normalize_no_typeck(*e)), name),
+            Eq(a, b) => Eq(
+                __(self.normalize_no_typeck(*a)),
+                __(self.normalize_no_typeck(*b)),
+            ),
+            Refl(a) => Refl(__(self.normalize_no_typeck(*a))),
+            Transport((eq, f)) => Transport(__((
+                self.normalize_no_typeck(*eq),
+                self.normalize_no_typeck(*f),
+            ))),
         }
     }
     fn normalize_abstraction(&mut self, (x, t, e): __<Abstraction>) -> __<Abstraction> {
-        let t = self.normalize_only(*t);
+        let t = self.normalize_no_typeck(*t);
         let e = self.scoped(|ctx| {
             ctx.push(*x, t);
-            ctx.normalize_only(*e)
+            ctx.normalize_no_typeck(*e)
         });
         __((*x, t, e))
     }
@@ -320,7 +327,7 @@ impl Context {
     ) -> &'static [(__<str>, Expr)] {
         let fields: Vec<_> = fields
             .iter()
-            .map(|&(n, e)| (n, self.normalize_only(e)))
+            .map(|&(n, e)| (n, self.normalize_no_typeck(e)))
             .collect();
         Box::leak(fields.into_boxed_slice())
     }
@@ -330,7 +337,7 @@ impl Context {
         }
     }
     fn equal(&mut self, e1: Expr, e2: Expr) -> bool {
-        self.normalize_only(e1) == self.normalize_only(e2)
+        self.normalize_no_typeck(e1) == self.normalize_no_typeck(e2)
     }
 }
 
