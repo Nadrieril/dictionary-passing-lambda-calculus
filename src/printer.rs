@@ -137,6 +137,17 @@ impl Expr {
                 }
                 Ok(())
             }
+            Todo(t) => {
+                if prec > 2 {
+                    write!(f, "(")?;
+                }
+                write!(f, "todo ")?;
+                t.fmt_prec(f, 3)?;
+                if prec > 2 {
+                    write!(f, ")")?;
+                }
+                Ok(())
+            }
         }
     }
 }

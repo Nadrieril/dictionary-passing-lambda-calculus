@@ -49,14 +49,34 @@ fn leak_str(s: &str) -> &'static str {
     Box::leak(s.to_string().into_boxed_str())
 }
 
-/// Skip leading whitespace before `inner`.
+/// Skip a single `// ...` line comment.
+fn line_comment(input: &str) -> IResult<'_, &str> {
+    recognize((tag("//"), take_while(|c| c != '\n'))).parse(input)
+}
+
+/// Skip whitespace and `//` comments.
+fn skip_ws_and_comments(input: &str) -> IResult<'_, ()> {
+    let mut input = input;
+    loop {
+        let (rest, _) = multispace0.parse(input)?;
+        input = rest;
+        if let Ok((rest, _)) = line_comment(input) {
+            input = rest;
+        } else {
+            break;
+        }
+    }
+    Ok((input, ()))
+}
+
+/// Skip leading whitespace and comments before `inner`.
 fn ws<'a, O>(
     inner: impl Parser<&'a str, Output = O, Error = DeepError<'a>>,
 ) -> impl Parser<&'a str, Output = O, Error = DeepError<'a>> {
-    preceded(multispace0, inner)
+    preceded(skip_ws_and_comments, inner)
 }
 
-const KEYWORDS: &[&str] = &["fn", "in", "let", "rec", "refl", "transport"];
+const KEYWORDS: &[&str] = &["fn", "in", "let", "rec", "refl", "todo", "transport"];
 
 /// Identifier: [a-zA-Z_][a-zA-Z0-9_]*, rejecting keywords.
 fn ident<'a>(original: &'a str) -> IResult<'a, &'a str> {
@@ -226,6 +246,7 @@ fn parse_postfix(input: &str) -> IResult<'_, Expr> {
 fn parse_app(input: &str) -> IResult<'_, Expr> {
     alt((
         parse_refl,
+        parse_todo,
         parse_transport,
         (parse_postfix, many0(parse_postfix)).map(|(first, rest)| {
             rest.into_iter()
@@ -272,6 +293,11 @@ fn parse_rec(input: &str) -> IResult<'_, Expr> {
 /// `refl e`
 fn parse_refl(input: &str) -> IResult<'_, Expr> {
     map((keyword("refl"), parse_postfix), |(_, e)| Refl(__(e))).parse(input)
+}
+
+/// `todo ty`
+fn parse_todo(input: &str) -> IResult<'_, Expr> {
+    map((keyword("todo"), parse_postfix), |(_, t)| Todo(__(t))).parse(input)
 }
 
 /// `transport eq f`
@@ -373,7 +399,8 @@ pub fn parse(input: &str) -> Result<Expr, ParseError> {
     let input = input.trim();
     match parse_expr(input) {
         Ok((rest, expr)) => {
-            if rest.trim().is_empty() {
+            let rest = skip_ws_and_comments(rest).map(|(r, _)| r).unwrap_or(rest);
+            if rest.is_empty() {
                 Ok(expr)
             } else {
                 Err(format_error(input, rest.trim_start()))
@@ -423,6 +450,8 @@ mod tests {
             "(x == y) == (y == x)",
             r"\(x: N) -> x == x",
             "refl (f x)",
+            // Todo
+            "todo N",
             // Rec
             "rec ({ a: Type(0) }) {=}",
             "rec ({ a: Type(0) }) { a = x }",
@@ -460,5 +489,15 @@ mod tests {
         // Multiline: deepest error is on line 2 at `@`
         let err = parse("let x =\n  @bad in x").unwrap_err().to_string();
         assert!(err.contains("line 2, column 3"), "got:\n{err}");
+    }
+
+    #[test]
+    fn test_comments() {
+        // Comment at end of line
+        assert_eq!(parse("x // a variable").unwrap().to_string(), "x");
+        // Comment between tokens
+        assert_eq!(parse("f // apply\n  x").unwrap().to_string(), "f x");
+        // Trailing comment
+        assert_eq!(parse("x\n// done").unwrap().to_string(), "x");
     }
 }

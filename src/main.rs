@@ -53,6 +53,8 @@ enum Expr {
     Eq(__<Expr>, __<Expr>),
     Refl(__<Expr>),
     Transport(__<(Expr, Expr)>),
+    /// `todo ty` — has type `ty`, panics on normalization.
+    Todo(__<Expr>),
 }
 
 impl PartialEq for Expr {
@@ -83,6 +85,7 @@ impl PartialEq for Expr {
             (Eq(a1, b1), Eq(a2, b2)) => a1 == a2 && b1 == b2,
             (Refl(a1), Refl(a2)) => a1 == a2,
             (Transport((eq1, f1)), Transport((eq2, f2))) => eq1 == eq2 && f1 == f2,
+            (Todo(t1), Todo(t2)) => t1 == t2,
             _ => false,
         }
     }
@@ -141,6 +144,7 @@ impl Expr {
             Eq(a, b) => Eq(__(a.subst(s.clone())), __(b.subst(s))),
             Refl(a) => Refl(__(a.subst(s))),
             Transport((eq, f)) => Transport(__((eq.subst(s.clone()), f.subst(s)))),
+            Todo(t) => Todo(__(t.subst(s))),
         }
     }
 }
@@ -330,6 +334,10 @@ impl Context {
                 };
                 Eq(__(App(f, a)), __(App(f, b)))
             }
+            Todo(t) => {
+                let _ = self.infer_universe(*t);
+                return *t;
+            }
         };
         // Recursively check the type is well-formed.
         let _ = self.infer_type(ty);
@@ -417,6 +425,7 @@ impl Context {
                 self.normalize_no_typeck(*eq),
                 self.normalize_no_typeck(*f),
             ))),
+            Todo(t) => panic!("tried to normalize `todo {t}`"),
         }
     }
     fn normalize_abstraction(&mut self, (x, t, e): __<Abstraction>) -> __<Abstraction> {
@@ -705,6 +714,28 @@ mod tests {
             in x.b
         ");
         assert_eq!(ctx.normalize(expr).to_string(), "z");
+    }
+
+    #[test]
+    fn test_todo() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+
+        // todo has the declared type
+        assert_eq!(ctx.infer_type(p("todo N")).to_string(), "N");
+        // todo works in larger expressions
+        assert_eq!(
+            ctx.infer_type(p(r"\(x: N) -> todo N")).to_string(),
+            "fn(x: N) -> N"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "tried to normalize")]
+    fn test_reject_normalize_todo() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.normalize(p("todo N"));
     }
 
     #[test]
