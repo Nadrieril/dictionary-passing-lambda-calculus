@@ -94,6 +94,9 @@ fn eq_fields(f1: &[(__<str>, Expr)], f2: &[(__<str>, Expr)]) -> bool {
 }
 
 impl Expr {
+    fn subst1(self, x: Variable, e: Expr) -> Expr {
+        self.subst([(x, e)].into())
+    }
     fn subst(self, mut s: HashMap<Variable, Expr>) -> Expr {
         match self {
             Var(x) => s.get(&x).copied().unwrap_or(self),
@@ -205,7 +208,7 @@ impl Context {
                 };
                 let arg_ty = self.infer_type(*arg);
                 self.check_equal(*s, arg_ty);
-                t.subst([(*x, *arg)].into_iter().collect())
+                t.subst1(*x, *arg)
             }
             StructTy(x, fields) => {
                 let k = self.scoped(|ctx| {
@@ -238,7 +241,7 @@ impl Context {
                     .find(|(n, _)| *n == name)
                     .unwrap_or_else(|| panic!("Field {name} not found"))
                     .1;
-                field_ty.subst([(self_var, *e)].into())
+                field_ty.subst1(self_var, *e)
             }
             Eq(a, b) => {
                 let ta = self.infer_type(*a);
@@ -286,7 +289,7 @@ impl Context {
                 Some(v) => self.whnf(v),
             },
             App(e1, e2) => match self.whnf(*e1) {
-                Lambda((x, _, body)) => self.whnf(body.subst([(*x, *e2)].into())),
+                Lambda((x, _, body)) => self.whnf(body.subst1(*x, *e2)),
                 e1 => App(__(e1), e2),
             },
             Field(e, name) => match self.whnf(*e) {
