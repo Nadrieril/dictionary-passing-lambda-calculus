@@ -44,13 +44,13 @@ impl Expr {
                 Ok(())
             }
             App(e1, e2) => {
-                if prec > 1 {
+                if prec > 2 {
                     write!(f, "(")?;
                 }
-                e1.fmt_prec(f, 1)?;
+                e1.fmt_prec(f, 2)?;
                 write!(f, " ")?;
-                e2.fmt_prec(f, 2)?;
-                if prec > 1 {
+                e2.fmt_prec(f, 3)?;
+                if prec > 2 {
                     write!(f, ")")?;
                 }
                 Ok(())
@@ -59,8 +59,48 @@ impl Expr {
             Struct(fields) => fmt_fields(f, fields, " = "),
             StructTy(fields) => fmt_fields(f, fields, ": "),
             Field(e, name) => {
-                e.fmt_prec(f, 2)?;
+                e.fmt_prec(f, 3)?;
                 write!(f, ".{name}")
+            }
+            Eq(a, b) => {
+                if prec > 1 {
+                    write!(f, "(")?;
+                }
+                a.fmt_prec(f, 2)?;
+                write!(f, " == ")?;
+                b.fmt_prec(f, 2)?;
+                if prec > 1 {
+                    write!(f, ")")?;
+                }
+                Ok(())
+            }
+            Refl(a) => {
+                if prec > 2 {
+                    write!(f, "(")?;
+                }
+                write!(f, "refl ")?;
+                a.fmt_prec(f, 3)?;
+                if prec > 2 {
+                    write!(f, ")")?;
+                }
+                Ok(())
+            }
+            Transport((a, b, eq, ff)) => {
+                if prec > 2 {
+                    write!(f, "(")?;
+                }
+                write!(f, "transport ")?;
+                a.fmt_prec(f, 3)?;
+                write!(f, " ")?;
+                b.fmt_prec(f, 3)?;
+                write!(f, " ")?;
+                eq.fmt_prec(f, 3)?;
+                write!(f, " ")?;
+                ff.fmt_prec(f, 3)?;
+                if prec > 2 {
+                    write!(f, ")")?;
+                }
+                Ok(())
             }
         }
     }

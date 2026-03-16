@@ -22,14 +22,16 @@ fn ws<'a, O>(
     preceded(multispace0, inner)
 }
 
-/// Identifier: [a-zA-Z_][a-zA-Z0-9_]*, rejecting the keyword `fn`.
+const KEYWORDS: &[&str] = &["fn", "refl", "transport"];
+
+/// Identifier: [a-zA-Z_][a-zA-Z0-9_]*, rejecting keywords.
 fn ident<'a>(original: &'a str) -> IResult<&'a str, &'a str> {
     let (rest, id) = ws(recognize(pair(
         satisfy(|c: char| c.is_alphabetic() || c == '_'),
         take_while(|c: char| c.is_alphanumeric() || c == '_'),
     )))
     .parse(original)?;
-    if id == "fn" {
+    if KEYWORDS.contains(&id) {
         return Err(nom::Err::Error(nom::error::Error::new(
             original,
             nom::error::ErrorKind::Tag,
@@ -42,20 +44,24 @@ fn variable(input: &str) -> IResult<&str, Variable> {
     map(ident, |id| Variable::User(leak_str(id))).parse(input)
 }
 
-/// Match the keyword `fn` with word boundary check.
-fn fn_keyword(input: &str) -> IResult<&str, &str> {
-    let (rest, matched) = ws(tag("fn")).parse(input)?;
-    if rest
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_alphanumeric() || c == '_')
-    {
-        return Err(nom::Err::Error(nom::error::Error::new(
-            input,
-            nom::error::ErrorKind::Tag,
-        )));
+/// Match a keyword with word boundary check.
+fn keyword<'a>(
+    kw: &'static str,
+) -> impl Parser<&'a str, Output = &'a str, Error = nom::error::Error<&'a str>> {
+    move |input: &'a str| {
+        let (rest, matched) = ws(tag(kw)).parse(input)?;
+        if rest
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+        {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Tag,
+            )));
+        }
+        Ok((rest, matched))
     }
-    Ok((rest, matched))
 }
 
 /// `Type(n)`
@@ -94,7 +100,7 @@ fn parse_lambda(input: &str) -> IResult<&str, Expr> {
 fn parse_pi(input: &str) -> IResult<&str, Expr> {
     map(
         (
-            fn_keyword,
+            keyword("fn"),
             ws(nom_char('(')),
             variable,
             ws(nom_char(':')),
@@ -169,18 +175,53 @@ fn parse_postfix(input: &str) -> IResult<&str, Expr> {
     Ok((input, expr))
 }
 
-/// Application: left-associative sequence of postfix expressions.
+/// Application: left-associative sequence of postfix expressions,
+/// or `refl`/`transport` keyword expressions.
 fn parse_app(input: &str) -> IResult<&str, Expr> {
-    (parse_postfix, many0(parse_postfix))
-        .map(|(first, rest)| {
+    alt((
+        parse_refl,
+        parse_transport,
+        (parse_postfix, many0(parse_postfix)).map(|(first, rest)| {
             rest.into_iter()
                 .fold(first, |acc, arg| App(__(acc), __(arg)))
-        })
-        .parse(input)
+        }),
+    ))
+    .parse(input)
+}
+
+/// `refl e`
+fn parse_refl(input: &str) -> IResult<&str, Expr> {
+    map((keyword("refl"), parse_postfix), |(_, e)| Refl(__(e))).parse(input)
+}
+
+/// `transport a b eq f`
+fn parse_transport(input: &str) -> IResult<&str, Expr> {
+    map(
+        (
+            keyword("transport"),
+            parse_postfix,
+            parse_postfix,
+            parse_postfix,
+            parse_postfix,
+        ),
+        |(_, a, b, eq, f)| Transport(__((a, b, eq, f))),
+    )
+    .parse(input)
+}
+
+/// Equality: `app == app` or just `app`.
+fn parse_eq(input: &str) -> IResult<&str, Expr> {
+    let (input, lhs) = parse_app(input)?;
+    if let Ok((input, _)) = ws(tag("==")).parse(input) {
+        let (input, rhs) = parse_app(input)?;
+        Ok((input, Eq(__(lhs), __(rhs))))
+    } else {
+        Ok((input, lhs))
+    }
 }
 
 fn parse_expr(input: &str) -> IResult<&str, Expr> {
-    alt((parse_lambda, parse_pi, parse_app)).parse(input)
+    alt((parse_lambda, parse_pi, parse_eq)).parse(input)
 }
 
 pub fn parse(input: &str) -> Result<Expr, String> {
@@ -227,6 +268,14 @@ mod tests {
             // Nested structs
             "{ a: { b: Type(0) } }",
             r"{ f = \(x: N) -> x }",
+            // Equality
+            "x == y",
+            "f x == g y",
+            "refl x",
+            "transport a b eq f",
+            "(x == y) == (y == x)",
+            r"\(x: N) -> x == x",
+            "refl (f x)",
         ];
         for input in cases {
             let expr = parse(input).unwrap_or_else(|e| panic!("failed to parse {input:?}: {e}"));

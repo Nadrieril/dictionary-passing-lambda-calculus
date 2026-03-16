@@ -42,6 +42,9 @@ enum Expr {
     Struct(&'static [(__<str>, Expr)]),
     StructTy(&'static [(__<str>, Expr)]),
     Field(__<Expr>, __<str>),
+    Eq(__<Expr>, __<Expr>),
+    Refl(__<Expr>),
+    Transport(__<(Expr, Expr, Expr, Expr)>),
 }
 
 impl Expr {
@@ -55,6 +58,14 @@ impl Expr {
             Struct(fields) => Struct(subst_fields(fields, s)),
             StructTy(fields) => StructTy(subst_fields(fields, s)),
             Field(e, name) => Field(__(e.subst(s)), name),
+            Eq(a, b) => Eq(__(a.subst(s.clone())), __(b.subst(s))),
+            Refl(a) => Refl(__(a.subst(s))),
+            Transport((a, b, eq, f)) => Transport(__((
+                a.subst(s.clone()),
+                b.subst(s.clone()),
+                eq.subst(s.clone()),
+                f.subst(s),
+            ))),
         }
     }
 }
@@ -155,6 +166,27 @@ impl Context {
                     _ => panic!("Struct type expected for field access"),
                 }
             }
+            Eq(a, b) => {
+                let ta = self.infer_type(*a);
+                let tb = self.infer_type(*b);
+                self.check_equal(ta, tb);
+                let k = self.infer_universe(ta);
+                Type(k)
+            }
+            Refl(a) => {
+                let _ = self.infer_type(*a);
+                Eq(a, a)
+            }
+            Transport((a, b, eq, f)) => {
+                let eq_ty = self.infer_type(*eq);
+                let Eq(ea, eb) = self.normalize(eq_ty) else {
+                    panic!("Equality type expected for transport")
+                };
+                self.check_equal(*a, *ea);
+                self.check_equal(*b, *eb);
+                let _ = self.infer_type(*f);
+                Eq(__(App(f, a)), __(App(f, b)))
+            }
         }
     }
     fn infer_universe(&mut self, t: Expr) -> usize {
@@ -191,6 +223,23 @@ impl Context {
                 }
                 e => Field(__(e), name),
             },
+            Eq(a, b) => Eq(__(self.normalize(*a)), __(self.normalize(*b))),
+            Refl(a) => Refl(__(self.normalize(*a))),
+            Transport((a, b, eq, f)) => {
+                let eq = self.normalize(*eq);
+                match eq {
+                    Refl(x) => {
+                        let y = self.normalize(App(f, x));
+                        Refl(__(y))
+                    }
+                    eq => {
+                        let a = self.normalize(*a);
+                        let b = self.normalize(*b);
+                        let f = self.normalize(*f);
+                        Transport(__((a, b, eq, f)))
+                    }
+                }
+            }
         }
     }
     fn normalize_abstraction(&mut self, (x, t, e): __<Abstraction>) -> __<Abstraction> {
@@ -223,6 +272,11 @@ impl Context {
                 (Lambda(a1), Lambda(a2)) => equal_abstraction(a1, a2),
                 (Struct(f1), Struct(f2)) | (StructTy(f1), StructTy(f2)) => equal_fields(f1, f2),
                 (Field(e1, n1), Field(e2, n2)) => n1 == n2 && equal(*e1, *e2),
+                (Eq(a1, b1), Eq(a2, b2)) => equal(*a1, *a2) && equal(*b1, *b2),
+                (Refl(a1), Refl(a2)) => equal(*a1, *a2),
+                (Transport((a1, b1, eq1, f1)), Transport((a2, b2, eq2, f2))) => {
+                    equal(*a1, *a2) && equal(*b1, *b2) && equal(*eq1, *eq2) && equal(*f1, *f2)
+                }
                 _ => false,
             }
         }
@@ -255,14 +309,7 @@ mod tests {
             (Variable::User("z"), (Var(Variable::User("N")), None)),
             (
                 Variable::User("s"),
-                (
-                    Pi(__((
-                        Variable::User("_"),
-                        Var(Variable::User("N")),
-                        Var(Variable::User("N")),
-                    ))),
-                    None,
-                ),
+                (parser::parse("fn(_: N) -> N").unwrap(), None),
             ),
             (
                 Variable::User("three"),
@@ -320,5 +367,39 @@ mod tests {
         let fb = parser::parse("p.b").unwrap();
         assert_eq!(ctx.infer_type(fb).to_string(), "N");
         assert_eq!(ctx.normalize(fb).to_string(), "z");
+    }
+
+    #[test]
+    fn test_equality() {
+        let mut ctx = Context(vec![
+            (Variable::User("N"), (Type(0), None)),
+            (Variable::User("M"), (Type(0), None)),
+            (
+                Variable::User("f"),
+                (
+                    parser::parse(r"fn(t: Type(0)) -> Type(1)").unwrap(),
+                    Some(parser::parse(r"\(t: Type(0)) -> t == N").unwrap()),
+                ),
+            ),
+        ]);
+
+        // Eq type has a type
+        let eq_ty = parser::parse("N == M").unwrap();
+        assert_eq!(ctx.infer_type(eq_ty).to_string(), "Type(1)");
+
+        // refl has an Eq type
+        let r = parser::parse("refl N").unwrap();
+        assert_eq!(ctx.infer_type(r).to_string(), "N == N");
+
+        // transport type-checks
+        ctx.extend(Variable::User("eq"), parser::parse("N == M").unwrap(), None);
+        let tr = parser::parse("transport N M eq f").unwrap();
+        let ty = ctx.infer_type(tr);
+        let ty = ctx.normalize(ty);
+        assert_eq!(ty.to_string(), "(N == N) == (M == N)");
+
+        // transport with refl normalizes
+        let tr_refl = parser::parse("transport N N (refl N) f").unwrap();
+        assert_eq!(ctx.normalize(tr_refl).to_string(), "refl (N == N)");
     }
 }
