@@ -90,7 +90,7 @@ fn subst_fields(
     Box::leak(fields.into_boxed_slice())
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Context(Vec<(Variable, (Expr, Option<Expr>))>);
 
 impl Context {
@@ -108,23 +108,37 @@ impl Context {
     fn lookup_value(&self, x: Variable) -> Option<Expr> {
         self.get(x).1
     }
-    fn push(&mut self, x: Variable, t: Expr, value: Option<Expr>) {
-        self.0.push((x, (t, value)));
+
+    /// Add a new uninterpreted term to the environment. Used in tests.
+    fn add_uninterpreted(&mut self, x: &'static str, t: Expr) {
+        let x = Variable::User(x);
+        self.0.push((x, (t, None)));
     }
+    /// Add a value to the environment. Used in tests.
+    fn add_val(&mut self, x: &'static str, value: Expr) {
+        let x = Variable::User(x);
+        let t = self.infer_type(value);
+        self.0.push((x, (t, Some(value))));
+    }
+    /// Push a value to the context stack.
+    fn push(&mut self, x: Variable, t: Expr) {
+        self.0.push((x, (t, None)));
+    }
+
     fn infer_type(&mut self, e: Expr) -> Expr {
         match e {
             Var(x) => self.lookup_ty(x),
             Type(k) => Type(k + 1),
             Pi((x, t1, t2)) => {
                 let k1 = self.infer_universe(*t1);
-                self.push(*x, *t1, None);
+                self.push(*x, *t1);
                 let k2 = self.infer_universe(*t2);
                 Type(k1.max(k2))
             }
             Lambda((x, t, e)) => {
                 let _ = self.infer_universe(*t);
                 let te = {
-                    self.push(*x, *t, None);
+                    self.push(*x, *t);
                     self.infer_type(*e)
                 };
                 Pi(__((*x, *t, te)))
@@ -244,7 +258,7 @@ impl Context {
     }
     fn normalize_abstraction(&mut self, (x, t, e): __<Abstraction>) -> __<Abstraction> {
         let t = self.normalize(*t);
-        self.push(*x, t, None);
+        self.push(*x, t);
         __((*x, t, self.normalize(*e)))
     }
     fn normalize_fields(
@@ -302,24 +316,19 @@ fn main() {}
 mod tests {
     use super::*;
 
+    fn p(s: &str) -> Expr {
+        parser::parse(s).unwrap()
+    }
+
     #[test]
-    fn test() {
-        let mut ctx = Context(vec![
-            (Variable::User("N"), (Type(0), None)),
-            (Variable::User("z"), (Var(Variable::User("N")), None)),
-            (
-                Variable::User("s"),
-                (parser::parse("fn(_: N) -> N").unwrap(), None),
-            ),
-            (
-                Variable::User("three"),
-                (
-                    parser::parse("fn(_: fn(_: N) -> N) -> fn(_: N) -> N").unwrap(),
-                    Some(parser::parse(r"\(f: fn(_: N) -> N) -> \(x: N) -> f (f (f x))").unwrap()),
-                ),
-            ),
-        ]);
-        let expr = parser::parse("three (three s) z").unwrap();
+    fn test_application() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("z", p("N"));
+        ctx.add_uninterpreted("s", p("fn(_: N) -> N"));
+        ctx.add_val("three", p(r"\(f: fn(_: N) -> N) -> \(x: N) -> f (f (f x))"));
+
+        let expr = p("three (three s) z");
         let normalized = ctx.normalize(expr);
         let ty = ctx.infer_type(expr);
         assert_eq!(
@@ -331,75 +340,64 @@ mod tests {
 
     #[test]
     fn test_types() {
-        let mut ctx = Context(vec![
-            (Variable::User("N"), (Type(0), None)),
-            (Variable::User("z"), (Var(Variable::User("N")), None)),
-        ]);
-        let sty = parser::parse("fn(_: fn(_: N) -> N) -> fn(_: N) -> N").unwrap();
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("z", p("N"));
+
+        let sty = p("fn(_: fn(_: N) -> N) -> fn(_: N) -> N");
         assert_eq!(ctx.infer_type(sty).to_string(), "Type(0)");
     }
 
     #[test]
     fn test_structs() {
-        let mut ctx = Context(vec![
-            (Variable::User("N"), (Type(0), None)),
-            (Variable::User("z"), (Var(Variable::User("N")), None)),
-        ]);
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("z", p("N"));
+
         // Struct type has a type
-        let sty = parser::parse("{ a: N, b: N }").unwrap();
+        let sty = p("{ a: N, b: N }");
         assert_eq!(ctx.infer_type(sty).to_string(), "Type(0)");
 
         // Struct value has a struct type
-        let sval = parser::parse("{ a = z, b = z }").unwrap();
+        let sval = p("{ a = z, b = z }");
         assert_eq!(ctx.infer_type(sval).to_string(), "{ a: N, b: N }");
 
         // Field access
-        let fa = parser::parse("{ a = z, b = z }.a").unwrap();
+        let fa = p("{ a = z, b = z }.a");
         assert_eq!(ctx.infer_type(fa).to_string(), "N");
         assert_eq!(ctx.normalize(fa).to_string(), "z");
 
         // Field access via variable
-        ctx.push(
-            Variable::User("p"),
-            parser::parse("{ a: N, b: N }").unwrap(),
-            Some(parser::parse("{ a = z, b = z }").unwrap()),
-        );
-        let fb = parser::parse("p.b").unwrap();
+        ctx.add_val("p", p("{ a = z, b = z }"));
+        let fb = p("p.b");
         assert_eq!(ctx.infer_type(fb).to_string(), "N");
         assert_eq!(ctx.normalize(fb).to_string(), "z");
     }
 
     #[test]
     fn test_equality() {
-        let mut ctx = Context(vec![
-            (Variable::User("N"), (Type(0), None)),
-            (Variable::User("M"), (Type(0), None)),
-            (
-                Variable::User("f"),
-                (
-                    parser::parse(r"fn(t: Type(0)) -> Type(1)").unwrap(),
-                    Some(parser::parse(r"\(t: Type(0)) -> t == N").unwrap()),
-                ),
-            ),
-        ]);
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("M", Type(0));
+        ctx.add_val("f", p(r"\(t: Type(0)) -> t == N"));
 
         // Eq type has a type
-        let eq_ty = parser::parse("N == M").unwrap();
+        let eq_ty = p("N == M");
         assert_eq!(ctx.infer_type(eq_ty).to_string(), "Type(1)");
 
         // refl has an Eq type
-        let r = parser::parse("refl N").unwrap();
+        let r = p("refl N");
         assert_eq!(ctx.infer_type(r).to_string(), "N == N");
 
         // transport type-checks
-        ctx.push(Variable::User("eq"), parser::parse("N == M").unwrap(), None);
-        let tr = parser::parse("transport N M eq f").unwrap();
+        ctx.add_uninterpreted("eq", p("N == M"));
+        let tr = p("transport N M eq f");
         let ty = ctx.infer_type(tr);
         let ty = ctx.normalize(ty);
         assert_eq!(ty.to_string(), "(N == N) == (M == N)");
 
         // transport with refl normalizes
-        let tr_refl = parser::parse("transport N N (refl N) f").unwrap();
+        let tr_refl = p("transport N N (refl N) f");
         assert_eq!(ctx.normalize(tr_refl).to_string(), "refl (N == N)");
     }
 }
