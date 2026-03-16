@@ -149,7 +149,7 @@ impl Context {
             }
             App(f, arg) => {
                 let f_ty = self.infer_type(*f);
-                let Pi((x, s, t)) = self.normalize(f_ty) else {
+                let Pi((x, s, t)) = self.normalize_only(f_ty) else {
                     panic!("Function expected.")
                 };
                 let arg_ty = self.infer_type(*arg);
@@ -173,7 +173,7 @@ impl Context {
             }
             Field(e, name) => {
                 let te = self.infer_type(*e);
-                match self.normalize(te) {
+                match self.normalize_only(te) {
                     StructTy(fields) => {
                         fields
                             .iter()
@@ -197,7 +197,7 @@ impl Context {
             }
             Transport((eq, f)) => {
                 let eq_ty = self.infer_type(*eq);
-                let Eq(a, b) = self.normalize(eq_ty) else {
+                let Eq(a, b) = self.normalize_only(eq_ty) else {
                     panic!("Equality type expected for transport")
                 };
                 let _ = self.infer_type(*f);
@@ -211,16 +211,22 @@ impl Context {
             t => panic!("Type expected, got {t:?}."),
         }
     }
+    /// Typecheck then normalize the value.
     fn normalize(&mut self, e: Expr) -> Expr {
+        let _ = self.infer_type(e);
+        self.normalize_only(e)
+    }
+    /// Just normalize the value; prefer `normalize`.
+    fn normalize_only(&mut self, e: Expr) -> Expr {
         match e {
             Var(x) => match self.lookup_value(x) {
                 None => Var(x),
-                Some(e) => self.normalize(e),
+                Some(e) => self.normalize_only(e),
             },
             App(e1, e2) => {
-                let e2 = self.normalize(*e2);
-                match self.normalize(*e1) {
-                    Lambda((x, _, e1_)) => self.normalize(e1_.subst([(*x, e2)].into())),
+                let e2 = self.normalize_only(*e2);
+                match self.normalize_only(*e1) {
+                    Lambda((x, _, e1_)) => self.normalize_only(e1_.subst([(*x, e2)].into())),
                     e1 => App(__(e1), __(e2)),
                 }
             }
@@ -229,7 +235,7 @@ impl Context {
             Lambda(a) => Lambda(self.normalize_abstraction(a)),
             Struct(fields) => Struct(self.normalize_fields(fields)),
             StructTy(fields) => StructTy(self.normalize_fields(fields)),
-            Field(e, name) => match self.normalize(*e) {
+            Field(e, name) => match self.normalize_only(*e) {
                 Struct(fields) => {
                     fields
                         .iter()
@@ -239,17 +245,17 @@ impl Context {
                 }
                 e => Field(__(e), name),
             },
-            Eq(a, b) => Eq(__(self.normalize(*a)), __(self.normalize(*b))),
-            Refl(a) => Refl(__(self.normalize(*a))),
+            Eq(a, b) => Eq(__(self.normalize_only(*a)), __(self.normalize_only(*b))),
+            Refl(a) => Refl(__(self.normalize_only(*a))),
             Transport((eq, f)) => {
-                let eq = self.normalize(*eq);
+                let eq = self.normalize_only(*eq);
                 match eq {
                     Refl(x) => {
-                        let y = self.normalize(App(f, x));
+                        let y = self.normalize_only(App(f, x));
                         Refl(__(y))
                     }
                     eq => {
-                        let f = self.normalize(*f);
+                        let f = self.normalize_only(*f);
                         Transport(__((eq, f)))
                     }
                 }
@@ -257,10 +263,10 @@ impl Context {
         }
     }
     fn normalize_abstraction(&mut self, (x, t, e): __<Abstraction>) -> __<Abstraction> {
-        let t = self.normalize(*t);
+        let t = self.normalize_only(*t);
         let e = self.scoped(|ctx| {
             ctx.push(*x, t);
-            ctx.normalize(*e)
+            ctx.normalize_only(*e)
         });
         __((*x, t, e))
     }
@@ -270,13 +276,13 @@ impl Context {
     ) -> &'static [(__<str>, Expr)] {
         let fields: Vec<_> = fields
             .iter()
-            .map(|&(n, e)| (n, self.normalize(e)))
+            .map(|&(n, e)| (n, self.normalize_only(e)))
             .collect();
         Box::leak(fields.into_boxed_slice())
     }
     fn check_equal(&mut self, e1: Expr, e2: Expr) {
         if !self.equal(e1, e2) {
-            panic!("{e1:?} and {e2:?} are not equal.")
+            panic!("{e1} and {e2} are not equal.")
         }
     }
     fn equal(&mut self, e1: Expr, e2: Expr) -> bool {
@@ -312,8 +318,8 @@ impl Context {
                     .all(|(n, e)| f2.iter().any(|(n2, e2)| n == n2 && equal(*e, *e2)))
         }
 
-        let e1_ = self.normalize(e1);
-        let e2_ = self.normalize(e2);
+        let e1_ = self.normalize_only(e1);
+        let e2_ = self.normalize_only(e2);
         equal(e1_, e2_)
     }
 }
