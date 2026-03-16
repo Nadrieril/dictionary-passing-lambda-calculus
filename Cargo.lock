@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "dictionary-passing-style"
+name = "dictionary-passing-lambda-calculus"
 version = "0.1.0"
 dependencies = [
  "nom",
