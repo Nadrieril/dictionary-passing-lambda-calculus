@@ -3,6 +3,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use Expr::*;
 
+mod parser;
+mod printer;
+
 // A but good
 type __<A> = &'static A;
 fn __<A>(a: A) -> &'static A {
@@ -172,6 +175,7 @@ fn main() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
     fn test() {
         let mut ctx = Context(vec![
@@ -191,56 +195,18 @@ mod tests {
             (
                 Variable::User("three"),
                 (
-                    Expr::Pi(__((
-                        Variable::User("_"),
-                        Expr::Pi(__((
-                            Variable::User("_"),
-                            Var(Variable::User("N")),
-                            Var(Variable::User("N")),
-                        ))),
-                        Expr::Pi(__((
-                            Variable::User("_"),
-                            Var(Variable::User("N")),
-                            Var(Variable::User("N")),
-                        ))),
-                    ))),
-                    Some(Lambda(__((
-                        Variable::User("f"),
-                        Pi(__((
-                            Variable::User("_"),
-                            Var(Variable::User("N")),
-                            Var(Variable::User("N")),
-                        ))),
-                        Lambda(__((
-                            Variable::User("x"),
-                            Var(Variable::User("N")),
-                            App(
-                                __(Var(Variable::User("f"))),
-                                __(App(
-                                    __(Var(Variable::User("f"))),
-                                    __(App(
-                                        __(Var(Variable::User("f"))),
-                                        __(Var(Variable::User("x"))),
-                                    )),
-                                )),
-                            ),
-                        ))),
-                    )))),
+                    parser::parse("fn(_: fn(_: N) -> N) -> fn(_: N) -> N").unwrap(),
+                    Some(parser::parse(r"\(f: fn(_: N) -> N) -> \(x: N) -> f (f (f x))").unwrap()),
                 ),
             ),
         ]);
-        let expr = App(
-            __(App(
-                __(Var(Variable::User("three"))),
-                __(App(
-                    __(Var(Variable::User("three"))),
-                    __(Var(Variable::User("s"))),
-                )),
-            )),
-            __(Var(Variable::User("z"))),
+        let expr = parser::parse("three (three s) z").unwrap();
+        let normalized = ctx.normalize(expr);
+        let ty = ctx.infer_type(expr);
+        assert_eq!(
+            normalized.to_string(),
+            "s (s (s (s (s (s (s (s (s z))))))))"
         );
-        println!("{:?}", ctx.normalize(expr));
-        println!("{:?}", ctx.infer_type(expr));
-        panic!()
+        assert_eq!(ty.to_string(), "N");
     }
 }
