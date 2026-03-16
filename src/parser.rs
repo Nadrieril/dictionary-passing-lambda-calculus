@@ -1,6 +1,5 @@
 use crate::Expr::{self, *};
 use crate::{__, Variable};
-use nom::IResult;
 use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_while};
@@ -8,8 +7,43 @@ use nom::character::complete::{char as nom_char, digit1};
 use nom::character::complete::{multispace0, satisfy};
 use nom::combinator::opt;
 use nom::combinator::{map, recognize};
+use nom::error::{ErrorKind, ParseError as _};
 use nom::multi::{many0, separated_list0, separated_list1};
 use nom::sequence::{delimited, pair, preceded};
+
+/// Custom error that always keeps the error at the deepest (furthest) position.
+#[derive(Debug)]
+struct DeepError<'a> {
+    input: &'a str,
+    kind: ErrorKind,
+}
+
+impl<'a> nom::error::ParseError<&'a str> for DeepError<'a> {
+    fn from_error_kind(input: &'a str, kind: ErrorKind) -> Self {
+        DeepError { input, kind }
+    }
+    fn append(_input: &'a str, _kind: ErrorKind, other: Self) -> Self {
+        other
+    }
+    fn from_char(input: &'a str, _: char) -> Self {
+        DeepError {
+            input,
+            kind: ErrorKind::Char,
+        }
+    }
+    fn or(self, other: Self) -> Self {
+        // Keep whichever error is deeper (shorter remaining input = further into parse).
+        if self.input.len() <= other.input.len() {
+            self
+        } else {
+            other
+        }
+    }
+}
+
+impl<'a> nom::error::ContextError<&'a str> for DeepError<'a> {}
+
+type IResult<'a, O> = nom::IResult<&'a str, O, DeepError<'a>>;
 
 fn leak_str(s: &str) -> &'static str {
     Box::leak(s.to_string().into_boxed_str())
@@ -17,37 +51,35 @@ fn leak_str(s: &str) -> &'static str {
 
 /// Skip leading whitespace before `inner`.
 fn ws<'a, O>(
-    inner: impl Parser<&'a str, Output = O, Error = nom::error::Error<&'a str>>,
-) -> impl Parser<&'a str, Output = O, Error = nom::error::Error<&'a str>> {
+    inner: impl Parser<&'a str, Output = O, Error = DeepError<'a>>,
+) -> impl Parser<&'a str, Output = O, Error = DeepError<'a>> {
     preceded(multispace0, inner)
 }
 
 const KEYWORDS: &[&str] = &["fn", "in", "let", "rec", "refl", "transport"];
 
 /// Identifier: [a-zA-Z_][a-zA-Z0-9_]*, rejecting keywords.
-fn ident<'a>(original: &'a str) -> IResult<&'a str, &'a str> {
+fn ident<'a>(original: &'a str) -> IResult<'a, &'a str> {
     let (rest, id) = ws(recognize(pair(
         satisfy(|c: char| c.is_alphabetic() || c == '_'),
         take_while(|c: char| c.is_alphanumeric() || c == '_'),
     )))
     .parse(original)?;
     if KEYWORDS.contains(&id) {
-        return Err(nom::Err::Error(nom::error::Error::new(
+        return Err(nom::Err::Error(DeepError::from_error_kind(
             original,
-            nom::error::ErrorKind::Tag,
+            ErrorKind::Tag,
         )));
     }
     Ok((rest, id))
 }
 
-fn variable(input: &str) -> IResult<&str, Variable> {
+fn variable(input: &str) -> IResult<'_, Variable> {
     map(ident, |id| Variable::User(leak_str(id))).parse(input)
 }
 
 /// Match a keyword with word boundary check.
-fn keyword<'a>(
-    kw: &'static str,
-) -> impl Parser<&'a str, Output = &'a str, Error = nom::error::Error<&'a str>> {
+fn keyword<'a>(kw: &'static str) -> impl Parser<&'a str, Output = &'a str, Error = DeepError<'a>> {
     move |input: &'a str| {
         let (rest, matched) = ws(tag(kw)).parse(input)?;
         if rest
@@ -55,9 +87,9 @@ fn keyword<'a>(
             .next()
             .is_some_and(|c| c.is_alphanumeric() || c == '_')
         {
-            return Err(nom::Err::Error(nom::error::Error::new(
+            return Err(nom::Err::Error(DeepError::from_error_kind(
                 input,
-                nom::error::ErrorKind::Tag,
+                ErrorKind::Tag,
             )));
         }
         Ok((rest, matched))
@@ -65,7 +97,7 @@ fn keyword<'a>(
 }
 
 /// `Type(n)`
-fn parse_type(input: &str) -> IResult<&str, Expr> {
+fn parse_type(input: &str) -> IResult<'_, Expr> {
     map(
         (
             ws(tag("Type")),
@@ -79,7 +111,7 @@ fn parse_type(input: &str) -> IResult<&str, Expr> {
 }
 
 /// `\(x: A) -> e`
-fn parse_lambda(input: &str) -> IResult<&str, Expr> {
+fn parse_lambda(input: &str) -> IResult<'_, Expr> {
     map(
         (
             ws(nom_char('\\')),
@@ -97,7 +129,7 @@ fn parse_lambda(input: &str) -> IResult<&str, Expr> {
 }
 
 /// `fn(x: A) -> B` or `fn(A) -> B` (shorthand for `fn(_: A) -> B`)
-fn parse_pi(input: &str) -> IResult<&str, Expr> {
+fn parse_pi(input: &str) -> IResult<'_, Expr> {
     alt((
         map(
             (
@@ -128,7 +160,7 @@ fn parse_pi(input: &str) -> IResult<&str, Expr> {
 }
 
 /// `{ a = e, b = e }` or `{ a: T, b: T }` or `{}` or `{=}`
-fn parse_struct(input: &str) -> IResult<&str, Expr> {
+fn parse_struct(input: &str) -> IResult<'_, Expr> {
     let field_val = |input| {
         (ident, ws(nom_char('=')), parse_expr)
             .map(|(n, _, e)| (leak_str(n), e))
@@ -168,7 +200,7 @@ fn parse_struct(input: &str) -> IResult<&str, Expr> {
 }
 
 /// Atom: variable, Type(n), struct, or parenthesized expression.
-fn parse_atom(input: &str) -> IResult<&str, Expr> {
+fn parse_atom(input: &str) -> IResult<'_, Expr> {
     alt((
         parse_type,
         parse_rec,
@@ -180,7 +212,7 @@ fn parse_atom(input: &str) -> IResult<&str, Expr> {
 }
 
 /// Postfix: atom followed by zero or more `.field` accesses.
-fn parse_postfix(input: &str) -> IResult<&str, Expr> {
+fn parse_postfix(input: &str) -> IResult<'_, Expr> {
     let (mut input, mut expr) = parse_atom(input)?;
     while let Ok((rest, (_, name))) = (ws(nom_char('.')), ident).parse(input) {
         expr = Field(__(expr), leak_str(name));
@@ -191,7 +223,7 @@ fn parse_postfix(input: &str) -> IResult<&str, Expr> {
 
 /// Application: left-associative sequence of postfix expressions,
 /// or `refl`/`transport` keyword expressions.
-fn parse_app(input: &str) -> IResult<&str, Expr> {
+fn parse_app(input: &str) -> IResult<'_, Expr> {
     alt((
         parse_refl,
         parse_transport,
@@ -204,7 +236,7 @@ fn parse_app(input: &str) -> IResult<&str, Expr> {
 }
 
 /// `rec (ty) { a = e, ... }` or `rec (ty) {=}`
-fn parse_rec(input: &str) -> IResult<&str, Expr> {
+fn parse_rec(input: &str) -> IResult<'_, Expr> {
     let field_val = |input| {
         (ident, ws(nom_char('=')), parse_expr)
             .map(|(n, _, e)| (leak_str(n), e))
@@ -238,12 +270,12 @@ fn parse_rec(input: &str) -> IResult<&str, Expr> {
 }
 
 /// `refl e`
-fn parse_refl(input: &str) -> IResult<&str, Expr> {
+fn parse_refl(input: &str) -> IResult<'_, Expr> {
     map((keyword("refl"), parse_postfix), |(_, e)| Refl(__(e))).parse(input)
 }
 
 /// `transport eq f`
-fn parse_transport(input: &str) -> IResult<&str, Expr> {
+fn parse_transport(input: &str) -> IResult<'_, Expr> {
     map(
         (keyword("transport"), parse_postfix, parse_postfix),
         |(_, eq, f)| Transport(__((eq, f))),
@@ -252,7 +284,7 @@ fn parse_transport(input: &str) -> IResult<&str, Expr> {
 }
 
 /// Equality: `app == app` or just `app`.
-fn parse_eq(input: &str) -> IResult<&str, Expr> {
+fn parse_eq(input: &str) -> IResult<'_, Expr> {
     let (input, lhs) = parse_app(input)?;
     if let Ok((input, _)) = ws(tag("==")).parse(input) {
         let (input, rhs) = parse_app(input)?;
@@ -263,7 +295,7 @@ fn parse_eq(input: &str) -> IResult<&str, Expr> {
 }
 
 /// `let x = e1 in e2`
-fn parse_let(input: &str) -> IResult<&str, Expr> {
+fn parse_let(input: &str) -> IResult<'_, Expr> {
     map(
         (
             keyword("let"),
@@ -279,7 +311,7 @@ fn parse_let(input: &str) -> IResult<&str, Expr> {
 }
 
 /// `let rec x: T = e1 in e2`
-fn parse_let_rec(input: &str) -> IResult<&str, Expr> {
+fn parse_let_rec(input: &str) -> IResult<'_, Expr> {
     map(
         (
             keyword("let"),
@@ -297,20 +329,58 @@ fn parse_let_rec(input: &str) -> IResult<&str, Expr> {
     .parse(input)
 }
 
-fn parse_expr(input: &str) -> IResult<&str, Expr> {
+fn parse_expr(input: &str) -> IResult<'_, Expr> {
     alt((parse_let_rec, parse_let, parse_lambda, parse_pi, parse_eq)).parse(input)
 }
 
-pub fn parse(input: &str) -> Result<Expr, String> {
-    match parse_expr(input.trim()) {
+/// Parse error with position information. Uses `Display` for pretty-printing,
+/// so `unwrap()` shows the error nicely.
+pub struct ParseError(String);
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::fmt::Debug for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("\n")?;
+        f.write_str(&self.0)
+    }
+}
+
+/// Format a parse error showing position in context.
+fn format_error(full_input: &str, err_input: &str) -> ParseError {
+    let offset = full_input.len() - err_input.len();
+    let before = &full_input[..offset];
+    let line_num = before.chars().filter(|&c| c == '\n').count() + 1;
+    let last_newline = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let col = full_input[last_newline..offset].chars().count() + 1;
+    let line_end = full_input[offset..]
+        .find('\n')
+        .map(|i| offset + i)
+        .unwrap_or(full_input.len());
+    let line_text = &full_input[last_newline..line_end];
+    ParseError(format!(
+        "parse error at line {line_num}, column {col}:\n  {line_text}\n  {:>width$}",
+        "^",
+        width = col
+    ))
+}
+
+pub fn parse(input: &str) -> Result<Expr, ParseError> {
+    let input = input.trim();
+    match parse_expr(input) {
         Ok((rest, expr)) => {
             if rest.trim().is_empty() {
                 Ok(expr)
             } else {
-                Err(format!("unexpected trailing input: {rest:?}"))
+                Err(format_error(input, rest.trim_start()))
             }
         }
-        Err(e) => Err(format!("parse error: {e}")),
+        Err(nom::Err::Error(e) | nom::Err::Failure(e)) => Err(format_error(input, e.input)),
+        Err(e) => Err(ParseError(format!("parse error: {e}"))),
     }
 }
 
@@ -375,5 +445,20 @@ mod tests {
             parse("fn(fn(A) -> B) -> C").unwrap().to_string(),
             "fn(_: fn(_: A) -> B) -> C"
         );
+    }
+
+    #[test]
+    fn test_error_position() {
+        // Trailing input: parser stops at the `(` it can't consume
+        let err = parse("f (g +) x").unwrap_err().to_string();
+        assert!(err.contains("line 1, column 3"), "got:\n{err}");
+
+        // Points to `@` which is an invalid token
+        let err = parse("@bad").unwrap_err().to_string();
+        assert!(err.contains("line 1, column 1"), "got:\n{err}");
+
+        // Multiline: deepest error is on line 2 at `@`
+        let err = parse("let x =\n  @bad in x").unwrap_err().to_string();
+        assert!(err.contains("line 2, column 3"), "got:\n{err}");
     }
 }
