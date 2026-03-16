@@ -286,11 +286,12 @@ impl Context {
             LetRec(x, ty, e1, e2) => {
                 let _ = self.infer_universe(*ty);
                 return self.scoped(|ctx| {
-                    ctx.push(x, *ty);
+                    // Push x with value immediately so it can reduce during
+                    // its own typechecking (needed for self-referential types
+                    // like `Trait` whose fields reference `Trait` applied to args).
+                    ctx.0.push((x, (*ty, Some(*e1))));
                     let t1 = ctx.infer_type(*e1);
                     ctx.check_equal(*ty, t1);
-                    // Re-push x with its value so it can reduce in e2.
-                    ctx.0.push((x, (*ty, Some(*e1))));
                     ctx.infer_type(*e2)
                 });
             }
@@ -330,8 +331,9 @@ impl Context {
                 Eq(__(App(f, a)), __(App(f, b)))
             }
         };
-        // Recursively check the type is well-formed, then normalize.
-        self.normalize(ty)
+        // Recursively check the type is well-formed.
+        let _ = self.infer_type(ty);
+        ty
     }
     fn infer_universe(&mut self, t: Expr) -> usize {
         match self.infer_type(t) {
@@ -347,9 +349,9 @@ impl Context {
     /// Weak head normal form: reduce the outermost redex only.
     fn whnf(&mut self, e: Expr) -> Expr {
         match e {
-            Var(x) => match self.lookup_value(x) {
-                None => Var(x),
-                Some(v) => self.whnf(v),
+            Var(x) => match self.0.iter().rev().find(|elem| x == elem.0) {
+                Some((_, (_, Some(v)))) => self.whnf(*v),
+                _ => Var(x),
             },
             App(e1, e2) => match self.whnf(*e1) {
                 Lambda((x, _, body)) => self.whnf(body.subst1(*x, *e2)),
@@ -441,7 +443,45 @@ impl Context {
         }
     }
     fn equal(&mut self, e1: Expr, e2: Expr) -> bool {
-        self.normalize_no_typeck(e1) == self.normalize_no_typeck(e2)
+        let e1 = self.whnf(e1);
+        let e2 = self.whnf(e2);
+        // Recurse into sub-expressions, applying whnf at each level.
+        match (e1, e2) {
+            (Var(x1), Var(x2)) => x1 == x2,
+            (Type(k1), Type(k2)) => k1 == k2,
+            (Pi(a1), Pi(a2)) | (Lambda(a1), Lambda(a2)) => {
+                let (x, t1, e1) = *a1;
+                let (y, t2, e2) = *a2;
+                let z = x.refresh();
+                self.equal(t1, t2) && self.equal(e1.subst1(x, Var(z)), e2.subst1(y, Var(z)))
+            }
+            (App(f1, a1), App(f2, a2)) => self.equal(*f1, *f2) && self.equal(*a1, *a2),
+            (Struct(f1), Struct(f2)) | (Rec(_, f1), Rec(_, f2)) => self.equal_fields(f1, f2),
+            (StructTy(x1, f1), StructTy(x2, f2)) => {
+                if f1.len() != f2.len() {
+                    return false;
+                }
+                let z = x1.refresh();
+                f1.iter().all(|(n, e)| {
+                    f2.iter().any(|(n2, e2)| {
+                        n == n2 && self.equal(e.subst1(x1, Var(z)), e2.subst1(x2, Var(z)))
+                    })
+                })
+            }
+            (Field(e1, n1), Field(e2, n2)) => n1 == n2 && self.equal(*e1, *e2),
+            (Eq(a1, b1), Eq(a2, b2)) => self.equal(*a1, *a2) && self.equal(*b1, *b2),
+            (Refl(a1), Refl(a2)) => self.equal(*a1, *a2),
+            (Transport((eq1, f1)), Transport((eq2, f2))) => {
+                self.equal(*eq1, *eq2) && self.equal(*f1, *f2)
+            }
+            _ => false,
+        }
+    }
+    fn equal_fields(&mut self, f1: &[(__<str>, Expr)], f2: &[(__<str>, Expr)]) -> bool {
+        f1.len() == f2.len()
+            && f1
+                .iter()
+                .all(|(n, e)| f2.iter().any(|(n2, e2)| n == n2 && self.equal(*e, *e2)))
     }
 }
 
@@ -624,10 +664,7 @@ mod tests {
 
         ctx.add_val("MyTy", p("{ val: N, same: self.val == self.val }"));
         let r = p("rec (MyTy) { val = z, same = refl z }");
-        assert_eq!(
-            ctx.infer_type(r).to_string(),
-            "{ val: N, same: self.val == self.val }"
-        );
+        assert_eq!(ctx.infer_type(r).to_string(), "MyTy");
     }
 
     #[test]
@@ -715,45 +752,45 @@ mod tests {
         );
     }
 
-    //     #[test]
-    //     fn test_unsound_traits() {
-    //         // Reproduce https://github.com/rust-lang/rust/issues/135246#issuecomment-4066328421
-    //         let mut ctx = Context::default();
-    //         ctx.infer_type(p(&[
-    //             // trait Trait<R>: Sized {
-    //             //     type Proof: Trait<R, Proof = Self>;
-    //             // }
-    //             r"
-    //             let rec Trait: fn(Type(0)) -> fn(Type(0)) -> Type(0) = \(t: Type(0)) -> \(r: Type(0)) -> {
-    //                 proof: Type(0),
-    //                 proof_impl: Trait self.proof r,
-    //                 proof_impl_constraint: self.proof_impl.proof == self,
-    //             } in",
-    //             // impl<L, R> Trait<R> for L
-    //             // where
-    //             //     L: Trait<R>, // unsound if all trait bounds are coinductive
-    //             //     // unsoundness: in impl, use item bounds to normalize
-    //             //     // `<L::Proof as Trait<R>>::Proof = L`
-    //             //     R: Trait<R, Proof = <L::Proof as Trait<R>>::Proof>,
-    //             // {
-    //             //     type Proof = R;
-    //             // }
-    //             // r"
-    //             // let rec TraitImpl: Type(0) = \(l: Type(0)) -> \(r: Type(0)) ->
-    //             //     \(l_trait: Trait l r) ->
-    //             //     \(r_trait: Trait r r) ->
-    //             //     \(r_trait_constraint: r_trait.proof == l_trait.proof_impl.proof) ->
-    //             // rec (Trait l r) {
-    //             //     proof = r,
-    //             //     proof_impl = r_trait,
-    //             //     proof_impl_bound: r_trait.proof == self
-    //             // } in",
-    //             r" {=} ",
-    //         ]
-    //         .into_iter()
-    //         .format("")
-    //         .to_string()));
-    //     }
+    #[test]
+    fn test_unsound_traits() {
+        // Reproduce https://github.com/rust-lang/rust/issues/135246#issuecomment-4066328421
+        let mut ctx = Context::default();
+        ctx.infer_type(p(&[
+                // trait Trait<R>: Sized {
+                //     type Proof: Trait<R, Proof = Self>;
+                // }
+                r"
+                let rec Trait: fn(Type(0)) -> fn(Type(0)) -> Type(1) = \(t: Type(0)) -> \(r: Type(0)) -> {
+                    proof: Type(0),
+                    proof_impl: Trait self.proof r,
+                    proof_impl_constraint: self.proof_impl.proof == t,
+                } in",
+                // impl<L, R> Trait<R> for L
+                // where
+                //     L: Trait<R>, // unsound if all trait bounds are coinductive
+                //     // unsoundness: in impl, use item bounds to normalize
+                //     // `<L::Proof as Trait<R>>::Proof = L`
+                //     R: Trait<R, Proof = <L::Proof as Trait<R>>::Proof>,
+                // {
+                //     type Proof = R;
+                // }
+                // r"
+                // let rec TraitImpl: fn(Type(0)) -> fn(Type(0)) -> Type(1) = \(l: Type(0)) -> \(r: Type(0)) ->
+                //     \(l_trait: Trait l r) ->
+                //     \(r_trait: Trait r r) ->
+                //     \(r_trait_constraint: r_trait.proof == l_trait.proof_impl.proof) ->
+                // rec (Trait l r) {
+                //     proof = r,
+                //     proof_impl = r_trait,
+                //     proof_impl_bound: r_trait.proof == self
+                // } in",
+                r" {=} ",
+            ]
+            .into_iter()
+            .format("")
+            .to_string()));
+    }
 
     // --- Rejection tests ---
 
