@@ -39,6 +39,9 @@ enum Expr {
     Pi(__<Abstraction>),
     Lambda(__<Abstraction>),
     App(__<Expr>, __<Expr>),
+    Struct(&'static [(__<str>, Expr)]),
+    StructTy(&'static [(__<str>, Expr)]),
+    Field(__<Expr>, __<str>),
 }
 
 impl Expr {
@@ -49,6 +52,9 @@ impl Expr {
             Pi(a) => Pi(subst_abstraction(s, a)),
             Lambda(a) => Lambda(subst_abstraction(s, a)),
             App(e1, e2) => App(__(e1.subst(s.clone())), __(e2.subst(s))),
+            Struct(fields) => Struct(subst_fields(fields, s)),
+            StructTy(fields) => StructTy(subst_fields(fields, s)),
+            Field(e, name) => Field(__(e.subst(s)), name),
         }
     }
 }
@@ -62,6 +68,18 @@ fn subst_abstraction(
     __((x_, t.subst(s.clone()), e.subst(s)))
 }
 
+fn subst_fields(
+    fields: &'static [(__<str>, Expr)],
+    s: HashMap<Variable, Expr>,
+) -> &'static [(__<str>, Expr)] {
+    let fields: Vec<_> = fields
+        .iter()
+        .map(|&(n, e)| (n, e.subst(s.clone())))
+        .collect();
+    Box::leak(fields.into_boxed_slice())
+}
+
+#[derive(Debug)]
 struct Context(Vec<(Variable, (Expr, Option<Expr>))>);
 
 impl Context {
@@ -106,12 +124,40 @@ impl Context {
                 self.check_equal(*s, te);
                 t.subst([(*x, *e2)].into_iter().collect())
             }
+            StructTy(fields) => {
+                let k = fields
+                    .iter()
+                    .map(|&(_, t)| self.infer_universe(t))
+                    .max()
+                    .unwrap_or(0);
+                Type(k)
+            }
+            Struct(fields) => {
+                let ty_fields: Vec<_> = fields
+                    .iter()
+                    .map(|&(n, e)| (n, self.infer_type(e)))
+                    .collect();
+                StructTy(Box::leak(ty_fields.into_boxed_slice()))
+            }
+            Field(e, name) => {
+                let te = self.infer_type(*e);
+                match self.normalize(te) {
+                    StructTy(fields) => {
+                        fields
+                            .iter()
+                            .find(|(n, _)| *n == name)
+                            .unwrap_or_else(|| panic!("Field {name} not found"))
+                            .1
+                    }
+                    _ => panic!("Struct type expected for field access"),
+                }
+            }
         }
     }
     fn infer_universe(&mut self, t: Expr) -> usize {
-        match self.normalize(t) {
+        match self.infer_type(t) {
             Type(k) => k,
-            _ => panic!("Type expected."),
+            t => panic!("Type expected, got {t:?}."),
         }
     }
     fn normalize(&mut self, e: Expr) -> Expr {
@@ -130,12 +176,34 @@ impl Context {
             Type(k) => Type(k),
             Pi(a) => Pi(self.normalize_abstraction(a)),
             Lambda(a) => Lambda(self.normalize_abstraction(a)),
+            Struct(fields) => Struct(self.normalize_fields(fields)),
+            StructTy(fields) => StructTy(self.normalize_fields(fields)),
+            Field(e, name) => match self.normalize(*e) {
+                Struct(fields) => {
+                    fields
+                        .iter()
+                        .find(|(n, _)| *n == name)
+                        .unwrap_or_else(|| panic!("Field {name} not found"))
+                        .1
+                }
+                e => Field(__(e), name),
+            },
         }
     }
     fn normalize_abstraction(&mut self, (x, t, e): __<Abstraction>) -> __<Abstraction> {
         let t = self.normalize(*t);
         self.extend(*x, t, None);
         __((*x, t, self.normalize(*e)))
+    }
+    fn normalize_fields(
+        &mut self,
+        fields: &'static [(__<str>, Expr)],
+    ) -> &'static [(__<str>, Expr)] {
+        let fields: Vec<_> = fields
+            .iter()
+            .map(|&(n, e)| (n, self.normalize(e)))
+            .collect();
+        Box::leak(fields.into_boxed_slice())
     }
     fn infer_pi(&mut self, e: Expr) -> __<Abstraction> {
         let t = self.infer_type(e);
@@ -157,11 +225,19 @@ impl Context {
                 (Type(k1), Type(k2)) => k1 == k2,
                 (Pi(a1), Pi(a2)) => equal_abstraction(a1, a2),
                 (Lambda(a1), Lambda(a2)) => equal_abstraction(a1, a2),
+                (Struct(f1), Struct(f2)) | (StructTy(f1), StructTy(f2)) => equal_fields(f1, f2),
+                (Field(e1, n1), Field(e2, n2)) => n1 == n2 && equal(*e1, *e2),
                 _ => false,
             }
         }
         fn equal_abstraction((x, t1, e1): __<Abstraction>, (y, t2, e2): __<Abstraction>) -> bool {
             equal(*t1, *t2) && equal(*e1, e2.subst([(*y, Var(*x))].into()))
+        }
+        fn equal_fields(f1: &'static [(__<str>, Expr)], f2: &'static [(__<str>, Expr)]) -> bool {
+            f1.len() == f2.len()
+                && f1
+                    .iter()
+                    .all(|(n, e)| f2.iter().any(|(n2, e2)| n == n2 && equal(*e, *e2)))
         }
 
         let e1_ = self.normalize(e1);
@@ -208,5 +284,45 @@ mod tests {
             "s (s (s (s (s (s (s (s (s z))))))))"
         );
         assert_eq!(ty.to_string(), "N");
+    }
+
+    #[test]
+    fn test_types() {
+        let mut ctx = Context(vec![
+            (Variable::User("N"), (Type(0), None)),
+            (Variable::User("z"), (Var(Variable::User("N")), None)),
+        ]);
+        let sty = parser::parse("fn(_: fn(_: N) -> N) -> fn(_: N) -> N").unwrap();
+        assert_eq!(ctx.infer_type(sty).to_string(), "Type(0)");
+    }
+
+    #[test]
+    fn test_structs() {
+        let mut ctx = Context(vec![
+            (Variable::User("N"), (Type(0), None)),
+            (Variable::User("z"), (Var(Variable::User("N")), None)),
+        ]);
+        // Struct type has a type
+        let sty = parser::parse("{ a: N, b: N }").unwrap();
+        assert_eq!(ctx.infer_type(sty).to_string(), "Type(0)");
+
+        // Struct value has a struct type
+        let sval = parser::parse("{ a = z, b = z }").unwrap();
+        assert_eq!(ctx.infer_type(sval).to_string(), "{ a: N, b: N }");
+
+        // Field access
+        let fa = parser::parse("{ a = z, b = z }.a").unwrap();
+        assert_eq!(ctx.infer_type(fa).to_string(), "N");
+        assert_eq!(ctx.normalize(fa).to_string(), "z");
+
+        // Field access via variable
+        ctx.extend(
+            Variable::User("p"),
+            parser::parse("{ a: N, b: N }").unwrap(),
+            Some(parser::parse("{ a = z, b = z }").unwrap()),
+        );
+        let fb = parser::parse("p.b").unwrap();
+        assert_eq!(ctx.infer_type(fb).to_string(), "N");
+        assert_eq!(ctx.normalize(fb).to_string(), "z");
     }
 }

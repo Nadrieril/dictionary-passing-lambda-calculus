@@ -55,8 +55,30 @@ impl Expr {
                 }
                 Ok(())
             }
+            Struct(fields) if fields.is_empty() => write!(f, "{{=}}"),
+            Struct(fields) => fmt_fields(f, fields, " = "),
+            StructTy(fields) => fmt_fields(f, fields, ": "),
+            Field(e, name) => {
+                e.fmt_prec(f, 2)?;
+                write!(f, ".{name}")
+            }
         }
     }
+}
+
+fn fmt_fields(f: &mut fmt::Formatter<'_>, fields: &[(&str, Expr)], sep: &str) -> fmt::Result {
+    if fields.is_empty() {
+        return write!(f, "{{}}");
+    }
+    write!(f, "{{ ")?;
+    for (i, (name, expr)) in fields.iter().enumerate() {
+        if i > 0 {
+            write!(f, ", ")?;
+        }
+        write!(f, "{name}{sep}")?;
+        expr.fmt_prec(f, 0)?;
+    }
+    write!(f, " }}")
 }
 
 impl fmt::Display for Expr {

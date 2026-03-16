@@ -1,14 +1,15 @@
 use crate::Expr::{self, *};
-use crate::{Variable, __};
+use crate::{__, Variable};
+use nom::IResult;
+use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_while};
 use nom::character::complete::{char as nom_char, digit1};
 use nom::character::complete::{multispace0, satisfy};
+use nom::combinator::opt;
 use nom::combinator::{map, recognize};
-use nom::multi::many0;
+use nom::multi::{many0, separated_list0, separated_list1};
 use nom::sequence::{delimited, pair, preceded};
-use nom::IResult;
-use nom::Parser;
 
 fn leak_str(s: &str) -> &'static str {
     Box::leak(s.to_string().into_boxed_str())
@@ -60,7 +61,12 @@ fn fn_keyword(input: &str) -> IResult<&str, &str> {
 /// `Type(n)`
 fn parse_type(input: &str) -> IResult<&str, Expr> {
     map(
-        (ws(tag("Type")), ws(nom_char('(')), ws(digit1), ws(nom_char(')'))),
+        (
+            ws(tag("Type")),
+            ws(nom_char('(')),
+            ws(digit1),
+            ws(nom_char(')')),
+        ),
         |(_, _, digits, _): (_, _, &str, _)| Type(digits.parse::<usize>().unwrap()),
     )
     .parse(input)
@@ -102,20 +108,74 @@ fn parse_pi(input: &str) -> IResult<&str, Expr> {
     .parse(input)
 }
 
-/// Atom: variable, Type(n), or parenthesized expression.
+/// `{ a = e, b = e }` or `{ a: T, b: T }` or `{}` or `{=}`
+fn parse_struct(input: &str) -> IResult<&str, Expr> {
+    let field_val = |input| {
+        (ident, ws(nom_char('=')), parse_expr)
+            .map(|(n, _, e)| (leak_str(n), e))
+            .parse(input)
+    };
+    let field_ty = |input| {
+        (ident, ws(nom_char(':')), parse_expr)
+            .map(|(n, _, e)| (leak_str(n), e))
+            .parse(input)
+    };
+    alt((
+        // {=} — empty struct value
+        map(
+            (ws(nom_char('{')), ws(nom_char('=')), ws(nom_char('}'))),
+            |_| Struct(Box::leak(Vec::new().into_boxed_slice())),
+        ),
+        // { a = e, ... } — struct value
+        map(
+            delimited(
+                ws(nom_char('{')),
+                separated_list1(ws(nom_char(',')), field_val),
+                (opt(ws(nom_char(','))), ws(nom_char('}'))),
+            ),
+            |fields| Struct(Box::leak(fields.into_boxed_slice())),
+        ),
+        // { a: T, ... } or {} — struct type
+        map(
+            delimited(
+                ws(nom_char('{')),
+                separated_list0(ws(nom_char(',')), field_ty),
+                (opt(ws(nom_char(','))), ws(nom_char('}'))),
+            ),
+            |fields| StructTy(Box::leak(fields.into_boxed_slice())),
+        ),
+    ))
+    .parse(input)
+}
+
+/// Atom: variable, Type(n), struct, or parenthesized expression.
 fn parse_atom(input: &str) -> IResult<&str, Expr> {
     alt((
         parse_type,
+        parse_struct,
         map(variable, Var),
         delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
     ))
     .parse(input)
 }
 
-/// Application: left-associative sequence of atoms.
+/// Postfix: atom followed by zero or more `.field` accesses.
+fn parse_postfix(input: &str) -> IResult<&str, Expr> {
+    let (mut input, mut expr) = parse_atom(input)?;
+    while let Ok((rest, (_, name))) = (ws(nom_char('.')), ident).parse(input) {
+        expr = Field(__(expr), leak_str(name));
+        input = rest;
+    }
+    Ok((input, expr))
+}
+
+/// Application: left-associative sequence of postfix expressions.
 fn parse_app(input: &str) -> IResult<&str, Expr> {
-    (parse_atom, many0(parse_atom))
-        .map(|(first, rest)| rest.into_iter().fold(first, |acc, arg| App(__(acc), __(arg))))
+    (parse_postfix, many0(parse_postfix))
+        .map(|(first, rest)| {
+            rest.into_iter()
+                .fold(first, |acc, arg| App(__(acc), __(arg)))
+        })
         .parse(input)
 }
 
@@ -152,10 +212,24 @@ mod tests {
             "fn(x: Type(0)) -> x",
             r"\(f: fn(_: N) -> N) -> \(x: N) -> f (f (f x))",
             "fn(_: fn(_: N) -> N) -> fn(_: N) -> N",
+            // Structs
+            "{ a: Type(0), b: Type(0) }",
+            "{ a = x, b = y }",
+            "{ x = f y, y = z }",
+            "{}",
+            "{=}",
+            // Field access
+            "x.a",
+            "x.a.b",
+            "f x.a",
+            "(f x).a",
+            "{ a = x, b = y }.a",
+            // Nested structs
+            "{ a: { b: Type(0) } }",
+            r"{ f = \(x: N) -> x }",
         ];
         for input in cases {
-            let expr =
-                parse(input).unwrap_or_else(|e| panic!("failed to parse {input:?}: {e}"));
+            let expr = parse(input).unwrap_or_else(|e| panic!("failed to parse {input:?}: {e}"));
             let output = expr.to_string();
             assert_eq!(output, input, "roundtrip failed for {input:?}");
         }
