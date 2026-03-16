@@ -1,6 +1,13 @@
 #![allow(dead_code)]
-
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use Expr::*;
+
+// A but good
+type __<A> = &'static A;
+fn __<A>(a: A) -> &'static A {
+    Box::leak(Box::new(a))
+}
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
 enum Variable {
@@ -9,28 +16,18 @@ enum Variable {
 }
 
 impl Variable {
-    // Do NOT run more than 1 test.
     fn refresh(self) -> Variable {
-        #[expect(non_upper_case_globals)]
-        static mut k: u128 = 0;
-        unsafe {
-            match self {
-                Variable::User(x) | Variable::SorryDeBruijn(x, _) => {
-                    k += 1;
-                    Variable::SorryDeBruijn(x, k)
-                }
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        match self {
+            Variable::User(x) | Variable::SorryDeBruijn(x, _) => {
+                let k = COUNTER.fetch_add(1, Ordering::Relaxed);
+                Variable::SorryDeBruijn(x, k as u128)
             }
         }
     }
 }
 
 type Abstraction = (Variable, Expr, Expr);
-
-// A but good
-type __<A> = &'static A;
-fn __<A>(a: A) -> &'static A {
-    Box::leak(Box::new(a))
-}
 
 #[derive(Clone, Copy, Debug)]
 enum Expr {
@@ -40,7 +37,6 @@ enum Expr {
     Lambda(__<Abstraction>),
     App(__<Expr>, __<Expr>),
 }
-use Expr::*;
 
 impl Expr {
     fn subst(self, s: HashMap<Variable, Expr>) -> Expr {
@@ -171,15 +167,10 @@ impl Context {
     }
 }
 
-fn main() {
-    println!("Hello, world!");
-}
+fn main() {}
 
 #[cfg(test)]
 mod tests {
-    // Do NOT run more than 1 test until refresh is fixed.
-    use std::time::Duration;
-
     use super::*;
     #[test]
     fn test() {
