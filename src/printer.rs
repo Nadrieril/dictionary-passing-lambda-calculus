@@ -57,7 +57,7 @@ impl Expr {
             }
             Struct(fields) if fields.is_empty() => write!(f, "{{=}}"),
             Struct(fields) => fmt_fields(f, fields, " = "),
-            StructTy(fields) => fmt_fields(f, fields, ": "),
+            StructTy(_, fields) => fmt_fields(f, fields, ": "),
             Field(e, name) => {
                 e.fmt_prec(f, 3)?;
                 write!(f, ".{name}")

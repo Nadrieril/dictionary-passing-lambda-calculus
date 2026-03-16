@@ -161,7 +161,7 @@ fn parse_struct(input: &str) -> IResult<&str, Expr> {
                 separated_list0(ws(nom_char(',')), field_ty),
                 (opt(ws(nom_char(','))), ws(nom_char('}'))),
             ),
-            |fields| StructTy(Box::leak(fields.into_boxed_slice())),
+            |fields| StructTy(Variable::User("self"), Box::leak(fields.into_boxed_slice())),
         ),
     ))
     .parse(input)

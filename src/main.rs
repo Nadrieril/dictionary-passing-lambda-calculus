@@ -39,8 +39,10 @@ enum Expr {
     Pi(__<Abstraction>),
     Lambda(__<Abstraction>),
     App(__<Expr>, __<Expr>),
-    Struct(&'static [(__<str>, Expr)]),
-    StructTy(&'static [(__<str>, Expr)]),
+    Struct(__<[(__<str>, Expr)]>),
+    /// Struct type. Binds a variable (typically `self`) that has the type being constructed,
+    /// making it an unordered dependent record.
+    StructTy(Variable, __<[(__<str>, Expr)]>),
     Field(__<Expr>, __<str>),
     Eq(__<Expr>, __<Expr>),
     Refl(__<Expr>),
@@ -51,7 +53,19 @@ impl PartialEq for Expr {
     fn eq(&self, other: &Self) -> bool {
         match (*self, *other) {
             (Pi(a1), Pi(a2)) | (Lambda(a1), Lambda(a2)) => eq_abstraction(a1, a2),
-            (Struct(f1), Struct(f2)) | (StructTy(f1), StructTy(f2)) => eq_fields(f1, f2),
+            (Struct(f1), Struct(f2)) => eq_fields(f1, f2),
+            (StructTy(x1, f1), StructTy(x2, f2)) => {
+                if f1.len() != f2.len() {
+                    return false;
+                }
+                let z = x1.refresh();
+                let s1: HashMap<_, _> = [(x1, Var(z))].into();
+                let s2: HashMap<_, _> = [(x2, Var(z))].into();
+                f1.iter().all(|(n, e)| {
+                    f2.iter()
+                        .any(|(n2, e2)| n == n2 && e.subst(s1.clone()) == e2.subst(s2.clone()))
+                })
+            }
             (Var(x1), Var(x2)) => x1 == x2,
             (Type(k1), Type(k2)) => k1 == k2,
             (App(e11, e12), App(e21, e22)) => e11 == e21 && e12 == e22,
@@ -80,7 +94,7 @@ fn eq_fields(f1: &[(__<str>, Expr)], f2: &[(__<str>, Expr)]) -> bool {
 }
 
 impl Expr {
-    fn subst(self, s: HashMap<Variable, Expr>) -> Expr {
+    fn subst(self, mut s: HashMap<Variable, Expr>) -> Expr {
         match self {
             Var(x) => s.get(&x).copied().unwrap_or(self),
             Type(k) => Type(k),
@@ -88,7 +102,11 @@ impl Expr {
             Lambda(a) => Lambda(subst_abstraction(s, a)),
             App(e1, e2) => App(__(e1.subst(s.clone())), __(e2.subst(s))),
             Struct(fields) => Struct(subst_fields(fields, s)),
-            StructTy(fields) => StructTy(subst_fields(fields, s)),
+            StructTy(x, fields) => {
+                let x_fresh = x.refresh();
+                s.insert(x, Var(x_fresh));
+                StructTy(x_fresh, subst_fields(fields, s))
+            }
             Field(e, name) => Field(__(e.subst(s)), name),
             Eq(a, b) => Eq(__(a.subst(s.clone())), __(b.subst(s))),
             Refl(a) => Refl(__(a.subst(s))),
@@ -162,8 +180,8 @@ impl Context {
     /// Infers the type of an expression. Also typechecks that expression.
     fn infer_type(&mut self, e: Expr) -> Expr {
         let ty = match e {
-            Var(x) => self.lookup_ty(x),
-            Type(k) => Type(k + 1),
+            Var(x) => return self.lookup_ty(x),
+            Type(k) => return Type(k + 1),
             Pi((x, t1, t2)) => {
                 let k1 = self.infer_universe(*t1);
                 let k2 = self.scoped(|ctx| {
@@ -189,12 +207,15 @@ impl Context {
                 self.check_equal(*s, arg_ty);
                 t.subst([(*x, *arg)].into_iter().collect())
             }
-            StructTy(fields) => {
-                let k = fields
-                    .iter()
-                    .map(|&(_, t)| self.infer_universe(t))
-                    .max()
-                    .unwrap_or(0);
+            StructTy(x, fields) => {
+                let k = self.scoped(|ctx| {
+                    ctx.push(x, e);
+                    fields
+                        .iter()
+                        .map(|&(_, t)| ctx.infer_universe(t))
+                        .max()
+                        .unwrap_or(0)
+                });
                 Type(k)
             }
             Struct(fields) => {
@@ -202,20 +223,22 @@ impl Context {
                     .iter()
                     .map(|&(n, e)| (n, self.infer_type(e)))
                     .collect();
-                StructTy(Box::leak(ty_fields.into_boxed_slice()))
+                StructTy(
+                    Variable::User("self"),
+                    Box::leak(ty_fields.into_boxed_slice()),
+                )
             }
             Field(e, name) => {
                 let te = self.infer_type(*e);
-                match self.whnf(te) {
-                    StructTy(fields) => {
-                        fields
-                            .iter()
-                            .find(|(n, _)| *n == name)
-                            .unwrap_or_else(|| panic!("Field {name} not found"))
-                            .1
-                    }
-                    _ => panic!("Struct type expected for field access"),
-                }
+                let StructTy(self_var, fields) = self.whnf(te) else {
+                    panic!("Struct type expected for field access")
+                };
+                let field_ty = fields
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .unwrap_or_else(|| panic!("Field {name} not found"))
+                    .1;
+                field_ty.subst([(self_var, *e)].into())
             }
             Eq(a, b) => {
                 let ta = self.infer_type(*a);
@@ -240,10 +263,8 @@ impl Context {
                 Eq(__(App(f, a)), __(App(f, b)))
             }
         };
-        if !matches!(ty, Type(_)) {
-            // Recursively check the type is well-formed.
-            let _ = self.infer_type(ty);
-        }
+        // Recursively check the type is well-formed.
+        let _ = self.infer_type(ty);
         ty
     }
     fn infer_universe(&mut self, t: Expr) -> usize {
@@ -300,7 +321,13 @@ impl Context {
             Pi(a) => Pi(self.normalize_abstraction(a)),
             Lambda(a) => Lambda(self.normalize_abstraction(a)),
             Struct(fields) => Struct(self.normalize_fields(fields)),
-            StructTy(fields) => StructTy(self.normalize_fields(fields)),
+            StructTy(x, fields) => {
+                let fields = self.scoped(|ctx| {
+                    ctx.push(x, StructTy(x, fields));
+                    ctx.normalize_fields(fields)
+                });
+                StructTy(x, fields)
+            }
             Field(e, name) => Field(__(self.normalize_no_typeck(*e)), name),
             Eq(a, b) => Eq(
                 __(self.normalize_no_typeck(*a)),
@@ -519,22 +546,22 @@ mod tests {
                 clone_supertrait: Clone t,
             }"),
         );
-        // ctx.add_val(
-        //     "Iterator",
-        //     p(r"\(t: Type(0)) -> fix {
-        //         item_ty: Type(0),
-        //         next_method: fn(t) -> self.item_ty,
-        //     })"),
-        // );
-        // ctx.add_val(
-        //     "IntoIterator",
-        //     p(r"\(t: Type(0)) -> fix {
-        //         item_ty: Type(0),
-        //         into_iter_ty: Type(0),
-        //         iterator_bound: Iterator self.into_iter_ty,
-        //         type_eq: self.item_ty == self.iterator_bound.item_ty,
-        //     })"),
-        // );
+        ctx.add_val(
+            "Iterator",
+            p(r"\(t: Type(0)) -> {
+                item_ty: Type(0),
+                next_method: fn(t) -> self.item_ty,
+            }"),
+        );
+        ctx.add_val(
+            "IntoIterator",
+            p(r"\(t: Type(0)) -> {
+                item_ty: Type(0),
+                into_iter_ty: Type(0),
+                iterator_bound: Iterator self.into_iter_ty,
+                type_eq: self.item_ty == self.iterator_bound.item_ty,
+            }"),
+        );
     }
 
     // --- Rejection tests ---
