@@ -332,7 +332,7 @@ impl Context {
                 let Pi(..) = self.whnf(f_ty) else {
                     panic!("Function expected for transport's second argument")
                 };
-                Eq(__(App(f, a)), __(App(f, b)))
+                Pi(__((Variable::User("_"), App(f, a), App(f, b))))
             }
             Todo(t) => {
                 let _ = self.infer_universe(*t);
@@ -384,7 +384,11 @@ impl Context {
             Transport((eq, f)) => {
                 let eq = self.whnf(*eq);
                 match eq {
-                    Refl(x) => Refl(__(App(f, x))),
+                    // transport (refl x) f : fn(f x) -> f x  reduces to identity
+                    Refl(x) => {
+                        let y = Variable::User("_").refresh();
+                        Lambda(__((y, App(f, x), Var(y))))
+                    }
                     eq => Transport(__((eq, *f))),
                 }
             }
@@ -574,16 +578,19 @@ mod tests {
         let r = p("refl N");
         assert_eq!(ctx.infer_type(r).to_string(), "N == N");
 
-        // transport type-checks
+        // transport type-checks: transport eq f : fn(f N) -> f M
         ctx.add_uninterpreted("eq", p("N == M"));
         let tr = p("transport eq f");
         let ty = ctx.infer_type(tr);
         let ty = ctx.normalize(ty);
-        assert_eq!(ty.to_string(), "(N == N) == (M == N)");
+        assert_eq!(ty.to_string(), "fn(_: N == N) -> M == N");
 
-        // transport with refl normalizes
-        let tr_refl = p("transport (refl N) f");
-        assert_eq!(ctx.normalize(tr_refl).to_string(), "refl (N == N)");
+        // transport with refl reduces to identity
+        assert_eq!(
+            ctx.normalize(p("(transport (refl N) f) (refl N)"))
+                .to_string(),
+            "refl N"
+        );
     }
 
     #[test]
@@ -788,6 +795,16 @@ mod tests {
         // Reproduce https://github.com/rust-lang/rust/issues/135246#issuecomment-4066328421
         let mut ctx = Context::default();
         ctx.infer_type(p(&[
+                r"
+                let transitivity =
+                    \(a: Type(0)) ->
+                    \(b: Type(0)) ->
+                    \(c: Type(0)) ->
+                    \(ab: a == b) ->
+                    \(bc: b == c) ->
+                    transport bc (\(x: Type(0)) -> a == x) ab
+                in
+                ",
                 // trait Trait<R>: Sized {
                 //     type Proof: Trait<R, Proof = Self>;
                 // }

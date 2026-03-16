@@ -241,19 +241,17 @@ fn parse_postfix(input: &str) -> IResult<'_, Expr> {
     Ok((input, expr))
 }
 
-/// Application: left-associative sequence of postfix expressions,
-/// or `refl`/`transport` keyword expressions.
+/// Application: left-associative sequence of postfix expressions.
+/// Keyword expressions (`refl`, `todo`, `transport`) can appear as the head
+/// and are then followed by further arguments, e.g. `transport eq f x`.
 fn parse_app(input: &str) -> IResult<'_, Expr> {
-    alt((
-        parse_refl,
-        parse_todo,
-        parse_transport,
-        (parse_postfix, many0(parse_postfix)).map(|(first, rest)| {
+    let head = alt((parse_refl, parse_todo, parse_transport, parse_postfix));
+    (head, many0(parse_postfix))
+        .map(|(first, rest)| {
             rest.into_iter()
                 .fold(first, |acc, arg| App(__(acc), __(arg)))
-        }),
-    ))
-    .parse(input)
+        })
+        .parse(input)
 }
 
 /// `rec (ty) { a = e, ... }` or `rec (ty) {=}`
@@ -447,6 +445,7 @@ mod tests {
             "f x == g y",
             "refl x",
             "transport eq f",
+            "transport eq f x",
             "(x == y) == (y == x)",
             r"\(x: N) -> x == x",
             "refl (f x)",
