@@ -43,6 +43,8 @@ enum Expr {
     /// Struct type. Binds a variable (typically `self`) that has the type being constructed,
     /// making it an unordered dependent record.
     StructTy(Variable, __<[(__<str>, Expr)]>),
+    /// Record value with explicit type annotation: `rec (ty) { a = e, ... }`.
+    Rec(__<Expr>, __<[(__<str>, Expr)]>),
     Field(__<Expr>, __<str>),
     Eq(__<Expr>, __<Expr>),
     Refl(__<Expr>),
@@ -53,7 +55,7 @@ impl PartialEq for Expr {
     fn eq(&self, other: &Self) -> bool {
         match (*self, *other) {
             (Pi(a1), Pi(a2)) | (Lambda(a1), Lambda(a2)) => eq_abstraction(a1, a2),
-            (Struct(f1), Struct(f2)) => eq_fields(f1, f2),
+            (Struct(f1), Struct(f2)) | (Rec(_, f1), Rec(_, f2)) => eq_fields(f1, f2),
             (StructTy(x1, f1), StructTy(x2, f2)) => {
                 if f1.len() != f2.len() {
                     return false;
@@ -104,7 +106,8 @@ impl Expr {
             Pi(a) => Pi(subst_abstraction(s, a)),
             Lambda(a) => Lambda(subst_abstraction(s, a)),
             App(e1, e2) => App(__(e1.subst(s.clone())), __(e2.subst(s))),
-            Struct(fields) => Struct(subst_fields(fields, s)),
+            Struct(fields) => Struct(subst_fields(fields, s.clone())),
+            Rec(ty, fields) => Rec(__(ty.subst(s.clone())), subst_fields(fields, s)),
             StructTy(x, fields) => {
                 let x_fresh = x.refresh();
                 s.insert(x, Var(x_fresh));
@@ -231,6 +234,24 @@ impl Context {
                     Box::leak(ty_fields.into_boxed_slice()),
                 )
             }
+            Rec(ty, fields) => {
+                let _ = self.infer_universe(*ty);
+                let StructTy(self_var, field_tys) = self.whnf(*ty) else {
+                    panic!("Struct type expected for rec")
+                };
+                // Check each field against the expected type, with self = the rec expression.
+                for &(name, val) in fields.iter() {
+                    let expected = field_tys
+                        .iter()
+                        .find(|(n, _)| *n == name)
+                        .unwrap_or_else(|| panic!("Field {name} not found in type"))
+                        .1;
+                    let expected = expected.subst1(self_var, e);
+                    let actual = self.infer_type(val);
+                    self.check_equal(expected, actual);
+                }
+                *ty
+            }
             Field(e, name) => {
                 let te = self.infer_type(*e);
                 let StructTy(self_var, fields) = self.whnf(te) else {
@@ -266,9 +287,8 @@ impl Context {
                 Eq(__(App(f, a)), __(App(f, b)))
             }
         };
-        // Recursively check the type is well-formed.
-        let _ = self.infer_type(ty);
-        ty
+        // Recursively check the type is well-formed, then normalize.
+        self.normalize(ty)
     }
     fn infer_universe(&mut self, t: Expr) -> usize {
         match self.infer_type(t) {
@@ -293,7 +313,7 @@ impl Context {
                 e1 => App(__(e1), e2),
             },
             Field(e, name) => match self.whnf(*e) {
-                Struct(fields) => self.whnf(
+                Struct(fields) | Rec(_, fields) => self.whnf(
                     fields
                         .iter()
                         .find(|(n, _)| *n == name)
@@ -324,6 +344,10 @@ impl Context {
             Pi(a) => Pi(self.normalize_abstraction(a)),
             Lambda(a) => Lambda(self.normalize_abstraction(a)),
             Struct(fields) => Struct(self.normalize_fields(fields)),
+            Rec(ty, fields) => Rec(
+                __(self.normalize_no_typeck(*ty)),
+                self.normalize_fields(fields),
+            ),
             StructTy(x, fields) => {
                 let fields = self.scoped(|ctx| {
                     ctx.push(x, StructTy(x, fields));
@@ -565,6 +589,39 @@ mod tests {
                 type_eq: self.item_ty == self.iterator_bound.item_ty,
             }"),
         );
+    }
+
+    #[test]
+    fn test_rec() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("z", p("N"));
+
+        let r = p("rec ({ a: N }) { a = z }");
+        assert_eq!(ctx.infer_type(r).to_string(), "{ a: N }");
+        assert_eq!(
+            ctx.normalize(p("rec ({ a: N }) { a = z }.a")).to_string(),
+            "z"
+        );
+
+        ctx.add_val("MyTy", p("{ val: N, same: self.val == self.val }"));
+        let r = p("rec (MyTy) { val = z, same = refl z }");
+        assert_eq!(
+            ctx.infer_type(r).to_string(),
+            "{ val: N, same: self.val == self.val }"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "not equal")]
+    fn test_reject_rec_self_mismatch() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("M", Type(0));
+        ctx.add_uninterpreted("z", p("N"));
+        ctx.add_uninterpreted("m", p("M"));
+        ctx.add_val("T", p("{ a: Type(0), b: Type(0), eq: self.a == self.b }"));
+        ctx.infer_type(p("rec (T) { a = N, b = M, eq = refl N }"));
     }
 
     // --- Rejection tests ---

@@ -22,7 +22,7 @@ fn ws<'a, O>(
     preceded(multispace0, inner)
 }
 
-const KEYWORDS: &[&str] = &["fn", "refl", "transport"];
+const KEYWORDS: &[&str] = &["fn", "rec", "refl", "transport"];
 
 /// Identifier: [a-zA-Z_][a-zA-Z0-9_]*, rejecting keywords.
 fn ident<'a>(original: &'a str) -> IResult<&'a str, &'a str> {
@@ -171,6 +171,7 @@ fn parse_struct(input: &str) -> IResult<&str, Expr> {
 fn parse_atom(input: &str) -> IResult<&str, Expr> {
     alt((
         parse_type,
+        parse_rec,
         parse_struct,
         map(variable, Var),
         delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
@@ -198,6 +199,40 @@ fn parse_app(input: &str) -> IResult<&str, Expr> {
             rest.into_iter()
                 .fold(first, |acc, arg| App(__(acc), __(arg)))
         }),
+    ))
+    .parse(input)
+}
+
+/// `rec (ty) { a = e, ... }` or `rec (ty) {=}`
+fn parse_rec(input: &str) -> IResult<&str, Expr> {
+    let field_val = |input| {
+        (ident, ws(nom_char('=')), parse_expr)
+            .map(|(n, _, e)| (leak_str(n), e))
+            .parse(input)
+    };
+    alt((
+        map(
+            (
+                keyword("rec"),
+                delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
+                ws(nom_char('{')),
+                ws(nom_char('=')),
+                ws(nom_char('}')),
+            ),
+            |(_, ty, _, _, _)| Rec(__(ty), Box::leak(Vec::new().into_boxed_slice())),
+        ),
+        map(
+            (
+                keyword("rec"),
+                delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
+                delimited(
+                    ws(nom_char('{')),
+                    separated_list1(ws(nom_char(',')), field_val),
+                    (opt(ws(nom_char(','))), ws(nom_char('}'))),
+                ),
+            ),
+            |(_, ty, fields)| Rec(__(ty), Box::leak(fields.into_boxed_slice())),
+        ),
     ))
     .parse(input)
 }
@@ -283,6 +318,9 @@ mod tests {
             "(x == y) == (y == x)",
             r"\(x: N) -> x == x",
             "refl (f x)",
+            // Rec
+            "rec ({ a: Type(0) }) {=}",
+            "rec ({ a: Type(0) }) { a = x }",
         ];
         for input in cases {
             let expr = parse(input).unwrap_or_else(|e| panic!("failed to parse {input:?}: {e}"));
