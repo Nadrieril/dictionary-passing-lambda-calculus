@@ -182,7 +182,7 @@ impl Context {
             }
             App(f, arg) => {
                 let f_ty = self.infer_type(*f);
-                let Pi((x, s, t)) = self.normalize_only(f_ty) else {
+                let Pi((x, s, t)) = self.whnf(f_ty) else {
                     panic!("Function expected.")
                 };
                 let arg_ty = self.infer_type(*arg);
@@ -206,7 +206,7 @@ impl Context {
             }
             Field(e, name) => {
                 let te = self.infer_type(*e);
-                match self.normalize_only(te) {
+                match self.whnf(te) {
                     StructTy(fields) => {
                         fields
                             .iter()
@@ -230,11 +230,11 @@ impl Context {
             }
             Transport((eq, f)) => {
                 let eq_ty = self.infer_type(*eq);
-                let Eq(a, b) = self.normalize_only(eq_ty) else {
+                let Eq(a, b) = self.whnf(eq_ty) else {
                     panic!("Equality type expected for transport")
                 };
                 let f_ty = self.infer_type(*f);
-                let Pi(..) = self.normalize_only(f_ty) else {
+                let Pi(..) = self.whnf(f_ty) else {
                     panic!("Function expected for transport's second argument")
                 };
                 Eq(__(App(f, a)), __(App(f, b)))
@@ -257,49 +257,52 @@ impl Context {
         let _ = self.infer_type(e);
         self.normalize_only(e)
     }
-    /// Just normalize the value; prefer `normalize`.
-    fn normalize_only(&mut self, e: Expr) -> Expr {
+    /// Weak head normal form: reduce the outermost redex only.
+    fn whnf(&mut self, e: Expr) -> Expr {
         match e {
             Var(x) => match self.lookup_value(x) {
                 None => Var(x),
-                Some(e) => self.normalize_only(e),
+                Some(v) => self.whnf(v),
             },
-            App(e1, e2) => {
-                let e2 = self.normalize_only(*e2);
-                match self.normalize_only(*e1) {
-                    Lambda((x, _, e1_)) => self.normalize_only(e1_.subst([(*x, e2)].into())),
-                    e1 => App(__(e1), __(e2)),
-                }
-            }
-            Type(k) => Type(k),
-            Pi(a) => Pi(self.normalize_abstraction(a)),
-            Lambda(a) => Lambda(self.normalize_abstraction(a)),
-            Struct(fields) => Struct(self.normalize_fields(fields)),
-            StructTy(fields) => StructTy(self.normalize_fields(fields)),
-            Field(e, name) => match self.normalize_only(*e) {
-                Struct(fields) => {
+            App(e1, e2) => match self.whnf(*e1) {
+                Lambda((x, _, body)) => self.whnf(body.subst([(*x, *e2)].into())),
+                e1 => App(__(e1), e2),
+            },
+            Field(e, name) => match self.whnf(*e) {
+                Struct(fields) => self.whnf(
                     fields
                         .iter()
                         .find(|(n, _)| *n == name)
                         .unwrap_or_else(|| panic!("Field {name} not found"))
-                        .1
-                }
+                        .1,
+                ),
                 e => Field(__(e), name),
             },
+            Transport((eq, f)) => {
+                let eq = self.whnf(*eq);
+                match eq {
+                    Refl(x) => Refl(__(App(f, x))),
+                    eq => Transport(__((eq, *f))),
+                }
+            }
+            _ => e,
+        }
+    }
+    /// Full normalization to normal form. Uses whnf first, then recurses.
+    fn normalize_only(&mut self, e: Expr) -> Expr {
+        match self.whnf(e) {
+            Var(x) => Var(x),
+            Type(k) => Type(k),
+            App(e1, e2) => App(__(self.normalize_only(*e1)), __(self.normalize_only(*e2))),
+            Pi(a) => Pi(self.normalize_abstraction(a)),
+            Lambda(a) => Lambda(self.normalize_abstraction(a)),
+            Struct(fields) => Struct(self.normalize_fields(fields)),
+            StructTy(fields) => StructTy(self.normalize_fields(fields)),
+            Field(e, name) => Field(__(self.normalize_only(*e)), name),
             Eq(a, b) => Eq(__(self.normalize_only(*a)), __(self.normalize_only(*b))),
             Refl(a) => Refl(__(self.normalize_only(*a))),
             Transport((eq, f)) => {
-                let eq = self.normalize_only(*eq);
-                match eq {
-                    Refl(x) => {
-                        let y = self.normalize_only(App(f, x));
-                        Refl(__(y))
-                    }
-                    eq => {
-                        let f = self.normalize_only(*f);
-                        Transport(__((eq, f)))
-                    }
-                }
+                Transport(__((self.normalize_only(*eq), self.normalize_only(*f))))
             }
         }
     }
