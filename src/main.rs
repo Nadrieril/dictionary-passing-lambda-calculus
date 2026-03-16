@@ -32,7 +32,7 @@ impl Variable {
 
 type Abstraction = (Variable, Expr, Expr);
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq)]
 enum Expr {
     Var(Variable),
     Type(usize),
@@ -45,6 +45,38 @@ enum Expr {
     Eq(__<Expr>, __<Expr>),
     Refl(__<Expr>),
     Transport(__<(Expr, Expr)>),
+}
+
+impl PartialEq for Expr {
+    fn eq(&self, other: &Self) -> bool {
+        match (*self, *other) {
+            (Pi(a1), Pi(a2)) | (Lambda(a1), Lambda(a2)) => eq_abstraction(a1, a2),
+            (Struct(f1), Struct(f2)) | (StructTy(f1), StructTy(f2)) => eq_fields(f1, f2),
+            (Var(x1), Var(x2)) => x1 == x2,
+            (Type(k1), Type(k2)) => k1 == k2,
+            (App(e11, e12), App(e21, e22)) => e11 == e21 && e12 == e22,
+            (Field(e1, n1), Field(e2, n2)) => n1 == n2 && e1 == e2,
+            (Eq(a1, b1), Eq(a2, b2)) => a1 == a2 && b1 == b2,
+            (Refl(a1), Refl(a2)) => a1 == a2,
+            (Transport((eq1, f1)), Transport((eq2, f2))) => eq1 == eq2 && f1 == f2,
+            _ => false,
+        }
+    }
+}
+
+/// Alpha-equality for abstractions: freshen both binders to a common variable.
+fn eq_abstraction(a1: __<Abstraction>, a2: __<Abstraction>) -> bool {
+    let (x, t1, e1) = *a1;
+    let (y, t2, e2) = *a2;
+    let z = x.refresh();
+    t1 == t2 && e1.subst([(x, Var(z))].into()) == e2.subst([(y, Var(z))].into())
+}
+
+fn eq_fields(f1: &[(__<str>, Expr)], f2: &[(__<str>, Expr)]) -> bool {
+    f1.len() == f2.len()
+        && f1
+            .iter()
+            .all(|(n, e)| f2.iter().any(|(n2, e2)| n == n2 && e == e2))
 }
 
 impl Expr {
@@ -286,41 +318,7 @@ impl Context {
         }
     }
     fn equal(&mut self, e1: Expr, e2: Expr) -> bool {
-        fn equal(e1: Expr, e2: Expr) -> bool {
-            match (e1, e2) {
-                (Var(x1), Var(x2)) => x1 == x2,
-                (App(e11, e12), App(e21, e22)) => equal(*e11, *e21) && equal(*e12, *e22),
-                (Type(k1), Type(k2)) => k1 == k2,
-                (Pi(a1), Pi(a2)) => equal_abstraction(a1, a2),
-                (Lambda(a1), Lambda(a2)) => equal_abstraction(a1, a2),
-                (Struct(f1), Struct(f2)) | (StructTy(f1), StructTy(f2)) => equal_fields(f1, f2),
-                (Field(e1, n1), Field(e2, n2)) => n1 == n2 && equal(*e1, *e2),
-                (Eq(a1, b1), Eq(a2, b2)) => equal(*a1, *a2) && equal(*b1, *b2),
-                (Refl(a1), Refl(a2)) => equal(*a1, *a2),
-                (Transport((eq1, f1)), Transport((eq2, f2))) => {
-                    equal(*eq1, *eq2) && equal(*f1, *f2)
-                }
-                _ => false,
-            }
-        }
-        fn equal_abstraction((x, t1, e1): __<Abstraction>, (y, t2, e2): __<Abstraction>) -> bool {
-            let z = x.refresh();
-            equal(*t1, *t2)
-                && equal(
-                    e1.subst([(*x, Var(z))].into()),
-                    e2.subst([(*y, Var(z))].into()),
-                )
-        }
-        fn equal_fields(f1: &'static [(__<str>, Expr)], f2: &'static [(__<str>, Expr)]) -> bool {
-            f1.len() == f2.len()
-                && f1
-                    .iter()
-                    .all(|(n, e)| f2.iter().any(|(n2, e2)| n == n2 && equal(*e, *e2)))
-        }
-
-        let e1_ = self.normalize_only(e1);
-        let e2_ = self.normalize_only(e2);
-        equal(e1_, e2_)
+        self.normalize_only(e1) == self.normalize_only(e2)
     }
 }
 
@@ -471,9 +469,8 @@ mod tests {
             p(r"\(t: Type(0)) -> \(u: Type(0)) -> \(f: fn(t) -> u) -> \(x: t) -> f x"),
         );
         assert_eq!(
-            ctx.normalize(p("ap N (fn(N) -> N) (ap N N) s z"))
-                .to_string(),
-            r"s z"
+            ctx.normalize(p("ap (fn(N) -> N) (fn(N) -> N) (ap N N)")),
+            p(r"\(x1: fn(N) -> N) -> \(x2: N) -> x1 x2")
         );
     }
 
