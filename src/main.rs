@@ -497,7 +497,6 @@ mod tests {
     #[test]
     fn test_traits() {
         let mut ctx = Context::default();
-        ctx.add_uninterpreted("fix", p(r"fn(fn(Type(0)) -> Type(0)) -> Type(0)"));
         ctx.add_val(
             "Clone",
             p(r"\(t: Type(0)) -> {
@@ -512,9 +511,18 @@ mod tests {
         );
         // ctx.add_val(
         //     "Iterator",
-        //     p(r"\(t: Type(0)) -> fix (\(self: Type(0)) -> {
+        //     p(r"\(t: Type(0)) -> fix {
         //         item_ty: Type(0),
         //         next_method: fn(t) -> self.item_ty,
+        //     })"),
+        // );
+        // ctx.add_val(
+        //     "IntoIterator",
+        //     p(r"\(t: Type(0)) -> fix {
+        //         item_ty: Type(0),
+        //         into_iter_ty: Type(0),
+        //         iterator_bound: Iterator self.into_iter_ty,
+        //         type_eq: self.item_ty == self.iterator_bound.item_ty,
         //     })"),
         // );
     }
