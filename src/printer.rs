@@ -69,6 +69,34 @@ impl Expr {
                 write!(f, ") ")?;
                 fmt_fields(f, fields, " = ")
             }
+            Let(x, e1, e2) => {
+                if prec > 0 {
+                    write!(f, "(")?;
+                }
+                write!(f, "let {x} = ")?;
+                e1.fmt_prec(f, 0)?;
+                write!(f, " in ")?;
+                e2.fmt_prec(f, 0)?;
+                if prec > 0 {
+                    write!(f, ")")?;
+                }
+                Ok(())
+            }
+            LetRec(x, ty, e1, e2) => {
+                if prec > 0 {
+                    write!(f, "(")?;
+                }
+                write!(f, "let rec {x}: ")?;
+                ty.fmt_prec(f, 0)?;
+                write!(f, " = ")?;
+                e1.fmt_prec(f, 0)?;
+                write!(f, " in ")?;
+                e2.fmt_prec(f, 0)?;
+                if prec > 0 {
+                    write!(f, ")")?;
+                }
+                Ok(())
+            }
             Field(e, name) => {
                 e.fmt_prec(f, 3)?;
                 write!(f, ".{name}")

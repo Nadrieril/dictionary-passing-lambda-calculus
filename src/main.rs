@@ -46,6 +46,10 @@ enum Expr {
     /// Record value with explicit type annotation: `rec (ty) { a = e, ... }`.
     Rec(__<Expr>, __<[(__<str>, Expr)]>),
     Field(__<Expr>, __<str>),
+    /// `let x = e1 in e2`.
+    Let(Variable, __<Expr>, __<Expr>),
+    /// `let rec x: T = e1 in e2`.
+    LetRec(Variable, __<Expr>, __<Expr>, __<Expr>),
     Eq(__<Expr>, __<Expr>),
     Refl(__<Expr>),
     Transport(__<(Expr, Expr)>),
@@ -72,6 +76,10 @@ impl PartialEq for Expr {
             (Type(k1), Type(k2)) => k1 == k2,
             (App(e11, e12), App(e21, e22)) => e11 == e21 && e12 == e22,
             (Field(e1, n1), Field(e2, n2)) => n1 == n2 && e1 == e2,
+            (Let(x1, e1, b1), Let(x2, e2, b2)) => x1 == x2 && e1 == e2 && b1 == b2,
+            (LetRec(x1, t1, e1, b1), LetRec(x2, t2, e2, b2)) => {
+                x1 == x2 && t1 == t2 && e1 == e2 && b1 == b2
+            }
             (Eq(a1, b1), Eq(a2, b2)) => a1 == a2 && b1 == b2,
             (Refl(a1), Refl(a2)) => a1 == a2,
             (Transport((eq1, f1)), Transport((eq2, f2))) => eq1 == eq2 && f1 == f2,
@@ -112,6 +120,22 @@ impl Expr {
                 let x_fresh = x.refresh();
                 s.insert(x, Var(x_fresh));
                 StructTy(x_fresh, subst_fields(fields, s))
+            }
+            Let(x, e1, e2) => {
+                let e1 = e1.subst(s.clone());
+                let x_fresh = x.refresh();
+                s.insert(x, Var(x_fresh));
+                Let(x_fresh, __(e1), __(e2.subst(s)))
+            }
+            LetRec(x, ty, e1, e2) => {
+                let x_fresh = x.refresh();
+                s.insert(x, Var(x_fresh));
+                LetRec(
+                    x_fresh,
+                    __(ty.subst(s.clone())),
+                    __(e1.subst(s.clone())),
+                    __(e2.subst(s)),
+                )
             }
             Field(e, name) => Field(__(e.subst(s)), name),
             Eq(a, b) => Eq(__(a.subst(s.clone())), __(b.subst(s))),
@@ -252,10 +276,29 @@ impl Context {
                 }
                 *ty
             }
+            Let(x, e1, e2) => {
+                let t1 = self.infer_type(*e1);
+                return self.scoped(|ctx| {
+                    ctx.0.push((x, (t1, Some(*e1))));
+                    ctx.infer_type(*e2)
+                });
+            }
+            LetRec(x, ty, e1, e2) => {
+                let _ = self.infer_universe(*ty);
+                return self.scoped(|ctx| {
+                    ctx.push(x, *ty);
+                    let t1 = ctx.infer_type(*e1);
+                    ctx.check_equal(*ty, t1);
+                    // Re-push x with its value so it can reduce in e2.
+                    ctx.0.push((x, (*ty, Some(*e1))));
+                    ctx.infer_type(*e2)
+                });
+            }
             Field(e, name) => {
                 let te = self.infer_type(*e);
-                let StructTy(self_var, fields) = self.whnf(te) else {
-                    panic!("Struct type expected for field access")
+                let te = self.whnf(te);
+                let StructTy(self_var, fields) = te else {
+                    panic!("Struct type expected for field access, got `{te}`")
                 };
                 let field_ty = fields
                     .iter()
@@ -322,6 +365,12 @@ impl Context {
                 ),
                 e => Field(__(e), name),
             },
+            Let(x, e1, e2) => self.whnf(e2.subst1(x, *e1)),
+            LetRec(x, ty, e1, e2) => {
+                let fixpoint = LetRec(x, ty, e1, __(Var(x)));
+                let e1_unrolled = e1.subst1(x, fixpoint);
+                self.whnf(e2.subst1(x, e1_unrolled))
+            }
             Transport((eq, f)) => {
                 let eq = self.whnf(*eq);
                 match eq {
@@ -355,6 +404,7 @@ impl Context {
                 });
                 StructTy(x, fields)
             }
+            Let(..) | LetRec(..) => unreachable!("let reduced by whnf"),
             Field(e, name) => Field(__(self.normalize_no_typeck(*e)), name),
             Eq(a, b) => Eq(
                 __(self.normalize_no_typeck(*a)),
@@ -400,6 +450,7 @@ fn main() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use itertools::Itertools;
 
     fn p(s: &str) -> Expr {
         parser::parse(s).unwrap()
@@ -559,6 +610,79 @@ mod tests {
     }
 
     #[test]
+    fn test_rec() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("z", p("N"));
+
+        let r = p("rec ({ a: N }) { a = z }");
+        assert_eq!(ctx.infer_type(r).to_string(), "{ a: N }");
+        assert_eq!(
+            ctx.normalize(p("rec ({ a: N }) { a = z }.a")).to_string(),
+            "z"
+        );
+
+        ctx.add_val("MyTy", p("{ val: N, same: self.val == self.val }"));
+        let r = p("rec (MyTy) { val = z, same = refl z }");
+        assert_eq!(
+            ctx.infer_type(r).to_string(),
+            "{ val: N, same: self.val == self.val }"
+        );
+    }
+
+    #[test]
+    fn test_let() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("z", p("N"));
+        ctx.add_uninterpreted("s", p("fn(N) -> N"));
+
+        // Basic let
+        assert_eq!(ctx.normalize(p("let x = z in s x")).to_string(), "s z");
+        assert_eq!(ctx.infer_type(p("let x = z in x")).to_string(), "N");
+
+        // Nested let
+        assert_eq!(
+            ctx.normalize(p("let x = z in let y = s x in s y"))
+                .to_string(),
+            "s (s z)"
+        );
+    }
+
+    #[test]
+    fn test_let_rec() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("z", p("N"));
+
+        // let rec with self-referential struct — field access through the fixpoint
+        let expr = p(r"
+            let rec x: { a: N, b: self.a == self.a } = rec ({ a: N, b: self.a == self.a }) { a = z, b = refl z }
+            in x.a
+        ");
+        assert_eq!(ctx.normalize(expr).to_string(), "z");
+
+        // let rec where a later field references an earlier one via self
+        let expr = p(r"
+            let rec x: { a: N, b: N } = { a = z, b = x.a }
+            in x.b
+        ");
+        assert_eq!(ctx.normalize(expr).to_string(), "z");
+    }
+
+    #[test]
+    #[should_panic(expected = "not equal")]
+    fn test_reject_rec_self_mismatch() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("M", Type(0));
+        ctx.add_uninterpreted("z", p("N"));
+        ctx.add_uninterpreted("m", p("M"));
+        ctx.add_val("T", p("{ a: Type(0), b: Type(0), eq: self.a == self.b }"));
+        ctx.infer_type(p("rec (T) { a = N, b = M, eq = refl N }"));
+    }
+
+    #[test]
     fn test_traits() {
         let mut ctx = Context::default();
         ctx.add_val(
@@ -591,38 +715,45 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_rec() {
-        let mut ctx = Context::default();
-        ctx.add_uninterpreted("N", Type(0));
-        ctx.add_uninterpreted("z", p("N"));
-
-        let r = p("rec ({ a: N }) { a = z }");
-        assert_eq!(ctx.infer_type(r).to_string(), "{ a: N }");
-        assert_eq!(
-            ctx.normalize(p("rec ({ a: N }) { a = z }.a")).to_string(),
-            "z"
-        );
-
-        ctx.add_val("MyTy", p("{ val: N, same: self.val == self.val }"));
-        let r = p("rec (MyTy) { val = z, same = refl z }");
-        assert_eq!(
-            ctx.infer_type(r).to_string(),
-            "{ val: N, same: self.val == self.val }"
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "not equal")]
-    fn test_reject_rec_self_mismatch() {
-        let mut ctx = Context::default();
-        ctx.add_uninterpreted("N", Type(0));
-        ctx.add_uninterpreted("M", Type(0));
-        ctx.add_uninterpreted("z", p("N"));
-        ctx.add_uninterpreted("m", p("M"));
-        ctx.add_val("T", p("{ a: Type(0), b: Type(0), eq: self.a == self.b }"));
-        ctx.infer_type(p("rec (T) { a = N, b = M, eq = refl N }"));
-    }
+    //     #[test]
+    //     fn test_unsound_traits() {
+    //         // Reproduce https://github.com/rust-lang/rust/issues/135246#issuecomment-4066328421
+    //         let mut ctx = Context::default();
+    //         ctx.infer_type(p(&[
+    //             // trait Trait<R>: Sized {
+    //             //     type Proof: Trait<R, Proof = Self>;
+    //             // }
+    //             r"
+    //             let rec Trait: fn(Type(0)) -> fn(Type(0)) -> Type(0) = \(t: Type(0)) -> \(r: Type(0)) -> {
+    //                 proof: Type(0),
+    //                 proof_impl: Trait self.proof r,
+    //                 proof_impl_constraint: self.proof_impl.proof == self,
+    //             } in",
+    //             // impl<L, R> Trait<R> for L
+    //             // where
+    //             //     L: Trait<R>, // unsound if all trait bounds are coinductive
+    //             //     // unsoundness: in impl, use item bounds to normalize
+    //             //     // `<L::Proof as Trait<R>>::Proof = L`
+    //             //     R: Trait<R, Proof = <L::Proof as Trait<R>>::Proof>,
+    //             // {
+    //             //     type Proof = R;
+    //             // }
+    //             // r"
+    //             // let rec TraitImpl: Type(0) = \(l: Type(0)) -> \(r: Type(0)) ->
+    //             //     \(l_trait: Trait l r) ->
+    //             //     \(r_trait: Trait r r) ->
+    //             //     \(r_trait_constraint: r_trait.proof == l_trait.proof_impl.proof) ->
+    //             // rec (Trait l r) {
+    //             //     proof = r,
+    //             //     proof_impl = r_trait,
+    //             //     proof_impl_bound: r_trait.proof == self
+    //             // } in",
+    //             r" {=} ",
+    //         ]
+    //         .into_iter()
+    //         .format("")
+    //         .to_string()));
+    //     }
 
     // --- Rejection tests ---
 

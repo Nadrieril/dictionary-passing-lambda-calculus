@@ -22,7 +22,7 @@ fn ws<'a, O>(
     preceded(multispace0, inner)
 }
 
-const KEYWORDS: &[&str] = &["fn", "rec", "refl", "transport"];
+const KEYWORDS: &[&str] = &["fn", "in", "let", "rec", "refl", "transport"];
 
 /// Identifier: [a-zA-Z_][a-zA-Z0-9_]*, rejecting keywords.
 fn ident<'a>(original: &'a str) -> IResult<&'a str, &'a str> {
@@ -262,8 +262,43 @@ fn parse_eq(input: &str) -> IResult<&str, Expr> {
     }
 }
 
+/// `let x = e1 in e2`
+fn parse_let(input: &str) -> IResult<&str, Expr> {
+    map(
+        (
+            keyword("let"),
+            variable,
+            ws(nom_char('=')),
+            parse_expr,
+            keyword("in"),
+            parse_expr,
+        ),
+        |(_, x, _, e1, _, e2)| Let(x, __(e1), __(e2)),
+    )
+    .parse(input)
+}
+
+/// `let rec x: T = e1 in e2`
+fn parse_let_rec(input: &str) -> IResult<&str, Expr> {
+    map(
+        (
+            keyword("let"),
+            keyword("rec"),
+            variable,
+            ws(nom_char(':')),
+            parse_expr,
+            ws(nom_char('=')),
+            parse_expr,
+            keyword("in"),
+            parse_expr,
+        ),
+        |(_, _, x, _, ty, _, e1, _, e2)| LetRec(x, __(ty), __(e1), __(e2)),
+    )
+    .parse(input)
+}
+
 fn parse_expr(input: &str) -> IResult<&str, Expr> {
-    alt((parse_lambda, parse_pi, parse_eq)).parse(input)
+    alt((parse_let_rec, parse_let, parse_lambda, parse_pi, parse_eq)).parse(input)
 }
 
 pub fn parse(input: &str) -> Result<Expr, String> {
@@ -321,6 +356,9 @@ mod tests {
             // Rec
             "rec ({ a: Type(0) }) {=}",
             "rec ({ a: Type(0) }) { a = x }",
+            // Let
+            "let x = y in x",
+            "let rec x: Type(0) = N in x",
         ];
         for input in cases {
             let expr = parse(input).unwrap_or_else(|e| panic!("failed to parse {input:?}: {e}"));
