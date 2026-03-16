@@ -108,7 +108,7 @@ impl Context {
     fn lookup_value(&self, x: Variable) -> Option<Expr> {
         self.get(x).1
     }
-    fn extend(&mut self, x: Variable, t: Expr, value: Option<Expr>) {
+    fn push(&mut self, x: Variable, t: Expr, value: Option<Expr>) {
         self.0.push((x, (t, value)));
     }
     fn infer_type(&mut self, e: Expr) -> Expr {
@@ -117,14 +117,14 @@ impl Context {
             Type(k) => Type(k + 1),
             Pi((x, t1, t2)) => {
                 let k1 = self.infer_universe(*t1);
-                self.extend(*x, *t1, None);
+                self.push(*x, *t1, None);
                 let k2 = self.infer_universe(*t2);
                 Type(k1.max(k2))
             }
             Lambda((x, t, e)) => {
                 let _ = self.infer_universe(*t);
                 let te = {
-                    self.extend(*x, *t, None);
+                    self.push(*x, *t, None);
                     self.infer_type(*e)
                 };
                 Pi(__((*x, *t, te)))
@@ -244,7 +244,7 @@ impl Context {
     }
     fn normalize_abstraction(&mut self, (x, t, e): __<Abstraction>) -> __<Abstraction> {
         let t = self.normalize(*t);
-        self.extend(*x, t, None);
+        self.push(*x, t, None);
         __((*x, t, self.normalize(*e)))
     }
     fn normalize_fields(
@@ -359,7 +359,7 @@ mod tests {
         assert_eq!(ctx.normalize(fa).to_string(), "z");
 
         // Field access via variable
-        ctx.extend(
+        ctx.push(
             Variable::User("p"),
             parser::parse("{ a: N, b: N }").unwrap(),
             Some(parser::parse("{ a = z, b = z }").unwrap()),
@@ -392,7 +392,7 @@ mod tests {
         assert_eq!(ctx.infer_type(r).to_string(), "N == N");
 
         // transport type-checks
-        ctx.extend(Variable::User("eq"), parser::parse("N == M").unwrap(), None);
+        ctx.push(Variable::User("eq"), parser::parse("N == M").unwrap(), None);
         let tr = parser::parse("transport N M eq f").unwrap();
         let ty = ctx.infer_type(tr);
         let ty = ctx.normalize(ty);
