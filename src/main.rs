@@ -115,9 +115,16 @@ impl Context {
         let t = self.infer_type(value);
         self.0.push((x, (t, Some(value))));
     }
-    /// Push a value to the context stack.
+    /// Push a variable to the context stack.
     fn push(&mut self, x: Variable, t: Expr) {
         self.0.push((x, (t, None)));
+    }
+    /// Run `f` with a temporary scope: any `push` calls inside are undone on return.
+    fn scoped<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        let len = self.0.len();
+        let result = f(self);
+        self.0.truncate(len);
+        result
     }
 
     fn infer_type(&mut self, e: Expr) -> Expr {
@@ -126,16 +133,18 @@ impl Context {
             Type(k) => Type(k + 1),
             Pi((x, t1, t2)) => {
                 let k1 = self.infer_universe(*t1);
-                self.push(*x, *t1);
-                let k2 = self.infer_universe(*t2);
+                let k2 = self.scoped(|ctx| {
+                    ctx.push(*x, *t1);
+                    ctx.infer_universe(*t2)
+                });
                 Type(k1.max(k2))
             }
             Lambda((x, t, e)) => {
                 let _ = self.infer_universe(*t);
-                let te = {
-                    self.push(*x, *t);
-                    self.infer_type(*e)
-                };
+                let te = self.scoped(|ctx| {
+                    ctx.push(*x, *t);
+                    ctx.infer_type(*e)
+                });
                 Pi(__((*x, *t, te)))
             }
             App(f, arg) => {
@@ -249,8 +258,11 @@ impl Context {
     }
     fn normalize_abstraction(&mut self, (x, t, e): __<Abstraction>) -> __<Abstraction> {
         let t = self.normalize(*t);
-        self.push(*x, t);
-        __((*x, t, self.normalize(*e)))
+        let e = self.scoped(|ctx| {
+            ctx.push(*x, t);
+            ctx.normalize(*e)
+        });
+        __((*x, t, e))
     }
     fn normalize_fields(
         &mut self,
@@ -286,7 +298,12 @@ impl Context {
             }
         }
         fn equal_abstraction((x, t1, e1): __<Abstraction>, (y, t2, e2): __<Abstraction>) -> bool {
-            equal(*t1, *t2) && equal(*e1, e2.subst([(*y, Var(*x))].into()))
+            let z = x.refresh();
+            equal(*t1, *t2)
+                && equal(
+                    e1.subst([(*x, Var(z))].into()),
+                    e2.subst([(*y, Var(z))].into()),
+                )
         }
         fn equal_fields(f1: &'static [(__<str>, Expr)], f2: &'static [(__<str>, Expr)]) -> bool {
             f1.len() == f2.len()
@@ -390,5 +407,103 @@ mod tests {
         // transport with refl normalizes
         let tr_refl = p("transport (refl N) f");
         assert_eq!(ctx.normalize(tr_refl).to_string(), "refl (N == N)");
+    }
+
+    #[test]
+    fn test_scoping() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("M", Type(0));
+        ctx.add_uninterpreted("x", p("N"));
+
+        // Type-checking a lambda that shadows x should not leak x:M
+        ctx.infer_type(p(r"\(x: M) -> x"));
+        assert_eq!(ctx.infer_type(p("x")).to_string(), "N");
+
+        // Same for normalization
+        ctx.normalize(p(r"\(x: M) -> x"));
+        assert_eq!(ctx.infer_type(p("x")).to_string(), "N");
+
+        // A defined variable should still reduce after normalizing a shadowing binder
+        ctx.add_val("y", p("x"));
+        ctx.normalize(p(r"\(y: M) -> y"));
+        assert_eq!(ctx.normalize(p("y")).to_string(), "x");
+    }
+
+    #[test]
+    fn test_capture_avoidance() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("x", p("N"));
+        ctx.add_uninterpreted("y", p("N"));
+        ctx.add_uninterpreted("z", p("N"));
+        ctx.add_uninterpreted("s", p("fn(N) -> N"));
+
+        assert_eq!(
+            ctx.normalize(p(r"(\(y: N) -> \(x: N) -> y) x z"))
+                .to_string(),
+            "x"
+        );
+        assert_eq!(
+            ctx.normalize(p(r"(\(x: N) -> \(x: N) -> x) y z"))
+                .to_string(),
+            "z"
+        );
+        assert_eq!(
+            ctx.normalize(p(r"(\(x: N) -> (\(y: N) -> \(x: N) -> y) x) z y"))
+                .to_string(),
+            "z"
+        );
+        assert_eq!(
+            ctx.normalize(p(r"(\(f: fn(N) -> N) -> f (f x)) (\(x: N) -> s x)"))
+                .to_string(),
+            "s (s x)"
+        );
+
+        ctx.add_val(
+            "ap",
+            p(r"\(t: Type(0)) -> \(u: Type(0)) -> \(f: fn(t) -> u) -> \(x: t) -> f x"),
+        );
+        assert_eq!(
+            ctx.normalize(p("ap N (fn(N) -> N) (ap N N) s z"))
+                .to_string(),
+            r"s z"
+        );
+    }
+
+    #[test]
+    fn test_equality_capture() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("x", Type(0));
+
+        let id_ty = p("fn(x: Type(0)) -> x");
+        let const_ty = p("fn(y: Type(0)) -> x");
+        assert!(!ctx.equal(id_ty, const_ty));
+    }
+
+    #[test]
+    fn test_traits() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("fix", p(r"fn(fn(Type(0)) -> Type(0)) -> Type(0)"));
+        ctx.add_val(
+            "Clone",
+            p(r"\(t: Type(0)) -> {
+                clone_method: fn(_: t) -> t,
+            }"),
+        );
+        ctx.add_val(
+            "Copy",
+            p(r"\(t: Type(0)) -> {
+                clone_supertrait: Clone t,
+            }"),
+        );
+        // ctx.add_val(
+        //     "Iterator",
+        //     p(r"\(t: Type(0)) -> fix (\(self: Type(0)) -> {
+        //         item_ty: Type(0),
+        //         next_method: fn(t) -> self.item_ty,
+        //     })"),
+        // );
     }
 }
