@@ -1,7 +1,7 @@
 #![allow(dead_code)]
+use Expr::*;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use Expr::*;
 
 mod parser;
 mod printer;
@@ -44,7 +44,7 @@ enum Expr {
     Field(__<Expr>, __<str>),
     Eq(__<Expr>, __<Expr>),
     Refl(__<Expr>),
-    Transport(__<(Expr, Expr, Expr, Expr)>),
+    Transport(__<(Expr, Expr)>),
 }
 
 impl Expr {
@@ -60,12 +60,7 @@ impl Expr {
             Field(e, name) => Field(__(e.subst(s)), name),
             Eq(a, b) => Eq(__(a.subst(s.clone())), __(b.subst(s))),
             Refl(a) => Refl(__(a.subst(s))),
-            Transport((a, b, eq, f)) => Transport(__((
-                a.subst(s.clone()),
-                b.subst(s.clone()),
-                eq.subst(s.clone()),
-                f.subst(s),
-            ))),
+            Transport((eq, f)) => Transport(__((eq.subst(s.clone()), f.subst(s)))),
         }
     }
 }
@@ -191,13 +186,11 @@ impl Context {
                 let _ = self.infer_type(*a);
                 Eq(a, a)
             }
-            Transport((a, b, eq, f)) => {
+            Transport((eq, f)) => {
                 let eq_ty = self.infer_type(*eq);
-                let Eq(ea, eb) = self.normalize(eq_ty) else {
+                let Eq(a, b) = self.normalize(eq_ty) else {
                     panic!("Equality type expected for transport")
                 };
-                self.check_equal(*a, *ea);
-                self.check_equal(*b, *eb);
                 let _ = self.infer_type(*f);
                 Eq(__(App(f, a)), __(App(f, b)))
             }
@@ -239,7 +232,7 @@ impl Context {
             },
             Eq(a, b) => Eq(__(self.normalize(*a)), __(self.normalize(*b))),
             Refl(a) => Refl(__(self.normalize(*a))),
-            Transport((a, b, eq, f)) => {
+            Transport((eq, f)) => {
                 let eq = self.normalize(*eq);
                 match eq {
                     Refl(x) => {
@@ -247,10 +240,8 @@ impl Context {
                         Refl(__(y))
                     }
                     eq => {
-                        let a = self.normalize(*a);
-                        let b = self.normalize(*b);
                         let f = self.normalize(*f);
-                        Transport(__((a, b, eq, f)))
+                        Transport(__((eq, f)))
                     }
                 }
             }
@@ -288,8 +279,8 @@ impl Context {
                 (Field(e1, n1), Field(e2, n2)) => n1 == n2 && equal(*e1, *e2),
                 (Eq(a1, b1), Eq(a2, b2)) => equal(*a1, *a2) && equal(*b1, *b2),
                 (Refl(a1), Refl(a2)) => equal(*a1, *a2),
-                (Transport((a1, b1, eq1, f1)), Transport((a2, b2, eq2, f2))) => {
-                    equal(*a1, *a2) && equal(*b1, *b2) && equal(*eq1, *eq2) && equal(*f1, *f2)
+                (Transport((eq1, f1)), Transport((eq2, f2))) => {
+                    equal(*eq1, *eq2) && equal(*f1, *f2)
                 }
                 _ => false,
             }
@@ -391,13 +382,13 @@ mod tests {
 
         // transport type-checks
         ctx.add_uninterpreted("eq", p("N == M"));
-        let tr = p("transport N M eq f");
+        let tr = p("transport eq f");
         let ty = ctx.infer_type(tr);
         let ty = ctx.normalize(ty);
         assert_eq!(ty.to_string(), "(N == N) == (M == N)");
 
         // transport with refl normalizes
-        let tr_refl = p("transport N N (refl N) f");
+        let tr_refl = p("transport (refl N) f");
         assert_eq!(ctx.normalize(tr_refl).to_string(), "refl (N == N)");
     }
 }

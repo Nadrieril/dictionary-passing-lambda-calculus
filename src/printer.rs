@@ -85,15 +85,11 @@ impl Expr {
                 }
                 Ok(())
             }
-            Transport((a, b, eq, ff)) => {
+            Transport((eq, ff)) => {
                 if prec > 2 {
                     write!(f, "(")?;
                 }
                 write!(f, "transport ")?;
-                a.fmt_prec(f, 3)?;
-                write!(f, " ")?;
-                b.fmt_prec(f, 3)?;
-                write!(f, " ")?;
                 eq.fmt_prec(f, 3)?;
                 write!(f, " ")?;
                 ff.fmt_prec(f, 3)?;

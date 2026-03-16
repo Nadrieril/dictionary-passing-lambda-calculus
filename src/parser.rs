@@ -194,17 +194,11 @@ fn parse_refl(input: &str) -> IResult<&str, Expr> {
     map((keyword("refl"), parse_postfix), |(_, e)| Refl(__(e))).parse(input)
 }
 
-/// `transport a b eq f`
+/// `transport eq f`
 fn parse_transport(input: &str) -> IResult<&str, Expr> {
     map(
-        (
-            keyword("transport"),
-            parse_postfix,
-            parse_postfix,
-            parse_postfix,
-            parse_postfix,
-        ),
-        |(_, a, b, eq, f)| Transport(__((a, b, eq, f))),
+        (keyword("transport"), parse_postfix, parse_postfix),
+        |(_, eq, f)| Transport(__((eq, f))),
     )
     .parse(input)
 }
@@ -272,7 +266,7 @@ mod tests {
             "x == y",
             "f x == g y",
             "refl x",
-            "transport a b eq f",
+            "transport eq f",
             "(x == y) == (y == x)",
             r"\(x: N) -> x == x",
             "refl (f x)",
