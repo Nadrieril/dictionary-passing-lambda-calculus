@@ -159,8 +159,9 @@ impl Context {
         result
     }
 
+    /// Infers the type of an expression. Also typechecks that expression.
     fn infer_type(&mut self, e: Expr) -> Expr {
-        match e {
+        let ty = match e {
             Var(x) => self.lookup_ty(x),
             Type(k) => Type(k + 1),
             Pi((x, t1, t2)) => {
@@ -232,10 +233,18 @@ impl Context {
                 let Eq(a, b) = self.normalize_only(eq_ty) else {
                     panic!("Equality type expected for transport")
                 };
-                let _ = self.infer_type(*f);
+                let f_ty = self.infer_type(*f);
+                let Pi(..) = self.normalize_only(f_ty) else {
+                    panic!("Function expected for transport's second argument")
+                };
                 Eq(__(App(f, a)), __(App(f, b)))
             }
+        };
+        if !matches!(ty, Type(_)) {
+            // Recursively check the type is well-formed.
+            let _ = self.infer_type(ty);
         }
+        ty
     }
     fn infer_universe(&mut self, t: Expr) -> usize {
         match self.infer_type(t) {
@@ -508,5 +517,100 @@ mod tests {
         //         next_method: fn(t) -> self.item_ty,
         //     })"),
         // );
+    }
+
+    // --- Rejection tests ---
+
+    #[test]
+    #[should_panic(expected = "Function expected")]
+    fn test_reject_apply_non_function() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("z", p("N"));
+        ctx.infer_type(p("z z"));
+    }
+
+    #[test]
+    #[should_panic(expected = "not equal")]
+    fn test_reject_arg_type_mismatch() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("M", Type(0));
+        ctx.add_uninterpreted("f", p("fn(_: N) -> N"));
+        ctx.add_uninterpreted("m", p("M"));
+        // f expects N but gets M
+        ctx.infer_type(p("f m"));
+    }
+
+    #[test]
+    #[should_panic(expected = "Type expected")]
+    fn test_reject_value_as_type() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("z", p("N"));
+        // z is a value, not a type — can't use as binder type
+        ctx.infer_type(p(r"\(x: z) -> x"));
+    }
+
+    #[test]
+    #[should_panic(expected = "Struct type expected")]
+    fn test_reject_field_on_non_struct() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("z", p("N"));
+        ctx.infer_type(p("z.a"));
+    }
+
+    #[test]
+    #[should_panic(expected = "Field b not found")]
+    fn test_reject_missing_field() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("z", p("N"));
+        ctx.infer_type(p("{ a = z }.b"));
+    }
+
+    #[test]
+    #[should_panic(expected = "not equal")]
+    fn test_reject_eq_different_types() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("z", p("N"));
+        // z : N and N : Type(0) — different types
+        ctx.infer_type(p("z == N"));
+    }
+
+    #[test]
+    #[should_panic(expected = "Equality type expected")]
+    fn test_reject_transport_non_eq() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("z", p("N"));
+        ctx.add_uninterpreted("f", p("fn(_: N) -> N"));
+        ctx.infer_type(p("transport z f"));
+    }
+
+    #[test]
+    #[should_panic(expected = "Function expected for transport")]
+    fn test_reject_transport_non_function() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("x", p("N"));
+        ctx.add_uninterpreted("eq", p("x == x"));
+        // second arg must be a function
+        ctx.infer_type(p("transport eq x"));
+    }
+
+    #[test]
+    #[should_panic(expected = "not equal")]
+    fn test_reject_transport_domain_mismatch() {
+        let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
+        ctx.add_uninterpreted("M", Type(0));
+        ctx.add_uninterpreted("x", p("N"));
+        ctx.add_uninterpreted("eq", p("x == x"));
+        ctx.add_uninterpreted("f", p("fn(_: M) -> M"));
+        // eq proves x == x where x: N, but f expects M
+        ctx.infer_type(p("transport eq f"));
     }
 }
