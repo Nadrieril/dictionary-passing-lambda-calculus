@@ -118,11 +118,14 @@ impl Context {
                 };
                 Pi(__((*x, *t, te)))
             }
-            App(e1, e2) => {
-                let (x, s, t) = self.infer_pi(*e1);
-                let te = self.infer_type(*e2);
-                self.check_equal(*s, te);
-                t.subst([(*x, *e2)].into_iter().collect())
+            App(f, arg) => {
+                let f_ty = self.infer_type(*f);
+                let Pi((x, s, t)) = self.normalize(f_ty) else {
+                    panic!("Function expected.")
+                };
+                let arg_ty = self.infer_type(*arg);
+                self.check_equal(*s, arg_ty);
+                t.subst([(*x, *arg)].into_iter().collect())
             }
             StructTy(fields) => {
                 let k = fields
@@ -204,13 +207,6 @@ impl Context {
             .map(|&(n, e)| (n, self.normalize(e)))
             .collect();
         Box::leak(fields.into_boxed_slice())
-    }
-    fn infer_pi(&mut self, e: Expr) -> __<Abstraction> {
-        let t = self.infer_type(e);
-        match self.normalize(t) {
-            Pi(a) => a,
-            _ => panic!("Function expected."),
-        }
     }
     fn check_equal(&mut self, e1: Expr, e2: Expr) {
         if !self.equal(e1, e2) {
