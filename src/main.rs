@@ -43,8 +43,8 @@ enum Expr {
     /// Struct type. Binds a variable (typically `self`) that has the type being constructed,
     /// making it an unordered dependent record.
     StructTy(Variable, __<[(__<str>, Expr)]>),
-    /// Record value with explicit type annotation: `rec (ty) { a = e, ... }`.
-    Rec(__<Expr>, __<[(__<str>, Expr)]>),
+    /// Record value with explicit type annotation: `make (ty) { a = e, ... }`.
+    TypedStruct(__<Expr>, __<[(__<str>, Expr)]>),
     Field(__<Expr>, __<str>),
     /// `let x = e1 in e2`.
     Let(Variable, __<Expr>, __<Expr>),
@@ -61,7 +61,9 @@ impl PartialEq for Expr {
     fn eq(&self, other: &Self) -> bool {
         match (*self, *other) {
             (Pi(a1), Pi(a2)) | (Lambda(a1), Lambda(a2)) => eq_abstraction(a1, a2),
-            (Struct(f1), Struct(f2)) | (Rec(_, f1), Rec(_, f2)) => eq_fields(f1, f2),
+            (Struct(f1), Struct(f2)) | (TypedStruct(_, f1), TypedStruct(_, f2)) => {
+                eq_fields(f1, f2)
+            }
             (StructTy(x1, f1), StructTy(x2, f2)) => {
                 if f1.len() != f2.len() {
                     return false;
@@ -118,7 +120,9 @@ impl Expr {
             Lambda(a) => Lambda(subst_abstraction(s, a)),
             App(e1, e2) => App(__(e1.subst(s.clone())), __(e2.subst(s))),
             Struct(fields) => Struct(subst_fields(fields, s.clone())),
-            Rec(ty, fields) => Rec(__(ty.subst(s.clone())), subst_fields(fields, s)),
+            TypedStruct(ty, fields) => {
+                TypedStruct(__(ty.subst(s.clone())), subst_fields(fields, s))
+            }
             StructTy(x, fields) => {
                 let x_fresh = x.refresh();
                 s.insert(x, Var(x_fresh));
@@ -290,7 +294,7 @@ impl Context {
                     Box::leak(ty_fields.into_boxed_slice()),
                 )
             }
-            Rec(ty, fields) => {
+            TypedStruct(ty, fields) => {
                 let _ = self.infer_universe(*ty);
                 let StructTy(self_var, field_tys) = self.whnf_unfold(*ty) else {
                     panic!("Struct type expected for rec")
@@ -424,7 +428,7 @@ impl Context {
                 e1 => App(__(e1), e2),
             },
             Field(e, name) => match self.whnf_inner(*e, unfold_opaque) {
-                Struct(fields) | Rec(_, fields) => self.whnf_inner(
+                Struct(fields) | TypedStruct(_, fields) => self.whnf_inner(
                     fields
                         .iter()
                         .find(|(n, _)| *n == name)
@@ -466,7 +470,7 @@ impl Context {
             Pi(a) => Pi(self.normalize_abstraction(a)),
             Lambda(a) => Lambda(self.normalize_abstraction(a)),
             Struct(fields) => Struct(self.normalize_fields(fields)),
-            Rec(ty, fields) => Rec(
+            TypedStruct(ty, fields) => TypedStruct(
                 __(self.normalize_no_typeck(*ty)),
                 self.normalize_fields(fields),
             ),
@@ -531,7 +535,9 @@ impl Context {
             }
             // Should only happen for uninterpreted symbols.
             (App(f1, a1), App(f2, a2)) => self.equal(*f1, *f2) && self.equal(*a1, *a2),
-            (Struct(f1), Struct(f2)) | (Rec(_, f1), Rec(_, f2)) => self.equal_fields(f1, f2),
+            (Struct(f1), Struct(f2)) | (TypedStruct(_, f1), TypedStruct(_, f2)) => {
+                self.equal_fields(f1, f2)
+            }
             (StructTy(x1, f1), StructTy(x2, f2)) => {
                 if f1.len() != f2.len() {
                     return false;
@@ -734,15 +740,15 @@ mod tests {
         ctx.add_uninterpreted("N", Type(0));
         ctx.add_uninterpreted("z", p("N"));
 
-        let r = p("rec ({ a: N }) { a = z }");
+        let r = p("make ({ a: N }) { a = z }");
         assert_eq!(ctx.infer_type(r).to_string(), "{ a: N }");
         assert_eq!(
-            ctx.normalize(p("rec ({ a: N }) { a = z }.a")).to_string(),
+            ctx.normalize(p("make ({ a: N }) { a = z }.a")).to_string(),
             "z"
         );
 
         ctx.add_val("MyTy", p("{ val: N, same: self.val == self.val }"));
-        let r = p("rec (MyTy) { val = z, same = refl z }");
+        let r = p("make (MyTy) { val = z, same = refl z }");
         assert_eq!(ctx.infer_type(r).to_string(), "MyTy");
     }
 
@@ -773,7 +779,7 @@ mod tests {
 
         // let rec with self-referential struct — field access through the fixpoint
         let expr = p(r"
-            let rec x: { a: N, b: self.a == self.a } = rec ({ a: N, b: self.a == self.a }) { a = z, b = refl z }
+            let rec x: { a: N, b: self.a == self.a } = make ({ a: N, b: self.a == self.a }) { a = z, b = refl z }
             in x.a
         ");
         assert_eq!(ctx.normalize(expr).to_string(), "z");
@@ -817,7 +823,7 @@ mod tests {
         ctx.add_uninterpreted("z", p("N"));
         ctx.add_uninterpreted("m", p("M"));
         ctx.add_val("T", p("{ a: Type(0), b: Type(0), eq: self.a == self.b }"));
-        ctx.infer_type(p("rec (T) { a = N, b = M, eq = refl N }"));
+        ctx.infer_type(p("make (T) { a = N, b = M, eq = refl N }"));
     }
 
     #[test]
@@ -907,11 +913,13 @@ mod tests {
                     \(l_trait: Trait l r) ->
                     \(r_trait: Trait r r) ->
                     \(r_trait_constraint: r_trait.proof == l_trait.proof_impl.proof) ->
-                let rec Impl: Trait l r = rec (Trait l r) {
+                make (Trait l r) {
                     proof = r,
                     proof_impl = r_trait,
                     proof_impl_constraint = todo (r_trait.proof == l),
-                } in Impl
+                    proof_impl_constraint = 
+                        transitivity r_trait.proof l_trait.proof_impl.proof l r_trait_constraint (todo (l_trait.proof_impl.proof == l))
+                }
                 in",
                 r" {=} ",
             ]

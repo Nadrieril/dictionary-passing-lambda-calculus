@@ -58,13 +58,13 @@ impl Expr {
             Struct(fields) if fields.is_empty() => write!(f, "{{=}}"),
             Struct(fields) => fmt_fields(f, fields, " = "),
             StructTy(_, fields) => fmt_fields(f, fields, ": "),
-            Rec(ty, fields) if fields.is_empty() => {
-                write!(f, "rec (")?;
+            TypedStruct(ty, fields) if fields.is_empty() => {
+                write!(f, "make (")?;
                 ty.fmt_prec(f, 0)?;
                 write!(f, ") {{=}}")
             }
-            Rec(ty, fields) => {
-                write!(f, "rec (")?;
+            TypedStruct(ty, fields) => {
+                write!(f, "make (")?;
                 ty.fmt_prec(f, 0)?;
                 write!(f, ") ")?;
                 fmt_fields(f, fields, " = ")

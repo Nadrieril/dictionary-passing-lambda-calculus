@@ -76,7 +76,16 @@ fn ws<'a, O>(
     preceded(skip_ws_and_comments, inner)
 }
 
-const KEYWORDS: &[&str] = &["fn", "in", "let", "rec", "refl", "todo", "transport"];
+const KEYWORDS: &[&str] = &[
+    "fn",
+    "in",
+    "let",
+    "make",
+    "rec",
+    "refl",
+    "todo",
+    "transport",
+];
 
 /// Identifier: [a-zA-Z_][a-zA-Z0-9_]*, rejecting keywords.
 fn ident<'a>(original: &'a str) -> IResult<'a, &'a str> {
@@ -223,7 +232,7 @@ fn parse_struct(input: &str) -> IResult<'_, Expr> {
 fn parse_atom(input: &str) -> IResult<'_, Expr> {
     alt((
         parse_type,
-        parse_rec,
+        parse_make,
         parse_struct,
         map(variable, Var),
         delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
@@ -254,8 +263,8 @@ fn parse_app(input: &str) -> IResult<'_, Expr> {
         .parse(input)
 }
 
-/// `rec (ty) { a = e, ... }` or `rec (ty) {=}`
-fn parse_rec(input: &str) -> IResult<'_, Expr> {
+/// `make (ty) { a = e, ... }` or `make (ty) {=}`
+fn parse_make(input: &str) -> IResult<'_, Expr> {
     let field_val = |input| {
         (ident, ws(nom_char('=')), parse_expr)
             .map(|(n, _, e)| (leak_str(n), e))
@@ -264,17 +273,17 @@ fn parse_rec(input: &str) -> IResult<'_, Expr> {
     alt((
         map(
             (
-                keyword("rec"),
+                keyword("make"),
                 delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
                 ws(nom_char('{')),
                 ws(nom_char('=')),
                 ws(nom_char('}')),
             ),
-            |(_, ty, _, _, _)| Rec(__(ty), Box::leak(Vec::new().into_boxed_slice())),
+            |(_, ty, _, _, _)| TypedStruct(__(ty), Box::leak(Vec::new().into_boxed_slice())),
         ),
         map(
             (
-                keyword("rec"),
+                keyword("make"),
                 delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
                 delimited(
                     ws(nom_char('{')),
@@ -282,7 +291,7 @@ fn parse_rec(input: &str) -> IResult<'_, Expr> {
                     (opt(ws(nom_char(','))), ws(nom_char('}'))),
                 ),
             ),
-            |(_, ty, fields)| Rec(__(ty), Box::leak(fields.into_boxed_slice())),
+            |(_, ty, fields)| TypedStruct(__(ty), Box::leak(fields.into_boxed_slice())),
         ),
     ))
     .parse(input)
@@ -318,19 +327,36 @@ fn parse_eq(input: &str) -> IResult<'_, Expr> {
     }
 }
 
-/// `let x = e1 in e2`
+/// `let x = e1 in e2` or `let x: T = e1 in e2`
 fn parse_let(input: &str) -> IResult<'_, Expr> {
-    map(
-        (
-            keyword("let"),
-            variable,
-            ws(nom_char('=')),
-            parse_expr,
-            keyword("in"),
-            parse_expr,
+    alt((
+        // let x: T = e1 in e2 — annotated let (desugars to LetRec)
+        map(
+            (
+                keyword("let"),
+                variable,
+                ws(nom_char(':')),
+                parse_expr,
+                ws(nom_char('=')),
+                parse_expr,
+                keyword("in"),
+                parse_expr,
+            ),
+            |(_, x, _, ty, _, e1, _, e2)| LetRec(x, __(ty), __(e1), __(e2)),
         ),
-        |(_, x, _, e1, _, e2)| Let(x, __(e1), __(e2)),
-    )
+        // let x = e1 in e2
+        map(
+            (
+                keyword("let"),
+                variable,
+                ws(nom_char('=')),
+                parse_expr,
+                keyword("in"),
+                parse_expr,
+            ),
+            |(_, x, _, e1, _, e2)| Let(x, __(e1), __(e2)),
+        ),
+    ))
     .parse(input)
 }
 
@@ -451,9 +477,9 @@ mod tests {
             "refl (f x)",
             // Todo
             "todo N",
-            // Rec
-            "rec ({ a: Type(0) }) {=}",
-            "rec ({ a: Type(0) }) { a = x }",
+            // Make
+            "make ({ a: Type(0) }) {=}",
+            "make ({ a: Type(0) }) { a = x }",
             // Let
             "let x = y in x",
             "let rec x: Type(0) = N in x",
@@ -472,6 +498,15 @@ mod tests {
         assert_eq!(
             parse("fn(fn(A) -> B) -> C").unwrap().to_string(),
             "fn(_: fn(_: A) -> B) -> C"
+        );
+    }
+
+    #[test]
+    fn test_annotated_let() {
+        // `let x: T = e in body` desugars to `let rec x: T = e in body`
+        assert_eq!(
+            parse("let x: Type(0) = N in x").unwrap().to_string(),
+            "let rec x: Type(0) = N in x"
         );
     }
 
