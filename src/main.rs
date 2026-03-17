@@ -427,7 +427,7 @@ impl Context {
                 Lambda((x, _, body)) => self.whnf_inner(body.subst1(*x, *e2), unfold_opaque),
                 e1 => App(__(e1), e2),
             },
-            Field(e, name) => match self.whnf_inner(*e, unfold_opaque) {
+            Field(e, name) => match self.whnf_inner(*e, true) {
                 Struct(fields) | TypedStruct(_, fields) => self.whnf_inner(
                     fields
                         .iter()
@@ -572,7 +572,6 @@ fn main() {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use itertools::Itertools;
 
     fn p(s: &str) -> Expr {
         parser::parse(s).unwrap()
@@ -864,68 +863,88 @@ mod tests {
         // Reproduce https://github.com/rust-lang/rust/issues/135246#issuecomment-4066328421
         let mut ctx = Context::default();
         ctx.add_uninterpreted("N", Type(0));
-        ctx.infer_type(p(&[
-                r"
-                let symmetry =
-                    \(a: Type(0)) ->
-                    \(b: Type(0)) ->
-                    \(ab: a == b) ->
-                    transport ab (\(x: Type(0)) -> x == a) (refl a)
-                in
-                let transitivity =
-                    \(a: Type(0)) ->
-                    \(b: Type(0)) ->
-                    \(c: Type(0)) ->
-                    \(ab: a == b) ->
-                    \(bc: b == c) ->
-                    transport bc (\(x: Type(0)) -> a == x) ab
-                in
-                ",
-                // trait Trait<R>: Sized {
-                //     type Proof: Trait<R, Proof = Self>;
-                // }
-                r"
-                let rec Trait: fn(Type(0)) -> fn(Type(0)) -> Type(1) = \(t: Type(0)) -> \(r: Type(0)) -> {
-                    proof: Type(0),
-                    proof_impl: Trait self.proof r,
-                    proof_impl_constraint: self.proof_impl.proof == t,
-                } in",
-                // impl<L, R> Trait<R> for L
-                // where
-                //     L: Trait<R>, // unsound if all trait bounds are coinductive
-                //     // unsoundness: in impl, use item bounds to normalize
-                //     // `<L::Proof as Trait<R>>::Proof = L`
-                //     R: Trait<R, Proof = <L::Proof as Trait<R>>::Proof>,
-                // {
-                //     type Proof = R;
-                // }
-                r"
-                let rec TraitImpl:
-                    fn(l: Type(0)) ->
-                    fn(r: Type(0)) ->
-                    fn(l_trait: Trait l r) ->
-                    fn(r_trait: Trait r r) ->
-                    fn(r_trait_constraint: r_trait.proof == l_trait.proof_impl.proof) ->
-                    Trait l r
-                =
-                    \(l: Type(0)) ->
-                    \(r: Type(0)) ->
-                    \(l_trait: Trait l r) ->
-                    \(r_trait: Trait r r) ->
-                    \(r_trait_constraint: r_trait.proof == l_trait.proof_impl.proof) ->
-                make (Trait l r) {
-                    proof = r,
-                    proof_impl = r_trait,
-                    proof_impl_constraint = todo (r_trait.proof == l),
-                    proof_impl_constraint = 
-                        transitivity r_trait.proof l_trait.proof_impl.proof l r_trait_constraint (todo (l_trait.proof_impl.proof == l))
-                }
-                in",
-                r" {=} ",
-            ]
-            .into_iter()
-            .format("")
-            .to_string()));
+        ctx.normalize(p(
+            r"
+            // Helpers
+            let symmetry: fn(a: Type(0)) -> fn(b: Type(0)) -> fn(a == b) -> b == a =
+                \(a: Type(0)) ->
+                \(b: Type(0)) ->
+                \(ab: a == b) ->
+                transport ab (\(x: Type(0)) -> x == a) (refl a)
+            in
+            let transitivity: fn(a: Type(0)) -> fn(b: Type(0)) -> fn(c: Type(0)) -> fn(a == b) -> fn(b == c) -> a == c =
+                \(a: Type(0)) ->
+                \(b: Type(0)) ->
+                \(c: Type(0)) ->
+                \(ab: a == b) ->
+                \(bc: b == c) ->
+                transport bc (\(x: Type(0)) -> a == x) ab
+            in
+
+            // trait Trait<R>: Sized {
+            //     type Proof: Trait<R, Proof = Self>;
+            // }
+            let rec Trait: fn(Type(0)) -> fn(Type(0)) -> Type(1) = \(t: Type(0)) -> \(r: Type(0)) -> {
+                proof: Type(0),
+                proof_impl: Trait self.proof r,
+                proof_impl_constraint: self.proof_impl.proof == t,
+            } in
+
+            // impl<L, R> Trait<R> for L
+            // where
+            //     L: Trait<R>, // unsound if all trait bounds are coinductive
+            //     // unsoundness: in impl, use item bounds to normalize
+            //     // `<L::Proof as Trait<R>>::Proof = L`
+            //     R: Trait<R, Proof = <L::Proof as Trait<R>>::Proof>,
+            // {
+            //     type Proof = R;
+            // }
+            let TraitImpl =
+                \(l: Type(0)) ->
+                \(r: Type(0)) ->
+                \(l_trait: Trait l r) ->
+                \(r_trait: Trait r r) ->
+                \(r_trait_constraint: r_trait.proof == l_trait.proof_impl.proof) ->
+            make (Trait l r) {
+                proof = r,
+                proof_impl = r_trait,
+                proof_impl_constraint =
+                    let eq1: (l_trait.proof_impl.proof == l) = l_trait.proof_impl_constraint in
+                    let eq2: (r_trait.proof == l) = transitivity r_trait.proof l_trait.proof_impl.proof l r_trait_constraint eq1 in
+                    eq2
+            }
+            in
+
+            // First coinductive impl dictionary.
+            let IdTraitImpl: fn(r: Type(0)) -> Trait r r =
+                \(r: Type(0)) ->
+                let rec Impl: Trait r r = TraitImpl r r Impl Impl (refl Impl.proof_impl.proof)
+                in Impl
+            in
+            // Second coinductive impl dictionary.
+            let GeneralTraitImpl: fn(l: Type(0)) -> fn(r: Type(0)) -> Trait l r =
+                \(l: Type(0)) ->
+                \(r: Type(0)) ->
+                let rec Impl: Trait l r =
+                    let l_trait: Trait l r = Impl in
+                    let r_trait: Trait r r = IdTraitImpl r in
+                    let r_trait_constraint: (r_trait.proof == l_trait.proof_impl.proof) = refl (l_trait.proof_impl.proof) in
+                    TraitImpl l r l_trait r_trait r_trait_constraint
+                in Impl
+            in
+            // Boom!
+            let transmute: fn(l: Type(0)) -> fn(r: Type(0)) -> l == r =
+                \(l: Type(0)) ->
+                \(r: Type(0)) ->
+                let l_impl: Trait l r = GeneralTraitImpl l r in
+                symmetry r l (l_impl.proof_impl_constraint)
+            in
+
+            // this creates a value of type `N` which is uninterpreted hihi (and stack overflows)
+            // transport (transmute {} N) (\(x: Type(0)) -> x) {=}
+            {=}
+            "
+        ));
     }
 
     // --- Rejection tests ---
