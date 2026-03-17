@@ -178,7 +178,7 @@ impl Context {
             .iter()
             .rev()
             .find(|elem| x == elem.0)
-            .expect("Failed to find variable!")
+            .expect(&format!("Failed to find variable {x}!"))
             .1
     }
     fn lookup_ty(&self, x: Variable) -> Expr {
@@ -452,7 +452,7 @@ impl Context {
     }
     fn check_equal(&mut self, e1: Expr, e2: Expr) {
         if !self.equal(e1, e2) {
-            panic!("{e1} and {e2} are not equal.")
+            panic!("`{e1}` and `{e2}` are not equal.")
         }
     }
     fn equal(&mut self, e1: Expr, e2: Expr) -> bool {
@@ -462,23 +462,26 @@ impl Context {
         match (e1, e2) {
             (Var(x1), Var(x2)) => x1 == x2,
             (Type(k1), Type(k2)) => k1 == k2,
-            (Pi(a1), Pi(a2)) | (Lambda(a1), Lambda(a2)) => {
+            // Undecidable, let's not even try.
+            (Lambda(..), Lambda(..)) => false,
+            (Pi(a1), Pi(a2)) => {
                 let (x, t1, e1) = *a1;
                 let (y, t2, e2) = *a2;
                 let z = x.refresh();
                 self.equal(t1, t2) && self.equal(e1.subst1(x, Var(z)), e2.subst1(y, Var(z)))
             }
+            // Should only happen for uninterpreted symbols.
             (App(f1, a1), App(f2, a2)) => self.equal(*f1, *f2) && self.equal(*a1, *a2),
             (Struct(f1), Struct(f2)) | (Rec(_, f1), Rec(_, f2)) => self.equal_fields(f1, f2),
             (StructTy(x1, f1), StructTy(x2, f2)) => {
                 if f1.len() != f2.len() {
                     return false;
                 }
+                // Fields are under the self-binder; compare syntactically.
                 let z = x1.refresh();
                 f1.iter().all(|(n, e)| {
-                    f2.iter().any(|(n2, e2)| {
-                        n == n2 && self.equal(e.subst1(x1, Var(z)), e2.subst1(x2, Var(z)))
-                    })
+                    f2.iter()
+                        .any(|(n2, e2)| n == n2 && e.subst1(x1, Var(z)) == e2.subst1(x2, Var(z)))
                 })
             }
             (Field(e1, n1), Field(e2, n2)) => n1 == n2 && self.equal(*e1, *e2),
@@ -487,6 +490,7 @@ impl Context {
             (Transport((eq1, f1)), Transport((eq2, f2))) => {
                 self.equal(*eq1, *eq2) && self.equal(*f1, *f2)
             }
+            (Todo(t1), Todo(t2)) => t1 == t2,
             _ => false,
         }
     }
@@ -794,8 +798,15 @@ mod tests {
     fn test_unsound_traits() {
         // Reproduce https://github.com/rust-lang/rust/issues/135246#issuecomment-4066328421
         let mut ctx = Context::default();
+        ctx.add_uninterpreted("N", Type(0));
         ctx.infer_type(p(&[
                 r"
+                let symmetry =
+                    \(a: Type(0)) ->
+                    \(b: Type(0)) ->
+                    \(ab: a == b) ->
+                    transport ab (\(x: Type(0)) -> x == a) (refl a)
+                in
                 let transitivity =
                     \(a: Type(0)) ->
                     \(b: Type(0)) ->
@@ -823,16 +834,27 @@ mod tests {
                 // {
                 //     type Proof = R;
                 // }
-                // r"
-                // let rec TraitImpl: fn(Type(0)) -> fn(Type(0)) -> Type(1) = \(l: Type(0)) -> \(r: Type(0)) ->
-                //     \(l_trait: Trait l r) ->
-                //     \(r_trait: Trait r r) ->
-                //     \(r_trait_constraint: r_trait.proof == l_trait.proof_impl.proof) ->
-                // rec (Trait l r) {
+                r"
+                let rec TraitImpl:
+                    fn(l: Type(0)) ->
+                    fn(r: Type(0)) ->
+                    fn(l_trait: Trait l r) ->
+                    fn(r_trait: Trait r r) ->
+                    fn(r_trait_constraint: r_trait.proof == l_trait.proof_impl.proof) ->
+                    Trait l r
+                =
+                    \(l: Type(0)) ->
+                    \(r: Type(0)) ->
+                    \(l_trait: Trait l r) ->
+                    \(r_trait: Trait r r) ->
+                    \(r_trait_constraint: r_trait.proof == l_trait.proof_impl.proof) ->
+                // (let rec Impl: Trait l r = rec (Trait l r) {
                 //     proof = r,
                 //     proof_impl = r_trait,
-                //     proof_impl_bound: r_trait.proof == self
-                // } in",
+                //     proof_impl_bound = todo (r_trait.proof == Impl),
+                // } in Impl)
+                todo (Trait l r)
+                in",
                 r" {=} ",
             ]
             .into_iter()
