@@ -169,11 +169,21 @@ fn subst_fields(
     Box::leak(fields.into_boxed_slice())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct Binding {
+    /// `None` for uninterpreted symbols and normalizing under binders.
+    value: Option<Expr>,
+    ty: Expr,
+    /// Opaque (LetRec-bound) variables are not unfolded by whnf,
+    /// giving them nominal equality semantics.
+    opaque: bool,
+}
+
 #[derive(Debug, Default)]
-struct Context(Vec<(Variable, (Expr, Option<Expr>))>);
+struct Context(Vec<(Variable, Binding)>);
 
 impl Context {
-    fn get(&self, x: Variable) -> (Expr, Option<Expr>) {
+    fn get(&self, x: Variable) -> Binding {
         self.0
             .iter()
             .rev()
@@ -182,26 +192,44 @@ impl Context {
             .1
     }
     fn lookup_ty(&self, x: Variable) -> Expr {
-        self.get(x).0
-    }
-    fn lookup_value(&self, x: Variable) -> Option<Expr> {
-        self.get(x).1
+        self.get(x).ty
     }
 
     /// Add a new uninterpreted term to the environment. Used in tests.
     fn add_uninterpreted(&mut self, x: &'static str, t: Expr) {
         let x = Variable::User(x);
-        self.0.push((x, (t, None)));
+        self.0.push((
+            x,
+            Binding {
+                ty: t,
+                value: None,
+                opaque: false,
+            },
+        ));
     }
     /// Add a value to the environment. Used in tests.
     fn add_val(&mut self, x: &'static str, value: Expr) {
         let x = Variable::User(x);
         let t = self.infer_type(value);
-        self.0.push((x, (t, Some(value))));
+        self.0.push((
+            x,
+            Binding {
+                ty: t,
+                value: Some(value),
+                opaque: false,
+            },
+        ));
     }
     /// Push a variable to the context stack.
     fn push(&mut self, x: Variable, t: Expr) {
-        self.0.push((x, (t, None)));
+        self.0.push((
+            x,
+            Binding {
+                ty: t,
+                value: None,
+                opaque: false,
+            },
+        ));
     }
     /// Run `f` with a temporary scope: any `push` calls inside are undone on return.
     fn scoped<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
@@ -234,7 +262,7 @@ impl Context {
             }
             App(f, arg) => {
                 let f_ty = self.infer_type(*f);
-                let Pi((x, s, t)) = self.whnf(f_ty) else {
+                let Pi((x, s, t)) = self.whnf_unfold(f_ty) else {
                     panic!("Function expected.")
                 };
                 let arg_ty = self.infer_type(*arg);
@@ -264,7 +292,7 @@ impl Context {
             }
             Rec(ty, fields) => {
                 let _ = self.infer_universe(*ty);
-                let StructTy(self_var, field_tys) = self.whnf(*ty) else {
+                let StructTy(self_var, field_tys) = self.whnf_unfold(*ty) else {
                     panic!("Struct type expected for rec")
                 };
                 // Check each field against the expected type, with self = the rec expression.
@@ -283,7 +311,14 @@ impl Context {
             Let(x, e1, e2) => {
                 let t1 = self.infer_type(*e1);
                 return self.scoped(|ctx| {
-                    ctx.0.push((x, (t1, Some(*e1))));
+                    ctx.0.push((
+                        x,
+                        Binding {
+                            ty: t1,
+                            value: Some(*e1),
+                            opaque: false,
+                        },
+                    ));
                     ctx.infer_type(*e2)
                 });
             }
@@ -293,7 +328,15 @@ impl Context {
                     // Push x with value immediately so it can reduce during
                     // its own typechecking (needed for self-referential types
                     // like `Trait` whose fields reference `Trait` applied to args).
-                    ctx.0.push((x, (*ty, Some(*e1))));
+                    // Marked opaque so whnf doesn't unfold it — gives nominal equality.
+                    ctx.0.push((
+                        x,
+                        Binding {
+                            ty: *ty,
+                            value: Some(*e1),
+                            opaque: true,
+                        },
+                    ));
                     let t1 = ctx.infer_type(*e1);
                     ctx.check_equal(*ty, t1);
                     ctx.infer_type(*e2)
@@ -301,7 +344,7 @@ impl Context {
             }
             Field(e, name) => {
                 let te = self.infer_type(*e);
-                let te = self.whnf(te);
+                let te = self.whnf_unfold(te);
                 let StructTy(self_var, fields) = te else {
                     panic!("Struct type expected for field access, got `{te}`")
                 };
@@ -325,11 +368,11 @@ impl Context {
             }
             Transport((eq, f)) => {
                 let eq_ty = self.infer_type(*eq);
-                let Eq(a, b) = self.whnf(eq_ty) else {
+                let Eq(a, b) = self.whnf_unfold(eq_ty) else {
                     panic!("Equality type expected for transport")
                 };
                 let f_ty = self.infer_type(*f);
-                let Pi(..) = self.whnf(f_ty) else {
+                let Pi(..) = self.whnf_unfold(f_ty) else {
                     panic!("Function expected for transport's second argument")
                 };
                 Pi(__((Variable::User("_"), App(f, a), App(f, b))))
@@ -354,35 +397,51 @@ impl Context {
         let _ = self.infer_type(e);
         self.normalize_no_typeck(e)
     }
-    /// Weak head normal form: reduce the outermost redex only.
+    /// Weak head normal form. Does not unfold opaque (LetRec-bound) variables,
+    /// giving them nominal equality semantics.
     fn whnf(&mut self, e: Expr) -> Expr {
+        self.whnf_inner(e, false)
+    }
+    /// Weak head normal form, unfolding opaque variables too.
+    /// Used in `infer_type` where we need to see through nominal types
+    /// (e.g. to find StructTy for field access, Pi for application).
+    fn whnf_unfold(&mut self, e: Expr) -> Expr {
+        self.whnf_inner(e, true)
+    }
+    fn whnf_inner(&mut self, e: Expr, unfold_opaque: bool) -> Expr {
         match e {
             Var(x) => match self.0.iter().rev().find(|elem| x == elem.0) {
-                Some((_, (_, Some(v)))) => self.whnf(*v),
+                Some((_, b))
+                    if let Some(val) = b.value
+                        && (unfold_opaque || !b.opaque) =>
+                {
+                    self.whnf_inner(val, unfold_opaque)
+                }
                 _ => Var(x),
             },
-            App(e1, e2) => match self.whnf(*e1) {
-                Lambda((x, _, body)) => self.whnf(body.subst1(*x, *e2)),
+            App(e1, e2) => match self.whnf_inner(*e1, unfold_opaque) {
+                Lambda((x, _, body)) => self.whnf_inner(body.subst1(*x, *e2), unfold_opaque),
                 e1 => App(__(e1), e2),
             },
-            Field(e, name) => match self.whnf(*e) {
-                Struct(fields) | Rec(_, fields) => self.whnf(
+            Field(e, name) => match self.whnf_inner(*e, unfold_opaque) {
+                Struct(fields) | Rec(_, fields) => self.whnf_inner(
                     fields
                         .iter()
                         .find(|(n, _)| *n == name)
                         .unwrap_or_else(|| panic!("Field {name} not found"))
                         .1,
+                    unfold_opaque,
                 ),
                 e => Field(__(e), name),
             },
-            Let(x, e1, e2) => self.whnf(e2.subst1(x, *e1)),
+            Let(x, e1, e2) => self.whnf_inner(e2.subst1(x, *e1), unfold_opaque),
             LetRec(x, ty, e1, e2) => {
                 let fixpoint = LetRec(x, ty, e1, __(Var(x)));
                 let e1_unrolled = e1.subst1(x, fixpoint);
-                self.whnf(e2.subst1(x, e1_unrolled))
+                self.whnf_inner(e2.subst1(x, e1_unrolled), unfold_opaque)
             }
             Transport((eq, f)) => {
-                let eq = self.whnf(*eq);
+                let eq = self.whnf_inner(*eq, unfold_opaque);
                 match eq {
                     // transport (refl x) f : fn(f x) -> f x  reduces to identity
                     Refl(x) => {
@@ -848,12 +907,11 @@ mod tests {
                     \(l_trait: Trait l r) ->
                     \(r_trait: Trait r r) ->
                     \(r_trait_constraint: r_trait.proof == l_trait.proof_impl.proof) ->
-                // (let rec Impl: Trait l r = rec (Trait l r) {
-                //     proof = r,
-                //     proof_impl = r_trait,
-                //     proof_impl_bound = todo (r_trait.proof == Impl),
-                // } in Impl)
-                todo (Trait l r)
+                let rec Impl: Trait l r = rec (Trait l r) {
+                    proof = r,
+                    proof_impl = r_trait,
+                    proof_impl_constraint = todo (r_trait.proof == l),
+                } in Impl
                 in",
                 r" {=} ",
             ]
