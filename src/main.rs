@@ -7,13 +7,13 @@ mod parser;
 mod printer;
 
 // A but good
-type __<A> = &'static A;
+pub type __<A> = &'static A;
 fn __<A>(a: A) -> &'static A {
     Box::leak(Box::new(a))
 }
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
-enum Variable {
+pub enum Variable {
     User(__<str>),
     SorryDeBruijn(__<str>, u128),
 }
@@ -30,10 +30,10 @@ impl Variable {
     }
 }
 
-type Abstraction = (Variable, Expr, Expr);
+pub type Abstraction = (Variable, Expr, Expr);
 
 #[derive(Clone, Copy, Debug, Eq)]
-enum Expr {
+pub enum Expr {
     Var(Variable),
     Type(usize),
     Pi(__<Abstraction>),
@@ -55,6 +55,80 @@ enum Expr {
     Transport(__<(Expr, Expr)>),
     /// `todo ty` — has type `ty`, panics on normalization.
     Todo(__<Expr>),
+}
+
+pub trait ExprMapper {
+    fn map_expr(&mut self, e: Expr) -> Expr;
+
+    type SelfWithNewLifetime<'a>: ExprMapper;
+    fn under_abstraction<T>(
+        &mut self,
+        var: &mut Variable,
+        // The already-mapped type of `var`, if any.
+        ty: Option<Expr>,
+        f: impl for<'a> FnOnce(&mut Self::SelfWithNewLifetime<'a>) -> T,
+    ) -> T;
+    fn under_recursive_abstraction<T>(
+        &mut self,
+        var: &mut Variable,
+        // The not-yet-mapped type of `var`.
+        ty: Expr,
+        f: impl for<'a> FnOnce(&mut Self::SelfWithNewLifetime<'a>) -> T,
+    ) -> T {
+        self.under_abstraction(var, Some(ty), f)
+    }
+
+    // Helper
+    fn map_fields(&mut self, fields: __<[(__<str>, Expr)]>) -> __<[(__<str>, Expr)]> {
+        let fields: Vec<_> = fields.iter().map(|&(n, e)| (n, self.map_expr(e))).collect();
+        Box::leak(fields.into_boxed_slice())
+    }
+}
+
+impl Expr {
+    /// Apply a transformation to all direct subexpressions of this expression.
+    pub fn map(self, v: &mut impl ExprMapper) -> Self {
+        match self {
+            Var(x) => Var(x),
+            Type(k) => Type(k),
+            App(e1, e2) => App(__(v.map_expr(*e1)), __(v.map_expr(*e2))),
+            Pi((x, t, e)) => {
+                let mut x = *x;
+                let t = v.map_expr(*t);
+                let e = v.under_abstraction(&mut x, Some(t), |v| v.map_expr(*e));
+                Pi(__((x, t, e)))
+            }
+            Lambda((x, t, e)) => {
+                let mut x = *x;
+                let t = v.map_expr(*t);
+                let e = v.under_abstraction(&mut x, Some(t), |v| v.map_expr(*e));
+                Lambda(__((x, t, e)))
+            }
+            Let(mut x, e1, e2) => {
+                let e1 = v.map_expr(*e1);
+                let e2 = v.under_abstraction(&mut x, None, |ctx| ctx.map_expr(*e2));
+                Let(x, __(e1), __(e2))
+            }
+            LetRec(mut x, ty, e1, e2) => {
+                let (ty, e1, e2) = v.under_recursive_abstraction(&mut x, *ty, |ctx| {
+                    (ctx.map_expr(*ty), ctx.map_expr(*e1), ctx.map_expr(*e2))
+                });
+                LetRec(x, __(ty), __(e1), __(e2))
+            }
+            Struct(fields) => Struct(v.map_fields(fields)),
+            TypedStruct(ty, fields) => TypedStruct(__(v.map_expr(*ty)), v.map_fields(fields)),
+            StructTy(mut x, fields) => {
+                let fields =
+                    v.under_recursive_abstraction(&mut x, self, |ctx| ctx.map_fields(fields));
+                StructTy(x, fields)
+            }
+            Field(e, name) => Field(__(v.map_expr(*e)), name),
+            Eq(a, b) => Eq(__(v.map_expr(*a)), __(v.map_expr(*b))),
+            Refl(a) => Refl(__(v.map_expr(*a))),
+            Transport((eq, f)) => Transport(__((v.map_expr(*eq), v.map_expr(*f)))),
+            Todo(t) => Todo(__(v.map_expr(*t))),
+        }
+    }
 }
 
 impl PartialEq for Expr {
@@ -112,65 +186,46 @@ impl Expr {
     fn subst1(self, x: Variable, e: Expr) -> Expr {
         self.subst([(x, e)].into())
     }
-    fn subst(self, mut s: HashMap<Variable, Expr>) -> Expr {
-        match self {
-            Var(x) => s.get(&x).copied().unwrap_or(self),
-            Type(k) => Type(k),
-            Pi(a) => Pi(subst_abstraction(s, a)),
-            Lambda(a) => Lambda(subst_abstraction(s, a)),
-            App(e1, e2) => App(__(e1.subst(s.clone())), __(e2.subst(s))),
-            Struct(fields) => Struct(subst_fields(fields, s.clone())),
-            TypedStruct(ty, fields) => {
-                TypedStruct(__(ty.subst(s.clone())), subst_fields(fields, s))
+    fn subst(self, s: HashMap<Variable, Expr>) -> Expr {
+        struct Substituter(HashMap<Variable, Expr>);
+
+        impl Substituter {
+            fn scoped<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+                let old = self.0.clone();
+                let result = f(self);
+                self.0 = old;
+                result
             }
-            StructTy(x, fields) => {
-                let x_fresh = x.refresh();
-                s.insert(x, Var(x_fresh));
-                StructTy(x_fresh, subst_fields(fields, s))
+            fn subst(&mut self, e: Expr) -> Expr {
+                match e {
+                    Var(x) => self.0.get(&x).copied().unwrap_or(e),
+                    _ => e.map(self),
+                }
             }
-            Let(x, e1, e2) => {
-                let e1 = e1.subst(s.clone());
-                let x_fresh = x.refresh();
-                s.insert(x, Var(x_fresh));
-                Let(x_fresh, __(e1), __(e2.subst(s)))
-            }
-            LetRec(x, ty, e1, e2) => {
-                let x_fresh = x.refresh();
-                s.insert(x, Var(x_fresh));
-                LetRec(
-                    x_fresh,
-                    __(ty.subst(s.clone())),
-                    __(e1.subst(s.clone())),
-                    __(e2.subst(s)),
-                )
-            }
-            Field(e, name) => Field(__(e.subst(s)), name),
-            Eq(a, b) => Eq(__(a.subst(s.clone())), __(b.subst(s))),
-            Refl(a) => Refl(__(a.subst(s))),
-            Transport((eq, f)) => Transport(__((eq.subst(s.clone()), f.subst(s)))),
-            Todo(t) => Todo(__(t.subst(s))),
         }
+        impl ExprMapper for Substituter {
+            fn map_expr(&mut self, e: Expr) -> Expr {
+                self.subst(e)
+            }
+
+            type SelfWithNewLifetime<'a> = Self;
+            fn under_abstraction<T>(
+                &mut self,
+                x: &mut Variable,
+                _ty: Option<Expr>,
+                f: impl FnOnce(&mut Self) -> T,
+            ) -> T {
+                self.scoped(|ctx| {
+                    let x_fresh = x.refresh();
+                    ctx.0.insert(*x, Var(x_fresh));
+                    *x = x_fresh;
+                    f(ctx)
+                })
+            }
+        }
+
+        Substituter(s).subst(self)
     }
-}
-
-fn subst_abstraction(
-    mut s: HashMap<Variable, Expr>,
-    (x, t, e): __<Abstraction>,
-) -> __<Abstraction> {
-    let x_ = x.refresh();
-    s.insert(*x, Var(x_));
-    __((x_, t.subst(s.clone()), e.subst(s)))
-}
-
-fn subst_fields(
-    fields: &'static [(__<str>, Expr)],
-    s: HashMap<Variable, Expr>,
-) -> &'static [(__<str>, Expr)] {
-    let fields: Vec<_> = fields
-        .iter()
-        .map(|&(n, e)| (n, e.subst(s.clone())))
-        .collect();
-    Box::leak(fields.into_boxed_slice())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -395,11 +450,7 @@ impl Context {
             t => panic!("Type expected, got {t:?}."),
         }
     }
-    /// Typecheck then normalize the value.
-    fn normalize(&mut self, e: Expr) -> Expr {
-        let _ = self.infer_type(e);
-        self.normalize_no_typeck(e)
-    }
+
     /// Weak head normal form. Does not unfold nominal variables,
     /// giving them nominal equality semantics.
     fn whnf(&mut self, e: Expr) -> Expr {
@@ -454,64 +505,39 @@ impl Context {
                     eq => Transport(__((eq, *f))),
                 }
             }
+            Todo(t) => panic!("tried to normalize `todo {t}`"),
             _ => e,
         }
     }
-    /// Full normalization to normal form. Uses whnf first, then recurses.
-    fn normalize_no_typeck(&mut self, e: Expr) -> Expr {
-        match self.whnf(e) {
-            Var(x) => Var(x),
-            Type(k) => Type(k),
-            App(e1, e2) => App(
-                __(self.normalize_no_typeck(*e1)),
-                __(self.normalize_no_typeck(*e2)),
-            ),
-            Pi(a) => Pi(self.normalize_abstraction(a)),
-            Lambda(a) => Lambda(self.normalize_abstraction(a)),
-            Struct(fields) => Struct(self.normalize_fields(fields)),
-            TypedStruct(ty, fields) => TypedStruct(
-                __(self.normalize_no_typeck(*ty)),
-                self.normalize_fields(fields),
-            ),
-            StructTy(x, fields) => {
-                let fields = self.scoped(|ctx| {
-                    ctx.push(x, StructTy(x, fields));
-                    ctx.normalize_fields(fields)
-                });
-                StructTy(x, fields)
+
+    /// Typecheck then fully normalize the value.
+    fn normalize(&mut self, e: Expr) -> Expr {
+        struct Normalizer<'a>(&'a mut Context);
+
+        impl<'a> ExprMapper for Normalizer<'a> {
+            fn map_expr(&mut self, e: Expr) -> Expr {
+                self.0.whnf(e).map(self)
             }
-            Let(..) | LetRec(..) => unreachable!("let reduced by whnf"),
-            Field(e, name) => Field(__(self.normalize_no_typeck(*e)), name),
-            Eq(a, b) => Eq(
-                __(self.normalize_no_typeck(*a)),
-                __(self.normalize_no_typeck(*b)),
-            ),
-            Refl(a) => Refl(__(self.normalize_no_typeck(*a))),
-            Transport((eq, f)) => Transport(__((
-                self.normalize_no_typeck(*eq),
-                self.normalize_no_typeck(*f),
-            ))),
-            Todo(t) => panic!("tried to normalize `todo {t}`"),
+
+            type SelfWithNewLifetime<'b> = Normalizer<'b>;
+            fn under_abstraction<T>(
+                &mut self,
+                var: &mut Variable,
+                ty: Option<Expr>,
+                f: impl for<'b> FnOnce(&mut Normalizer<'b>) -> T,
+            ) -> T {
+                let ty = ty.expect("found a `let` after wnhf");
+                self.0.scoped(|ctx| {
+                    ctx.push(*var, ty);
+                    f(&mut Normalizer(ctx))
+                })
+            }
         }
+
+        let _ = self.infer_type(e);
+        Normalizer(self).map_expr(e)
     }
-    fn normalize_abstraction(&mut self, (x, t, e): __<Abstraction>) -> __<Abstraction> {
-        let t = self.normalize_no_typeck(*t);
-        let e = self.scoped(|ctx| {
-            ctx.push(*x, t);
-            ctx.normalize_no_typeck(*e)
-        });
-        __((*x, t, e))
-    }
-    fn normalize_fields(
-        &mut self,
-        fields: &'static [(__<str>, Expr)],
-    ) -> &'static [(__<str>, Expr)] {
-        let fields: Vec<_> = fields
-            .iter()
-            .map(|&(n, e)| (n, self.normalize_no_typeck(e)))
-            .collect();
-        Box::leak(fields.into_boxed_slice())
-    }
+
     fn check_equal(&mut self, e1: Expr, e2: Expr) {
         if !self.equal(e1, e2) {
             panic!("`{e1}` and `{e2}` are not equal.")
