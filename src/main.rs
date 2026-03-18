@@ -178,9 +178,8 @@ struct Binding {
     /// `None` for uninterpreted symbols and normalizing under binders.
     value: Option<Expr>,
     ty: Expr,
-    /// Opaque (LetRec-bound) variables are not unfolded by whnf,
-    /// giving them nominal equality semantics.
-    opaque: bool,
+    /// Nominal variables are not unfolded by whnf. These come from `let rec` binders.
+    nominal: bool,
 }
 
 #[derive(Debug, Default)]
@@ -207,7 +206,7 @@ impl Context {
             Binding {
                 ty: t,
                 value: None,
-                opaque: false,
+                nominal: false,
             },
         ));
     }
@@ -220,7 +219,7 @@ impl Context {
             Binding {
                 ty: t,
                 value: Some(value),
-                opaque: false,
+                nominal: false,
             },
         ));
     }
@@ -231,7 +230,7 @@ impl Context {
             Binding {
                 ty: t,
                 value: None,
-                opaque: false,
+                nominal: false,
             },
         ));
     }
@@ -320,7 +319,7 @@ impl Context {
                         Binding {
                             ty: t1,
                             value: Some(*e1),
-                            opaque: false,
+                            nominal: false,
                         },
                     ));
                     ctx.infer_type(*e2)
@@ -332,13 +331,13 @@ impl Context {
                     // Push x with value immediately so it can reduce during
                     // its own typechecking (needed for self-referential types
                     // like `Trait` whose fields reference `Trait` applied to args).
-                    // Marked opaque so whnf doesn't unfold it — gives nominal equality.
+                    // Marked nominal so whnf doesn't unfold it.
                     ctx.0.push((
                         x,
                         Binding {
                             ty: *ty,
                             value: Some(*e1),
-                            opaque: true,
+                            nominal: true,
                         },
                     ));
                     let t1 = ctx.infer_type(*e1);
@@ -401,30 +400,30 @@ impl Context {
         let _ = self.infer_type(e);
         self.normalize_no_typeck(e)
     }
-    /// Weak head normal form. Does not unfold opaque (LetRec-bound) variables,
+    /// Weak head normal form. Does not unfold nominal variables,
     /// giving them nominal equality semantics.
     fn whnf(&mut self, e: Expr) -> Expr {
         self.whnf_inner(e, false)
     }
-    /// Weak head normal form, unfolding opaque variables too.
+    /// Weak head normal form, unfolding nominal variables too.
     /// Used in `infer_type` where we need to see through nominal types
     /// (e.g. to find StructTy for field access, Pi for application).
     fn whnf_unfold(&mut self, e: Expr) -> Expr {
         self.whnf_inner(e, true)
     }
-    fn whnf_inner(&mut self, e: Expr, unfold_opaque: bool) -> Expr {
+    fn whnf_inner(&mut self, e: Expr, unfold_nominal: bool) -> Expr {
         match e {
             Var(x) => match self.0.iter().rev().find(|elem| x == elem.0) {
                 Some((_, b))
                     if let Some(val) = b.value
-                        && (unfold_opaque || !b.opaque) =>
+                        && (unfold_nominal || !b.nominal) =>
                 {
-                    self.whnf_inner(val, unfold_opaque)
+                    self.whnf_inner(val, unfold_nominal)
                 }
                 _ => Var(x),
             },
-            App(e1, e2) => match self.whnf_inner(*e1, unfold_opaque) {
-                Lambda((x, _, body)) => self.whnf_inner(body.subst1(*x, *e2), unfold_opaque),
+            App(e1, e2) => match self.whnf_inner(*e1, unfold_nominal) {
+                Lambda((x, _, body)) => self.whnf_inner(body.subst1(*x, *e2), unfold_nominal),
                 e1 => App(__(e1), e2),
             },
             Field(e, name) => match self.whnf_inner(*e, true) {
@@ -434,18 +433,18 @@ impl Context {
                         .find(|(n, _)| *n == name)
                         .unwrap_or_else(|| panic!("Field {name} not found"))
                         .1,
-                    unfold_opaque,
+                    unfold_nominal,
                 ),
                 e => Field(__(e), name),
             },
-            Let(x, e1, e2) => self.whnf_inner(e2.subst1(x, *e1), unfold_opaque),
+            Let(x, e1, e2) => self.whnf_inner(e2.subst1(x, *e1), unfold_nominal),
             LetRec(x, ty, e1, e2) => {
                 let fixpoint = LetRec(x, ty, e1, __(Var(x)));
                 let e1_unrolled = e1.subst1(x, fixpoint);
-                self.whnf_inner(e2.subst1(x, e1_unrolled), unfold_opaque)
+                self.whnf_inner(e2.subst1(x, e1_unrolled), unfold_nominal)
             }
             Transport((eq, f)) => {
-                let eq = self.whnf_inner(*eq, unfold_opaque);
+                let eq = self.whnf_inner(*eq, unfold_nominal);
                 match eq {
                     // transport (refl x) f : fn(f x) -> f x  reduces to identity
                     Refl(x) => {
