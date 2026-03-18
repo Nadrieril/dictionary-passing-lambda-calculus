@@ -129,60 +129,7 @@ impl Expr {
             Todo(t) => Todo(__(v.map_expr(*t))),
         }
     }
-}
 
-impl PartialEq for Expr {
-    fn eq(&self, other: &Self) -> bool {
-        match (*self, *other) {
-            (Pi(a1), Pi(a2)) | (Lambda(a1), Lambda(a2)) => eq_abstraction(a1, a2),
-            (Struct(f1), Struct(f2)) | (TypedStruct(_, f1), TypedStruct(_, f2)) => {
-                eq_fields(f1, f2)
-            }
-            (StructTy(x1, f1), StructTy(x2, f2)) => {
-                if f1.len() != f2.len() {
-                    return false;
-                }
-                let z = x1.refresh();
-                let s1: HashMap<_, _> = [(x1, Var(z))].into();
-                let s2: HashMap<_, _> = [(x2, Var(z))].into();
-                f1.iter().all(|(n, e)| {
-                    f2.iter()
-                        .any(|(n2, e2)| n == n2 && e.subst(s1.clone()) == e2.subst(s2.clone()))
-                })
-            }
-            (Var(x1), Var(x2)) => x1 == x2,
-            (Type(k1), Type(k2)) => k1 == k2,
-            (App(e11, e12), App(e21, e22)) => e11 == e21 && e12 == e22,
-            (Field(e1, n1), Field(e2, n2)) => n1 == n2 && e1 == e2,
-            (Let(x1, e1, b1), Let(x2, e2, b2)) => x1 == x2 && e1 == e2 && b1 == b2,
-            (LetRec(x1, t1, e1, b1), LetRec(x2, t2, e2, b2)) => {
-                x1 == x2 && t1 == t2 && e1 == e2 && b1 == b2
-            }
-            (Eq(a1, b1), Eq(a2, b2)) => a1 == a2 && b1 == b2,
-            (Refl(a1), Refl(a2)) => a1 == a2,
-            (Transport((eq1, f1)), Transport((eq2, f2))) => eq1 == eq2 && f1 == f2,
-            (Todo(t1), Todo(t2)) => t1 == t2,
-            _ => false,
-        }
-    }
-}
-
-/// Alpha-equality for abstractions: freshen both binders to a common variable.
-fn eq_abstraction(a1: __<Abstraction>, a2: __<Abstraction>) -> bool {
-    let (x, t1, e1) = *a1;
-    let (y, t2, e2) = *a2;
-    let z = x.refresh();
-    t1 == t2 && e1.subst([(x, Var(z))].into()) == e2.subst([(y, Var(z))].into())
-}
-
-fn eq_fields(f1: &[(__<str>, Expr)], f2: &[(__<str>, Expr)]) -> bool {
-    f1.len() == f2.len()
-        && f1
-            .iter()
-            .all(|(n, e)| f2.iter().any(|(n2, e2)| n == n2 && e == e2))
-}
-
-impl Expr {
     fn subst1(self, x: Variable, e: Expr) -> Expr {
         self.subst([(x, e)].into())
     }
@@ -225,6 +172,57 @@ impl Expr {
         }
 
         Substituter(s).subst(self)
+    }
+}
+
+impl PartialEq for Expr {
+    fn eq(&self, other: &Self) -> bool {
+        /// Alpha-equality for abstractions: freshen both binders to a common variable.
+        fn eq_abstraction(a1: __<Abstraction>, a2: __<Abstraction>) -> bool {
+            let (x, t1, e1) = *a1;
+            let (y, t2, e2) = *a2;
+            let z = x.refresh();
+            t1 == t2 && e1.subst([(x, Var(z))].into()) == e2.subst([(y, Var(z))].into())
+        }
+
+        fn eq_fields(f1: &[(__<str>, Expr)], f2: &[(__<str>, Expr)]) -> bool {
+            f1.len() == f2.len()
+                && f1
+                    .iter()
+                    .all(|(n, e)| f2.iter().any(|(n2, e2)| n == n2 && e == e2))
+        }
+
+        match (*self, *other) {
+            (Pi(a1), Pi(a2)) | (Lambda(a1), Lambda(a2)) => eq_abstraction(a1, a2),
+            (Struct(f1), Struct(f2)) | (TypedStruct(_, f1), TypedStruct(_, f2)) => {
+                eq_fields(f1, f2)
+            }
+            (StructTy(x1, f1), StructTy(x2, f2)) => {
+                if f1.len() != f2.len() {
+                    return false;
+                }
+                let z = x1.refresh();
+                let s1: HashMap<_, _> = [(x1, Var(z))].into();
+                let s2: HashMap<_, _> = [(x2, Var(z))].into();
+                f1.iter().all(|(n, e)| {
+                    f2.iter()
+                        .any(|(n2, e2)| n == n2 && e.subst(s1.clone()) == e2.subst(s2.clone()))
+                })
+            }
+            (Var(x1), Var(x2)) => x1 == x2,
+            (Type(k1), Type(k2)) => k1 == k2,
+            (App(e11, e12), App(e21, e22)) => e11 == e21 && e12 == e22,
+            (Field(e1, n1), Field(e2, n2)) => n1 == n2 && e1 == e2,
+            (Let(x1, e1, b1), Let(x2, e2, b2)) => x1 == x2 && e1 == e2 && b1 == b2,
+            (LetRec(x1, t1, e1, b1), LetRec(x2, t2, e2, b2)) => {
+                x1 == x2 && t1 == t2 && e1 == e2 && b1 == b2
+            }
+            (Eq(a1, b1), Eq(a2, b2)) => a1 == a2 && b1 == b2,
+            (Refl(a1), Refl(a2)) => a1 == a2,
+            (Transport((eq1, f1)), Transport((eq2, f2))) => eq1 == eq2 && f1 == f2,
+            (Todo(t1), Todo(t2)) => t1 == t2,
+            _ => false,
+        }
     }
 }
 
@@ -324,7 +322,7 @@ impl Context {
                     panic!("Function expected.")
                 };
                 let arg_ty = self.infer_type(*arg);
-                self.check_equal(*s, arg_ty);
+                self.assert_equal(*s, arg_ty);
                 t.subst1(*x, *arg)
             }
             StructTy(x, fields) => {
@@ -362,7 +360,7 @@ impl Context {
                         .1;
                     let expected = expected.subst1(self_var, e);
                     let actual = self.infer_type(val);
-                    self.check_equal(expected, actual);
+                    self.assert_equal(expected, actual);
                 }
                 *ty
             }
@@ -396,7 +394,7 @@ impl Context {
                         },
                     ));
                     let t1 = ctx.infer_type(*e1);
-                    ctx.check_equal(*ty, t1);
+                    ctx.assert_equal(*ty, t1);
                     ctx.infer_type(*e2)
                 });
             }
@@ -416,7 +414,7 @@ impl Context {
             Eq(a, b) => {
                 let ta = self.infer_type(*a);
                 let tb = self.infer_type(*b);
-                self.check_equal(ta, tb);
+                self.assert_equal(ta, tb);
                 let k = self.infer_universe(ta);
                 Type(k)
             }
@@ -538,7 +536,7 @@ impl Context {
         Normalizer(self).map_expr(e)
     }
 
-    fn check_equal(&mut self, e1: Expr, e2: Expr) {
+    fn assert_equal(&mut self, e1: Expr, e2: Expr) {
         if !self.equal(e1, e2) {
             panic!("`{e1}` and `{e2}` are not equal.")
         }
@@ -561,7 +559,10 @@ impl Context {
             // Should only happen for uninterpreted symbols.
             (App(f1, a1), App(f2, a2)) => self.equal(*f1, *f2) && self.equal(*a1, *a2),
             (Struct(f1), Struct(f2)) | (TypedStruct(_, f1), TypedStruct(_, f2)) => {
-                self.equal_fields(f1, f2)
+                f1.len() == f2.len()
+                    && f1
+                        .iter()
+                        .all(|(n, e)| f2.iter().any(|(n2, e2)| n == n2 && self.equal(*e, *e2)))
             }
             (StructTy(x1, f1), StructTy(x2, f2)) => {
                 if f1.len() != f2.len() {
@@ -583,12 +584,6 @@ impl Context {
             (Todo(t1), Todo(t2)) => t1 == t2,
             _ => false,
         }
-    }
-    fn equal_fields(&mut self, f1: &[(__<str>, Expr)], f2: &[(__<str>, Expr)]) -> bool {
-        f1.len() == f2.len()
-            && f1
-                .iter()
-                .all(|(n, e)| f2.iter().any(|(n2, e2)| n == n2 && self.equal(*e, *e2)))
     }
 }
 
