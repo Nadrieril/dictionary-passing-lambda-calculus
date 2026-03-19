@@ -12,9 +12,9 @@ fn test_application() {
     ctx.add_uninterpreted("N", Type(0));
     ctx.add_uninterpreted("z", p("N"));
     ctx.add_uninterpreted("s", p("fn(_: N) -> N"));
-    ctx.add_val("three", p(r"\(f: fn(_: N) -> N) -> \(x: N) -> f (f (f x))"));
+    ctx.add_val("three", p(r"\(f: fn(_: N) -> N, x: N) -> f(f(f(x)))"));
 
-    let expr = p("three (three s) z");
+    let expr = p("three(three(s), z)");
     let normalized = ctx.normalize(expr);
     let ty = ctx.infer_type(expr);
     assert_eq!(
@@ -30,7 +30,7 @@ fn test_types() {
     ctx.add_uninterpreted("N", Type(0));
     ctx.add_uninterpreted("z", p("N"));
 
-    let sty = p("fn(_: fn(_: N) -> N) -> fn(_: N) -> N");
+    let sty = p("fn(_: fn(_: N) -> N, _: N) -> N");
     assert_eq!(ctx.infer_type(sty).to_string(), "Type(0)");
 }
 
@@ -121,33 +121,31 @@ fn test_capture_avoidance() {
     ctx.add_uninterpreted("s", p("fn(N) -> N"));
 
     assert_eq!(
-        ctx.normalize(p(r"(\(y: N) -> \(x: N) -> y) x z"))
-            .to_string(),
+        ctx.normalize(p(r"(\(y: N, x: N) -> y)(x, z)")).to_string(),
         "x"
     );
     assert_eq!(
-        ctx.normalize(p(r"(\(x: N) -> \(x: N) -> x) y z"))
+        ctx.normalize(p(r"(\(x: N, x: N) -> x)(y, z)")).to_string(),
+        "z"
+    );
+    assert_eq!(
+        ctx.normalize(p(r"(\(x: N) -> (\(y: N, x: N) -> y)(x))(z, y)"))
             .to_string(),
         "z"
     );
     assert_eq!(
-        ctx.normalize(p(r"(\(x: N) -> (\(y: N) -> \(x: N) -> y) x) z y"))
-            .to_string(),
-        "z"
-    );
-    assert_eq!(
-        ctx.normalize(p(r"(\(f: fn(N) -> N) -> f (f x)) (\(x: N) -> s x)"))
+        ctx.normalize(p(r"(\(f: fn(N) -> N) -> f(f(x)))(\(x: N) -> s(x))"))
             .to_string(),
         "s (s x)"
     );
 
     ctx.add_val(
         "ap",
-        p(r"\(t: Type(0)) -> \(u: Type(0)) -> \(f: fn(t) -> u) -> \(x: t) -> f x"),
+        p(r"\(t: Type(0), u: Type(0), f: fn(t) -> u, x: t) -> f(x)"),
     );
     ctx.assert_equal(
-        p("ap (fn(N) -> N) (fn(N) -> N) (ap N N)"),
-        p(r"\(x1: fn(N) -> N) -> \(x2: N) -> x1 x2"),
+        p("ap(fn(N) -> N, fn(N) -> N, ap(N, N))"),
+        p(r"\(x1: fn(N) -> N, x2: N) -> x1(x2)"),
     );
 }
 
@@ -276,9 +274,7 @@ fn test_traits() {
             iterator_bound: Iterator self.into_iter_ty,
             type_eq: self.item_ty == self.iterator_bound.item_ty,
         } in
-        let IntoIteratorImpl =
-            \(t: Type(0)) ->
-            \(t_iter: Iterator t) ->
+        let IntoIteratorImpl(t: Type(0), t_iter: Iterator t) -> IntoIterator t =
             make (IntoIterator t) {
                 item_ty = t_iter.item_ty,
                 into_iter_ty = t,
@@ -290,21 +286,16 @@ fn test_traits() {
         // fn conv<T: Iterator>(t: <T as Iterator>::Item) -> <T as IntoIterator>::Item {
         //     t
         // }
-        let conv:
-            fn(t: Type(0)) ->
-            fn(t_iter: Iterator t) ->
-            t_iter.item_ty == (IntoIteratorImpl t t_iter).item_ty
+        let conv(t: Type(0), t_iter: Iterator t) ->
+            t_iter.item_ty == IntoIteratorImpl(t, t_iter).item_ty
         =
-            \(t: Type(0)) ->
-            \(t_iter: Iterator t) ->
-            (IntoIteratorImpl t t_iter).type_eq
+            IntoIteratorImpl(t, t_iter).type_eq
         in
 
-        let contractible = \(t: Type(1)) -> fn(x: t) -> fn(y: t) -> x == y in
+        let contractible = \(t: Type(1)) -> fn(x: t, y: t) -> x == y in
         // assume coherence for IntoIterator
-        let coherence:
-            fn(t: Type(0)) -> contractible (IntoIterator t)
-            = \(t: Type(0)) -> todo (contractible (IntoIterator t))
+        let coherence(t: Type(0)) -> contractible(IntoIterator t)
+            = todo (contractible(IntoIterator t))
         in
 
         // fn foo<T>(t: <T as Iterator>::Item) -> <T as IntoIterator>::Item
@@ -312,17 +303,11 @@ fn test_traits() {
         // {
         //     conv::<T>(t)
         // }
-        let foo:
-            fn(t: Type(0)) ->
-            fn(t_iter: Iterator t) ->
-            fn(t_into_iter: IntoIterator t) ->
+        let foo(t: Type(0), t_iter: Iterator(t), t_into_iter: IntoIterator t) ->
             t_iter.item_ty == t_into_iter.item_ty
         =
-            \(t: Type(0)) ->
-            \(t_iter: Iterator t) ->
-            \(t_into_iter: IntoIterator t) ->
-            let use_coherence = coherence t (IntoIteratorImpl t t_iter) t_into_iter in
-            transport use_coherence (\(impl: IntoIterator t) -> t_iter.item_ty == impl.item_ty) (conv t t_iter)
+            let use_coherence = coherence(t, IntoIteratorImpl(t, t_iter), t_into_iter) in
+            transport use_coherence (\(impl: IntoIterator t) -> t_iter.item_ty == impl.item_ty) conv(t, t_iter)
         in
 
         {=}
@@ -337,27 +322,19 @@ fn test_unsound_traits() {
     ctx.normalize(p(
         r"
         // Helpers
-        let symmetry: fn(a: Type(0)) -> fn(b: Type(0)) -> fn(a == b) -> b == a =
-            \(a: Type(0)) ->
-            \(b: Type(0)) ->
-            \(ab: a == b) ->
+        let symmetry(a: Type(0), b: Type(0), ab: a == b) -> b == a =
             transport ab (\(x: Type(0)) -> x == a) (refl a)
         in
-        let transitivity: fn(a: Type(0)) -> fn(b: Type(0)) -> fn(c: Type(0)) -> fn(a == b) -> fn(b == c) -> a == c =
-            \(a: Type(0)) ->
-            \(b: Type(0)) ->
-            \(c: Type(0)) ->
-            \(ab: a == b) ->
-            \(bc: b == c) ->
+        let transitivity(a: Type(0), b: Type(0), c: Type(0), ab: a == b, bc: b == c) -> a == c =
             transport bc (\(x: Type(0)) -> a == x) ab
         in
 
         // trait Trait<R>: Sized {
         //     type Proof: Trait<R, Proof = Self>;
         // }
-        let rec Trait: fn(Type(0)) -> fn(Type(0)) -> Type(1) = \(t: Type(0)) -> \(r: Type(0)) -> {
+        let rec Trait(t: Type(0), r: Type(0)) -> Type(1) = {
             proof: Type(0),
-            proof_impl: Trait self.proof r,
+            proof_impl: Trait(self.proof, r),
             proof_impl_constraint: self.proof_impl.proof == t,
         } in
 
@@ -370,49 +347,44 @@ fn test_unsound_traits() {
         // {
         //     type Proof = R;
         // }
-        let TraitImpl =
-            \(l: Type(0)) ->
-            \(r: Type(0)) ->
-            \(l_trait: Trait l r) ->
-            \(r_trait: Trait r r) ->
-            \(r_trait_constraint: r_trait.proof == l_trait.proof_impl.proof) ->
-        make (Trait l r) {
+        let TraitImpl(
+            l: Type(0),
+            r: Type(0),
+            l_trait: Trait(l, r),
+            r_trait: Trait(r, r),
+            r_trait_constraint: r_trait.proof == l_trait.proof_impl.proof,
+        ) -> Trait(l, r) = make (Trait(l, r)) {
             proof = r,
             proof_impl = r_trait,
             proof_impl_constraint =
                 let eq1: (l_trait.proof_impl.proof == l) = l_trait.proof_impl_constraint in
-                let eq2: (r_trait.proof == l) = transitivity r_trait.proof l_trait.proof_impl.proof l r_trait_constraint eq1 in
+                let eq2: (r_trait.proof == l) = transitivity(r_trait.proof, l_trait.proof_impl.proof, l, r_trait_constraint, eq1) in
                 eq2
         }
         in
 
         // First coinductive impl dictionary.
-        let IdTraitImpl: fn(r: Type(0)) -> Trait r r =
-            \(r: Type(0)) ->
-            let rec Impl: Trait r r = TraitImpl r r Impl Impl (refl Impl.proof_impl.proof)
+        let IdTraitImpl(r: Type(0)) -> Trait(r, r) =
+            let rec Impl: Trait(r, r) = TraitImpl(r, r, Impl, Impl, refl Impl.proof_impl.proof)
             in Impl
         in
         // Second coinductive impl dictionary.
-        let GeneralTraitImpl: fn(l: Type(0)) -> fn(r: Type(0)) -> Trait l r =
-            \(l: Type(0)) ->
-            \(r: Type(0)) ->
-            let rec Impl: Trait l r =
-                let l_trait: Trait l r = Impl in
-                let r_trait: Trait r r = IdTraitImpl r in
+        let GeneralTraitImpl(l: Type(0), r: Type(0)) -> Trait(l, r) =
+            let rec Impl: Trait(l, r) =
+                let l_trait: Trait(l, r) = Impl in
+                let r_trait: Trait(r, r) = IdTraitImpl(r) in
                 let r_trait_constraint: (r_trait.proof == l_trait.proof_impl.proof) = refl (l_trait.proof_impl.proof) in
-                TraitImpl l r l_trait r_trait r_trait_constraint
+                TraitImpl(l, r, l_trait, r_trait, r_trait_constraint)
             in Impl
         in
         // Boom!
-        let transmute: fn(l: Type(0)) -> fn(r: Type(0)) -> l == r =
-            \(l: Type(0)) ->
-            \(r: Type(0)) ->
-            let l_impl: Trait l r = GeneralTraitImpl l r in
-            symmetry r l (l_impl.proof_impl_constraint)
+        let transmute(l: Type(0), r: Type(0)) -> l == r =
+            let l_impl: Trait(l, r) = GeneralTraitImpl(l, r) in
+            symmetry(r, l, l_impl.proof_impl_constraint)
         in
 
         // This creates a value of arbitrary type hihi (and stack overflows)
-        // transport (transmute {} N) (\(x: Type(0)) -> x) {=}
+        // transport(transmute({}, N), \(x: Type(0)) -> x, {=})
         {=}
         "
     ));
@@ -425,27 +397,19 @@ fn test_unsound_traits2() {
     ctx.normalize(p(
         r"
         // Helpers
-        let symmetry: fn(a: Type(0)) -> fn(b: Type(0)) -> fn(a == b) -> b == a =
-            \(a: Type(0)) ->
-            \(b: Type(0)) ->
-            \(ab: a == b) ->
+        let symmetry(a: Type(0), b: Type(0), ab: a == b) -> b == a =
             transport ab (\(x: Type(0)) -> x == a) (refl a)
         in
-        let transitivity: fn(a: Type(0)) -> fn(b: Type(0)) -> fn(c: Type(0)) -> fn(a == b) -> fn(b == c) -> a == c =
-            \(a: Type(0)) ->
-            \(b: Type(0)) ->
-            \(c: Type(0)) ->
-            \(ab: a == b) ->
-            \(bc: b == c) ->
+        let transitivity(a: Type(0), b: Type(0), c: Type(0), ab: a == b, bc: b == c) -> a == c =
             transport bc (\(x: Type(0)) -> a == x) ab
         in
 
         // trait Trait<R>: Sized {
         //     type Proof: Trait<R, Proof = Self>;
         // }
-        let rec Trait: fn(Type(0)) -> fn(Type(0)) -> Type(1) = \(t: Type(0)) -> \(r: Type(0)) -> {
+        let rec Trait(t: Type(0), r: Type(0)) -> Type(1) = {
             proof: Type(0),
-            proof_impl: Trait self.proof r,
+            proof_impl: Trait(self.proof, r),
             proof_impl_constraint: self.proof_impl.proof == t,
         } in
 
@@ -468,34 +432,26 @@ fn test_unsound_traits2() {
         //         L: Trait<R>,
         //         R: Trait<R, Proof = <L::Proof as Trait<R>>::Proof>;
         // }
-        let rec TraitImpl:
-            fn(l: Type(0)) ->
-            fn(r: Type(0)) ->
-            Trait l r
-        =
-            \(l: Type(0)) ->
-            \(r: Type(0)) ->
-            let rec Impl: Trait l r =
-                let l_trait: Trait l r = Impl in // direct coinduction
-                let r_trait: Trait r r = TraitImpl r r in // polymorphic coinduction
+        let rec TraitImpl(l: Type(0), r: Type(0)) -> Trait(l, r) =
+            let rec Impl: Trait(l, r) =
+                let l_trait: Trait(l, r) = Impl in // direct coinduction
+                let r_trait: Trait(r, r) = TraitImpl(r, r) in // polymorphic coinduction
                 let r_trait_constraint: (r_trait.proof == l_trait.proof_impl.proof) = refl (l_trait.proof_impl.proof) in
-                make (Trait l r) {
+                make (Trait(l, r)) {
                     proof = r,
                     proof_impl = r_trait,
                     proof_impl_constraint =
                         let eq1: (l_trait.proof_impl.proof == l) = l_trait.proof_impl_constraint in
-                        let eq2: (r_trait.proof == l) = transitivity r_trait.proof l_trait.proof_impl.proof l r_trait_constraint eq1 in
+                        let eq2: (r_trait.proof == l) = transitivity(r_trait.proof, l_trait.proof_impl.proof, l, r_trait_constraint, eq1) in
                         eq2
                 }
             in Impl
         in
 
         // Boom!
-        let transmute: fn(l: Type(0)) -> fn(r: Type(0)) -> l == r =
-            \(l: Type(0)) ->
-            \(r: Type(0)) ->
-            let l_impl: Trait l r = TraitImpl l r in
-            symmetry r l (l_impl.proof_impl_constraint)
+        let transmute(l: Type(0), r: Type(0)) -> l == r =
+            let l_impl: Trait(l, r) = TraitImpl(l, r) in
+            symmetry(r, l, l_impl.proof_impl_constraint)
         in
 
         {=}

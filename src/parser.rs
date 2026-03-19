@@ -135,40 +135,24 @@ fn parse_type(input: &str) -> IResult<'_, Expr> {
     .parse(input)
 }
 
-/// `\(x: A) -> e`
+/// `\(x: A) -> e` or `\(x: A, y: B) -> e` (multi-param sugar)
 fn parse_lambda(input: &str) -> IResult<'_, Expr> {
     map(
-        (
-            ws(nom_char('\\')),
-            ws(nom_char('(')),
-            variable,
-            ws(nom_char(':')),
-            parse_expr,
-            ws(nom_char(')')),
-            ws(tag("->")),
-            parse_expr,
-        ),
-        |(_, _, x, _, t, _, _, e)| Lambda(x, __(t), __(e)),
+        (ws(nom_char('\\')), parse_params, ws(tag("->")), parse_expr),
+        |(_, params, _, body)| wrap_lambda(&params, body),
     )
     .parse(input)
 }
 
-/// `fn(x: A) -> B` or `fn(A) -> B` (shorthand for `fn(_: A) -> B`)
+/// `fn(x: A) -> B`, `fn(x: A, y: B) -> C` (multi-param sugar), or `fn(A) -> B` (shorthand for `fn(_: A) -> B`)
 fn parse_pi(input: &str) -> IResult<'_, Expr> {
     alt((
+        // fn(x: A, ...) -> B — named params (possibly multiple)
         map(
-            (
-                keyword("fn"),
-                ws(nom_char('(')),
-                variable,
-                ws(nom_char(':')),
-                parse_expr,
-                ws(nom_char(')')),
-                ws(tag("->")),
-                parse_expr,
-            ),
-            |(_, _, x, _, t, _, _, e)| Pi(x, __(t), __(e)),
+            (keyword("fn"), parse_params, ws(tag("->")), parse_expr),
+            |(_, params, _, ret)| wrap_pi(&params, ret),
         ),
+        // fn(A) -> B — anonymous param
         map(
             (
                 keyword("fn"),
@@ -236,12 +220,34 @@ fn parse_atom(input: &str) -> IResult<'_, Expr> {
     .parse(input)
 }
 
-/// Postfix: atom followed by zero or more `.field` accesses.
+/// Postfix: atom followed by zero or more `.field` accesses or `(args)` calls.
+/// Call syntax `f(a, b)` requires no whitespace before the `(` to distinguish
+/// from juxtaposition application `f (a)`.
 fn parse_postfix(input: &str) -> IResult<'_, Expr> {
     let (mut input, mut expr) = parse_atom(input)?;
-    while let Ok((rest, (_, name))) = (ws(nom_char('.')), ident).parse(input) {
-        expr = Field(__(expr), leak_str(name));
-        input = rest;
+    loop {
+        if let Ok((rest, (_, name))) = (ws(nom_char('.')), ident).parse(input) {
+            expr = Field(__(expr), leak_str(name));
+            input = rest;
+        } else if input.starts_with('(') {
+            // No whitespace before '(' — parse as call syntax
+            if let Ok((rest, args)) = delimited(
+                nom_char('('),
+                separated_list1(ws(nom_char(',')), parse_expr),
+                (opt(ws(nom_char(','))), ws(nom_char(')'))),
+            )
+            .parse(input)
+            {
+                for arg in args {
+                    expr = App(__(expr), __(arg));
+                }
+                input = rest;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
     }
     Ok((input, expr))
 }
@@ -323,9 +329,62 @@ fn parse_eq(input: &str) -> IResult<'_, Expr> {
     }
 }
 
-/// `let x = e1 in e2` or `let x: T = e1 in e2`
+/// Parse a parameter list: `(x: A, y: B, ...)`
+fn parse_params(input: &str) -> IResult<'_, Vec<(Variable, Expr)>> {
+    let param = |input| {
+        (variable, ws(nom_char(':')), parse_expr)
+            .map(|(x, _, t)| (x, t))
+            .parse(input)
+    };
+    delimited(
+        ws(nom_char('(')),
+        separated_list1(ws(nom_char(',')), param),
+        (opt(ws(nom_char(','))), ws(nom_char(')'))),
+    )
+    .parse(input)
+}
+
+/// Wrap a return type in nested Pi types for each parameter.
+fn wrap_pi(params: &[(Variable, Expr)], ret: Expr) -> Expr {
+    params
+        .iter()
+        .rev()
+        .fold(ret, |acc, (x, t)| Pi(*x, __(*t), __(acc)))
+}
+
+/// Wrap a body in nested lambdas for each parameter.
+fn wrap_lambda(params: &[(Variable, Expr)], body: Expr) -> Expr {
+    params
+        .iter()
+        .rev()
+        .fold(body, |acc, (x, t)| Lambda(*x, __(*t), __(acc)))
+}
+
+/// `let x = e1 in e2` or `let x: T = e1 in e2` or `let x(params): T = e1 in e2`
 fn parse_let(input: &str) -> IResult<'_, Expr> {
     alt((
+        // let x(params) -> T = e1 in e2 — function sugar
+        map(
+            (
+                keyword("let"),
+                variable,
+                parse_params,
+                ws(tag("->")),
+                parse_expr,
+                ws(nom_char('=')),
+                parse_expr,
+                keyword("in"),
+                parse_expr,
+            ),
+            |(_, x, params, _, ret, _, body, _, e2)| {
+                LetRec(
+                    x,
+                    __(wrap_pi(&params, ret)),
+                    __(wrap_lambda(&params, body)),
+                    __(e2),
+                )
+            },
+        ),
         // let x: T = e1 in e2 — annotated let (desugars to LetRec)
         map(
             (
@@ -356,22 +415,48 @@ fn parse_let(input: &str) -> IResult<'_, Expr> {
     .parse(input)
 }
 
-/// `let rec x: T = e1 in e2`
+/// `let rec x: T = e1 in e2` or `let rec x(params): T = e1 in e2`
 fn parse_let_rec(input: &str) -> IResult<'_, Expr> {
-    map(
-        (
-            keyword("let"),
-            keyword("rec"),
-            variable,
-            ws(nom_char(':')),
-            parse_expr,
-            ws(nom_char('=')),
-            parse_expr,
-            keyword("in"),
-            parse_expr,
+    alt((
+        // let rec x(params) -> T = e1 in e2 — function sugar
+        map(
+            (
+                keyword("let"),
+                keyword("rec"),
+                variable,
+                parse_params,
+                ws(tag("->")),
+                parse_expr,
+                ws(nom_char('=')),
+                parse_expr,
+                keyword("in"),
+                parse_expr,
+            ),
+            |(_, _, x, params, _, ret, _, body, _, e2)| {
+                LetRec(
+                    x,
+                    __(wrap_pi(&params, ret)),
+                    __(wrap_lambda(&params, body)),
+                    __(e2),
+                )
+            },
         ),
-        |(_, _, x, _, ty, _, e1, _, e2)| LetRec(x, __(ty), __(e1), __(e2)),
-    )
+        // let rec x: T = e1 in e2
+        map(
+            (
+                keyword("let"),
+                keyword("rec"),
+                variable,
+                ws(nom_char(':')),
+                parse_expr,
+                ws(nom_char('=')),
+                parse_expr,
+                keyword("in"),
+                parse_expr,
+            ),
+            |(_, _, x, _, ty, _, e1, _, e2)| LetRec(x, __(ty), __(e1), __(e2)),
+        ),
+    ))
     .parse(input)
 }
 
@@ -445,8 +530,8 @@ mod tests {
             "f (g x)",
             r"\(x: Type(0)) -> x",
             "fn(x: Type(0)) -> x",
-            r"\(f: fn(_: N) -> N) -> \(x: N) -> f (f (f x))",
-            "fn(_: fn(_: N) -> N) -> fn(_: N) -> N",
+            r"\(f: fn(_: N) -> N, x: N) -> f (f (f x))",
+            "fn(_: fn(_: N) -> N, _: N) -> N",
             // Structs
             "{ a: Type(0), b: Type(0) }",
             "{ a = x, b = y }",
@@ -479,6 +564,8 @@ mod tests {
             // Let
             "let x = y in x",
             "let rec x: Type(0) = N in x",
+            r"let rec f(x: Type(0), y: Type(0)) -> Type(0) = x in f",
+            // NB: `let f(x: T): R = ...` also roundtrips as `let rec` since annotated let desugars to LetRec
         ];
         for input in cases {
             let expr = parse(input).unwrap_or_else(|e| panic!("failed to parse {input:?}: {e}"));
@@ -498,12 +585,32 @@ mod tests {
     }
 
     #[test]
-    fn test_annotated_let() {
-        // `let x: T = e in body` desugars to `let rec x: T = e in body`
-        assert_eq!(
-            parse("let x: Type(0) = N in x").unwrap().to_string(),
-            "let rec x: Type(0) = N in x"
-        );
+    fn test_desugaring() {
+        let cases = [
+            ("let x: Type(0) = N in x", "let rec x: Type(0) = N in x"),
+            (r"\(x: A) -> \(y: B) -> x", r"\(x: A, y: B) -> x"),
+            ("fn(x: A) -> fn(y: B) -> C", "fn(x: A, y: B) -> C"),
+            ("fn(A) -> fn(B) -> C", "fn(_: A, _: B) -> C"),
+            (
+                r"let f(x: A) -> B = x in f",
+                r"let rec f(x: A) -> B = x in f",
+            ),
+            (
+                r"let f(x: A, y: B) -> C = x in f",
+                r"let rec f(x: A, y: B) -> C = x in f",
+            ),
+            (r"fn(f: \(x: A) -> x) -> B", r"fn(f: \(x: A) -> x) -> B"),
+            // Call syntax
+            ("f(x)", "f x"),
+            ("f(x, y)", "f x y"),
+            ("f(x, y).a", "(f x y).a"),
+            ("f(x)(y)", "f x y"),
+        ];
+        for (input, expected) in cases {
+            let expr = parse(input).unwrap_or_else(|e| panic!("failed to parse {input:?}: {e}"));
+            let output = expr.to_string();
+            assert_eq!(output, expected, "desugaring failed for {input:?}");
+        }
     }
 
     #[test]

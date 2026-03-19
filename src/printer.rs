@@ -23,8 +23,14 @@ impl Expr {
                 }
                 write!(f, "fn({x}: ")?;
                 t.fmt_prec(f, 0)?;
+                let mut inner = &**e;
+                while let Pi(x2, t2, e2) = inner {
+                    write!(f, ", {x2}: ")?;
+                    t2.fmt_prec(f, 0)?;
+                    inner = e2;
+                }
                 write!(f, ") -> ")?;
-                e.fmt_prec(f, 0)?;
+                inner.fmt_prec(f, 0)?;
                 if prec > 0 {
                     write!(f, ")")?;
                 }
@@ -36,8 +42,14 @@ impl Expr {
                 }
                 write!(f, "\\({x}: ")?;
                 t.fmt_prec(f, 0)?;
+                let mut inner = &**e;
+                while let Lambda(x2, t2, e2) = inner {
+                    write!(f, ", {x2}: ")?;
+                    t2.fmt_prec(f, 0)?;
+                    inner = e2;
+                }
                 write!(f, ") -> ")?;
-                e.fmt_prec(f, 0)?;
+                inner.fmt_prec(f, 0)?;
                 if prec > 0 {
                     write!(f, ")")?;
                 }
@@ -86,10 +98,26 @@ impl Expr {
                 if prec > 0 {
                     write!(f, "(")?;
                 }
-                write!(f, "let rec {x}: ")?;
-                ty.fmt_prec(f, 0)?;
+                // Detect function sugar: type is nested Pi, body is nested Lambda
+                // with matching parameters.
+                let (params, ret, body) = peel_fun_sugar(ty, e1);
+                if params.is_empty() {
+                    write!(f, "let rec {x}: ")?;
+                    ret.fmt_prec(f, 0)?;
+                } else {
+                    write!(f, "let rec {x}(")?;
+                    for (i, (px, pt)) in params.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{px}: ")?;
+                        pt.fmt_prec(f, 0)?;
+                    }
+                    write!(f, ") -> ")?;
+                    ret.fmt_prec(f, 0)?;
+                }
                 write!(f, " = ")?;
-                e1.fmt_prec(f, 0)?;
+                body.fmt_prec(f, 0)?;
                 write!(f, " in ")?;
                 e2.fmt_prec(f, 0)?;
                 if prec > 0 {
@@ -152,6 +180,26 @@ impl Expr {
     }
 }
 
+/// Peel matching Pi/Lambda layers for function sugar printing.
+/// Returns (params, return_type, inner_body).
+fn peel_fun_sugar<'a>(
+    mut ty: &'a Expr,
+    mut body: &'a Expr,
+) -> (Vec<(Variable, &'a Expr)>, &'a Expr, &'a Expr) {
+    let mut params = Vec::new();
+    loop {
+        match (ty, body) {
+            (Pi(tx, tt, te), Lambda(bx, _bt, be)) if *tx == *bx => {
+                params.push((*tx, &**tt));
+                ty = te;
+                body = be;
+            }
+            _ => break,
+        }
+    }
+    (params, ty, body)
+}
+
 fn fmt_fields(f: &mut fmt::Formatter<'_>, fields: &[(&str, Expr)], sep: &str) -> fmt::Result {
     if fields.is_empty() {
         return write!(f, "{{}}");
@@ -200,6 +248,6 @@ fn test_print() {
     );
     assert_eq!(
         expr.to_string(),
-        r"\(f: fn(_: N) -> N) -> \(x: N) -> f (f (f x))"
+        r"\(f: fn(_: N) -> N, x: N) -> f (f (f x))"
     );
 }
