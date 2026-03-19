@@ -257,34 +257,75 @@ fn test_reject_rec_self_mismatch() {
 #[test]
 fn test_traits() {
     let mut ctx = EvalContext::default();
-    ctx.add_val(
-        "Clone",
-        p(r"\(t: Type(0)) -> {
+    ctx.normalize(p(r"
+        let Clone = \(t: Type(0)) -> {
             clone_method: fn(_: t) -> t,
-        }"),
-    );
-    ctx.add_val(
-        "Copy",
-        p(r"\(t: Type(0)) -> {
+        } in
+        let Copy = \(t: Type(0)) -> {
             clone_supertrait: Clone t,
-        }"),
-    );
-    ctx.add_val(
-        "Iterator",
-        p(r"\(t: Type(0)) -> {
+        } in
+
+        let Iterator = \(t: Type(0)) -> {
             item_ty: Type(0),
             next_method: fn(t) -> self.item_ty,
-        }"),
-    );
-    ctx.add_val(
-        "IntoIterator",
-        p(r"\(t: Type(0)) -> {
+        } in
+
+        let IntoIterator = \(t: Type(0)) -> {
             item_ty: Type(0),
             into_iter_ty: Type(0),
             iterator_bound: Iterator self.into_iter_ty,
             type_eq: self.item_ty == self.iterator_bound.item_ty,
-        }"),
-    );
+        } in
+        let IntoIteratorImpl =
+            \(t: Type(0)) ->
+            \(t_iter: Iterator t) ->
+            make (IntoIterator t) {
+                item_ty = t_iter.item_ty,
+                into_iter_ty = t,
+                iterator_bound = t_iter,
+                type_eq = refl t_iter.item_ty,
+            }
+        in
+
+        // fn conv<T: Iterator>(t: <T as Iterator>::Item) -> <T as IntoIterator>::Item {
+        //     t
+        // }
+        let conv:
+            fn(t: Type(0)) ->
+            fn(t_iter: Iterator t) ->
+            t_iter.item_ty == (IntoIteratorImpl t t_iter).item_ty
+        =
+            \(t: Type(0)) ->
+            \(t_iter: Iterator t) ->
+            (IntoIteratorImpl t t_iter).type_eq
+        in
+
+        // fn foo<T>(t: <T as Iterator>::Item) -> <T as IntoIterator>::Item
+        //   where T: Iterator + IntoIterator
+        // {
+        //     conv::<T>(t)
+        // }
+        let coherence =
+            \(t: Type(0)) ->
+            \(t_into_iter1: IntoIterator t) ->
+            \(t_into_iter2: IntoIterator t) ->
+            todo (t_into_iter1 == t_into_iter2) // assume coherence
+        in
+        let foo:
+            fn(t: Type(0)) ->
+            fn(t_iter: Iterator t) ->
+            fn(t_into_iter: IntoIterator t) ->
+            t_iter.item_ty == t_into_iter.item_ty
+        =
+            \(t: Type(0)) ->
+            \(t_iter: Iterator t) ->
+            \(t_into_iter: IntoIterator t) ->
+            let use_coherence = coherence t (IntoIteratorImpl t t_iter) t_into_iter in
+            transport use_coherence (\(impl: IntoIterator t) -> t_iter.item_ty == impl.item_ty) (conv t t_iter)
+        in
+
+        {=}
+    "));
 }
 
 #[test]
