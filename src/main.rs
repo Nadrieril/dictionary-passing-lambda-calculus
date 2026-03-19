@@ -32,7 +32,7 @@ impl Variable {
 
 pub type Abstraction = (Variable, Expr, Expr);
 
-#[derive(Clone, Copy, Debug, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub enum Expr {
     Var(Variable),
     Type(usize),
@@ -172,58 +172,6 @@ impl Expr {
         }
 
         Substituter(s).subst(self)
-    }
-}
-
-/// Convenience best-effort equality testing; used mostly for `assert_eq`.
-impl PartialEq for Expr {
-    fn eq(&self, other: &Self) -> bool {
-        /// Alpha-equality for abstractions: freshen both binders to a common variable.
-        fn eq_abstraction(a1: __<Abstraction>, a2: __<Abstraction>) -> bool {
-            let (x, t1, e1) = *a1;
-            let (y, t2, e2) = *a2;
-            let z = x.refresh();
-            t1 == t2 && e1.subst([(x, Var(z))].into()) == e2.subst([(y, Var(z))].into())
-        }
-
-        fn eq_fields(f1: &[(__<str>, Expr)], f2: &[(__<str>, Expr)]) -> bool {
-            f1.len() == f2.len()
-                && f1
-                    .iter()
-                    .all(|(n, e)| f2.iter().any(|(n2, e2)| n == n2 && e == e2))
-        }
-
-        match (*self, *other) {
-            (Pi(a1), Pi(a2)) | (Lambda(a1), Lambda(a2)) => eq_abstraction(a1, a2),
-            (Struct(f1), Struct(f2)) | (TypedStruct(_, f1), TypedStruct(_, f2)) => {
-                eq_fields(f1, f2)
-            }
-            (StructTy(x1, f1), StructTy(x2, f2)) => {
-                if f1.len() != f2.len() {
-                    return false;
-                }
-                let z = x1.refresh();
-                let s1: HashMap<_, _> = [(x1, Var(z))].into();
-                let s2: HashMap<_, _> = [(x2, Var(z))].into();
-                f1.iter().all(|(n, e)| {
-                    f2.iter()
-                        .any(|(n2, e2)| n == n2 && e.subst(s1.clone()) == e2.subst(s2.clone()))
-                })
-            }
-            (Var(x1), Var(x2)) => x1 == x2,
-            (Type(k1), Type(k2)) => k1 == k2,
-            (App(e11, e12), App(e21, e22)) => e11 == e21 && e12 == e22,
-            (Field(e1, n1), Field(e2, n2)) => n1 == n2 && e1 == e2,
-            (Let(x1, e1, b1), Let(x2, e2, b2)) => x1 == x2 && e1 == e2 && b1 == b2,
-            (LetRec(x1, t1, e1, b1), LetRec(x2, t2, e2, b2)) => {
-                x1 == x2 && t1 == t2 && e1 == e2 && b1 == b2
-            }
-            (Eq(a1, b1), Eq(a2, b2)) => a1 == a2 && b1 == b2,
-            (Refl(a1), Refl(a2)) => a1 == a2,
-            (Transport((eq1, f1)), Transport((eq2, f2))) => eq1 == eq2 && f1 == f2,
-            (Todo(t1), Todo(t2)) => t1 == t2,
-            _ => false,
-        }
     }
 }
 
@@ -530,7 +478,11 @@ impl Context {
 
     fn assert_equal(&mut self, e1: Expr, e2: Expr) {
         if !self.equal(e1, e2) {
-            panic!("`{e1}` and `{e2}` are not equal.")
+            panic!(
+                "\nassertion `left == right` failed\n  \
+                 left: {e1}\n \
+                 right: {e2}"
+            );
         }
     }
     fn equal(&mut self, e1: Expr, e2: Expr) -> bool {
@@ -540,8 +492,13 @@ impl Context {
         match (e1, e2) {
             (Var(x1), Var(x2)) => x1 == x2,
             (Type(k1), Type(k2)) => k1 == k2,
-            // Undecidable, let's not even try.
-            (Lambda(..), Lambda(..)) => false,
+            (Lambda(a1), Lambda(a2)) => {
+                // A little bit of alpha-equivalence.
+                let (x, t1, e1) = *a1;
+                let (y, t2, e2) = *a2;
+                let z = x.refresh();
+                self.equal(t1, t2) && self.equal(e1.subst1(x, Var(z)), e2.subst1(y, Var(z)))
+            }
             (Pi(a1), Pi(a2)) => {
                 let (x, t1, e1) = *a1;
                 let (y, t2, e2) = *a2;
@@ -563,8 +520,9 @@ impl Context {
                 // Fields are under the self-binder; compare syntactically.
                 let z = x1.refresh();
                 f1.iter().all(|(n, e)| {
-                    f2.iter()
-                        .any(|(n2, e2)| n == n2 && e.subst1(x1, Var(z)) == e2.subst1(x2, Var(z)))
+                    f2.iter().any(|(n2, e2)| {
+                        n == n2 && self.equal(e.subst1(x1, Var(z)), e2.subst1(x2, Var(z)))
+                    })
                 })
             }
             (Field(e1, n1), Field(e2, n2)) => n1 == n2 && self.equal(*e1, *e2),
@@ -573,7 +531,7 @@ impl Context {
             (Transport((eq1, f1)), Transport((eq2, f2))) => {
                 self.equal(*eq1, *eq2) && self.equal(*f1, *f2)
             }
-            (Todo(t1), Todo(t2)) => t1 == t2,
+            (Todo(t1), Todo(t2)) => self.equal(*t1, *t2),
             _ => false,
         }
     }
@@ -728,9 +686,9 @@ mod tests {
             "ap",
             p(r"\(t: Type(0)) -> \(u: Type(0)) -> \(f: fn(t) -> u) -> \(x: t) -> f x"),
         );
-        assert_eq!(
-            ctx.normalize(p("ap (fn(N) -> N) (fn(N) -> N) (ap N N)")),
-            p(r"\(x1: fn(N) -> N) -> \(x2: N) -> x1 x2")
+        ctx.assert_equal(
+            p("ap (fn(N) -> N) (fn(N) -> N) (ap N N)"),
+            p(r"\(x1: fn(N) -> N) -> \(x2: N) -> x1 x2"),
         );
     }
 
@@ -826,7 +784,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not equal")]
+    #[should_panic(expected = "assertion `left == right` failed")]
     fn test_reject_rec_self_mismatch() {
         let mut ctx = Context::default();
         ctx.add_uninterpreted("N", Type(0));
@@ -971,7 +929,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not equal")]
+    #[should_panic(expected = "assertion `left == right` failed")]
     fn test_reject_arg_type_mismatch() {
         let mut ctx = Context::default();
         ctx.add_uninterpreted("N", Type(0));
@@ -1011,7 +969,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not equal")]
+    #[should_panic(expected = "assertion `left == right` failed")]
     fn test_reject_eq_different_types() {
         let mut ctx = Context::default();
         ctx.add_uninterpreted("N", Type(0));
@@ -1042,7 +1000,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "not equal")]
+    #[should_panic(expected = "assertion `left == right` failed")]
     fn test_reject_transport_domain_mismatch() {
         let mut ctx = Context::default();
         ctx.add_uninterpreted("N", Type(0));
