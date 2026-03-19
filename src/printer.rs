@@ -17,7 +17,7 @@ impl Expr {
         match self {
             Var(x) => write!(f, "{x}"),
             Type(k) => write!(f, "Type({k})"),
-            Pi((x, t, e)) => {
+            Pi(x, t, e) => {
                 if prec > 0 {
                     write!(f, "(")?;
                 }
@@ -30,7 +30,7 @@ impl Expr {
                 }
                 Ok(())
             }
-            Lambda((x, t, e)) => {
+            Lambda(x, t, e) => {
                 if prec > 0 {
                     write!(f, "(")?;
                 }
@@ -176,17 +176,17 @@ impl fmt::Display for Expr {
 #[test]
 fn test_print() {
     use crate::*;
-    let expr = Lambda(__((
+    let expr = Lambda(
         Variable::User("f"),
-        Pi(__((
+        __(Pi(
             Variable::User("_"),
-            Var(Variable::User("N")),
-            Var(Variable::User("N")),
-        ))),
-        Lambda(__((
+            __(Var(Variable::User("N"))),
+            __(Var(Variable::User("N"))),
+        )),
+        __(Lambda(
             Variable::User("x"),
-            Var(Variable::User("N")),
-            App(
+            __(Var(Variable::User("N"))),
+            __(App(
                 __(Var(Variable::User("f"))),
                 __(App(
                     __(Var(Variable::User("f"))),
@@ -195,9 +195,9 @@ fn test_print() {
                         __(Var(Variable::User("x"))),
                     )),
                 )),
-            ),
-        ))),
-    )));
+            )),
+        )),
+    );
     assert_eq!(
         expr.to_string(),
         r"\(f: fn(_: N) -> N) -> \(x: N) -> f (f (f x))"

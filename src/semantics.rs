@@ -134,27 +134,26 @@ impl EvalContext {
                     .ty;
             }
             Type(k) => return Type(k + 1),
-            Pi((x, t1, t2)) => {
+            Pi(x, t1, t2) => {
                 let k1 = self.infer_universe(*t1);
-                let k2 = self.with_binding_in_scope(*x, Binding::with_ty(*t1), |ctx| {
-                    ctx.infer_universe(*t2)
-                });
+                let k2 = self
+                    .with_binding_in_scope(x, Binding::with_ty(*t1), |ctx| ctx.infer_universe(*t2));
                 Type(k1.max(k2))
             }
-            Lambda((x, t, e)) => {
+            Lambda(x, t, e) => {
                 let _ = self.infer_universe(*t);
                 let te =
-                    self.with_binding_in_scope(*x, Binding::with_ty(*t), |ctx| ctx.infer_type(*e));
-                Pi(__((*x, *t, te)))
+                    self.with_binding_in_scope(x, Binding::with_ty(*t), |ctx| ctx.infer_type(*e));
+                Pi(x, t, __(te))
             }
             App(f, arg) => {
                 let f_ty = self.infer_type(*f);
-                let Pi((x, s, t)) = self.whnf_unfold(f_ty) else {
+                let Pi(x, s, t) = self.whnf_unfold(f_ty) else {
                     panic!("Function expected.")
                 };
                 let arg_ty = self.infer_type(*arg);
                 self.assert_equal(*s, arg_ty);
-                t.subst1(*x, *arg)
+                t.subst1(x, *arg)
             }
             StructTy(x, fields) => {
                 let k = self.with_binding_in_scope(x, Binding::with_ty(e), |ctx| {
@@ -245,7 +244,7 @@ impl EvalContext {
                 let Pi(..) = self.whnf_unfold(f_ty) else {
                     panic!("Function expected for transport's second argument")
                 };
-                Pi(__((Variable::User("_"), App(f, a), App(f, b))))
+                Pi(Variable::User("_"), __(App(f, a)), __(App(f, b)))
             }
             Todo(t) => {
                 let _ = self.infer_universe(*t);
@@ -286,7 +285,7 @@ impl EvalContext {
                 _ => Var(x),
             },
             App(e1, e2) => match self.whnf_inner(*e1, unfold_nominal) {
-                Lambda((x, _, body)) => self.whnf_inner(body.subst1(*x, *e2), unfold_nominal),
+                Lambda(x, _, body) => self.whnf_inner(body.subst1(x, *e2), unfold_nominal),
                 e1 => App(__(e1), e2),
             },
             Field(e, name) => match self.whnf_inner(*e, true) {
@@ -312,7 +311,7 @@ impl EvalContext {
                     // transport (refl x) f : fn(f x) -> f x  reduces to identity
                     Refl(x) => {
                         let y = Variable::User("_").refresh();
-                        Lambda(__((y, App(f, x), Var(y))))
+                        Lambda(y, __(App(f, x)), __(Var(y)))
                     }
                     eq => Transport(__((eq, *f))),
                 }
@@ -366,18 +365,14 @@ impl EvalContext {
         match (e1, e2) {
             (Var(x1), Var(x2)) => x1 == x2,
             (Type(k1), Type(k2)) => k1 == k2,
-            (Lambda(a1), Lambda(a2)) => {
+            (Lambda(x, t1, e1), Lambda(y, t2, e2)) => {
                 // A little bit of alpha-equivalence.
-                let (x, t1, e1) = *a1;
-                let (y, t2, e2) = *a2;
                 let z = x.refresh();
-                self.equal(t1, t2) && self.equal(e1.subst1(x, Var(z)), e2.subst1(y, Var(z)))
+                self.equal(*t1, *t2) && self.equal(e1.subst1(x, Var(z)), e2.subst1(y, Var(z)))
             }
-            (Pi(a1), Pi(a2)) => {
-                let (x, t1, e1) = *a1;
-                let (y, t2, e2) = *a2;
+            (Pi(x, t1, e1), Pi(y, t2, e2)) => {
                 let z = x.refresh();
-                self.equal(t1, t2) && self.equal(e1.subst1(x, Var(z)), e2.subst1(y, Var(z)))
+                self.equal(*t1, *t2) && self.equal(e1.subst1(x, Var(z)), e2.subst1(y, Var(z)))
             }
             // Should only happen for uninterpreted symbols.
             (App(f1, a1), App(f2, a2)) => self.equal(*f1, *f2) && self.equal(*a1, *a2),

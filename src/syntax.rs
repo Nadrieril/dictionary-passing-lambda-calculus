@@ -26,14 +26,12 @@ impl Variable {
     }
 }
 
-pub type Abstraction = (Variable, Expr, Expr);
-
 #[derive(Clone, Copy, Debug)]
 pub enum Expr {
     Var(Variable),
     Type(usize),
-    Pi(__<Abstraction>),
-    Lambda(__<Abstraction>),
+    Pi(Variable, __<Expr>, __<Expr>),
+    Lambda(Variable, __<Expr>, __<Expr>),
     App(__<Expr>, __<Expr>),
     Struct(__<[(__<str>, Expr)]>),
     /// Struct type. Binds a variable (typically `self`) that has the type being constructed,
@@ -88,17 +86,15 @@ impl Expr {
             Var(x) => Var(x),
             Type(k) => Type(k),
             App(e1, e2) => App(__(v.map_expr(*e1)), __(v.map_expr(*e2))),
-            Pi((x, t, e)) => {
-                let mut x = *x;
+            Pi(mut x, t, e) => {
                 let t = v.map_expr(*t);
                 let e = v.under_abstraction(&mut x, Some(t), |v| v.map_expr(*e));
-                Pi(__((x, t, e)))
+                Pi(x, __(t), __(e))
             }
-            Lambda((x, t, e)) => {
-                let mut x = *x;
+            Lambda(mut x, t, e) => {
                 let t = v.map_expr(*t);
                 let e = v.under_abstraction(&mut x, Some(t), |v| v.map_expr(*e));
-                Lambda(__((x, t, e)))
+                Lambda(x, __(t), __(e))
             }
             Let(mut x, e1, e2) => {
                 let e1 = v.map_expr(*e1);

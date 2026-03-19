@@ -148,7 +148,7 @@ fn parse_lambda(input: &str) -> IResult<'_, Expr> {
             ws(tag("->")),
             parse_expr,
         ),
-        |(_, _, x, _, t, _, _, e)| Lambda(__((x, t, e))),
+        |(_, _, x, _, t, _, _, e)| Lambda(x, __(t), __(e)),
     )
     .parse(input)
 }
@@ -167,7 +167,7 @@ fn parse_pi(input: &str) -> IResult<'_, Expr> {
                 ws(tag("->")),
                 parse_expr,
             ),
-            |(_, _, x, _, t, _, _, e)| Pi(__((x, t, e))),
+            |(_, _, x, _, t, _, _, e)| Pi(x, __(t), __(e)),
         ),
         map(
             (
@@ -178,7 +178,7 @@ fn parse_pi(input: &str) -> IResult<'_, Expr> {
                 ws(tag("->")),
                 parse_expr,
             ),
-            |(_, _, t, _, _, e)| Pi(__((Variable::User("_"), t, e))),
+            |(_, _, t, _, _, e)| Pi(Variable::User("_"), __(t), __(e)),
         ),
     ))
     .parse(input)
