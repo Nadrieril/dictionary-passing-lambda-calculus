@@ -300,17 +300,18 @@ fn test_traits() {
             (IntoIteratorImpl t t_iter).type_eq
         in
 
+        let contractible = \(t: Type(1)) -> fn(x: t) -> fn(y: t) -> x == y in
+        // assume coherence for IntoIterator
+        let coherence:
+            fn(t: Type(0)) -> contractible (IntoIterator t)
+            = \(t: Type(0)) -> todo (contractible (IntoIterator t))
+        in
+
         // fn foo<T>(t: <T as Iterator>::Item) -> <T as IntoIterator>::Item
         //   where T: Iterator + IntoIterator
         // {
         //     conv::<T>(t)
         // }
-        let coherence =
-            \(t: Type(0)) ->
-            \(t_into_iter1: IntoIterator t) ->
-            \(t_into_iter2: IntoIterator t) ->
-            todo (t_into_iter1 == t_into_iter2) // assume coherence
-        in
         let foo:
             fn(t: Type(0)) ->
             fn(t_iter: Iterator t) ->
