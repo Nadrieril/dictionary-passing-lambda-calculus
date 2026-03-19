@@ -207,16 +207,16 @@ fn test_let_rec() {
 
     // let rec with self-referential struct — field access through the fixpoint
     let expr = p(r"
-            let rec x: { a: N, b: self.a == self.a } = make ({ a: N, b: self.a == self.a }) { a = z, b = refl z }
-            in x.a
-        ");
+        let rec x: { a: N, b: self.a == self.a } = make ({ a: N, b: self.a == self.a }) { a = z, b = refl z }
+        in x.a
+    ");
     assert_eq!(ctx.normalize(expr).to_string(), "z");
 
     // let rec where a later field references an earlier one via self
     let expr = p(r"
-            let rec x: { a: N, b: N } = { a = z, b = x.a }
-            in x.b
-        ");
+        let rec x: { a: N, b: N } = { a = z, b = x.a }
+        in x.b
+    ");
     assert_eq!(ctx.normalize(expr).to_string(), "z");
 }
 
@@ -260,30 +260,30 @@ fn test_traits() {
     ctx.add_val(
         "Clone",
         p(r"\(t: Type(0)) -> {
-                clone_method: fn(_: t) -> t,
-            }"),
+            clone_method: fn(_: t) -> t,
+        }"),
     );
     ctx.add_val(
         "Copy",
         p(r"\(t: Type(0)) -> {
-                clone_supertrait: Clone t,
-            }"),
+            clone_supertrait: Clone t,
+        }"),
     );
     ctx.add_val(
         "Iterator",
         p(r"\(t: Type(0)) -> {
-                item_ty: Type(0),
-                next_method: fn(t) -> self.item_ty,
-            }"),
+            item_ty: Type(0),
+            next_method: fn(t) -> self.item_ty,
+        }"),
     );
     ctx.add_val(
         "IntoIterator",
         p(r"\(t: Type(0)) -> {
-                item_ty: Type(0),
-                into_iter_ty: Type(0),
-                iterator_bound: Iterator self.into_iter_ty,
-                type_eq: self.item_ty == self.iterator_bound.item_ty,
-            }"),
+            item_ty: Type(0),
+            into_iter_ty: Type(0),
+            iterator_bound: Iterator self.into_iter_ty,
+            type_eq: self.item_ty == self.iterator_bound.item_ty,
+        }"),
     );
 }
 
@@ -293,87 +293,87 @@ fn test_unsound_traits() {
     let mut ctx = EvalContext::default();
     ctx.add_uninterpreted("N", Type(0));
     ctx.normalize(p(
-            r"
-            // Helpers
-            let symmetry: fn(a: Type(0)) -> fn(b: Type(0)) -> fn(a == b) -> b == a =
-                \(a: Type(0)) ->
-                \(b: Type(0)) ->
-                \(ab: a == b) ->
-                transport ab (\(x: Type(0)) -> x == a) (refl a)
-            in
-            let transitivity: fn(a: Type(0)) -> fn(b: Type(0)) -> fn(c: Type(0)) -> fn(a == b) -> fn(b == c) -> a == c =
-                \(a: Type(0)) ->
-                \(b: Type(0)) ->
-                \(c: Type(0)) ->
-                \(ab: a == b) ->
-                \(bc: b == c) ->
-                transport bc (\(x: Type(0)) -> a == x) ab
-            in
+        r"
+        // Helpers
+        let symmetry: fn(a: Type(0)) -> fn(b: Type(0)) -> fn(a == b) -> b == a =
+            \(a: Type(0)) ->
+            \(b: Type(0)) ->
+            \(ab: a == b) ->
+            transport ab (\(x: Type(0)) -> x == a) (refl a)
+        in
+        let transitivity: fn(a: Type(0)) -> fn(b: Type(0)) -> fn(c: Type(0)) -> fn(a == b) -> fn(b == c) -> a == c =
+            \(a: Type(0)) ->
+            \(b: Type(0)) ->
+            \(c: Type(0)) ->
+            \(ab: a == b) ->
+            \(bc: b == c) ->
+            transport bc (\(x: Type(0)) -> a == x) ab
+        in
 
-            // trait Trait<R>: Sized {
-            //     type Proof: Trait<R, Proof = Self>;
-            // }
-            let rec Trait: fn(Type(0)) -> fn(Type(0)) -> Type(1) = \(t: Type(0)) -> \(r: Type(0)) -> {
-                proof: Type(0),
-                proof_impl: Trait self.proof r,
-                proof_impl_constraint: self.proof_impl.proof == t,
-            } in
+        // trait Trait<R>: Sized {
+        //     type Proof: Trait<R, Proof = Self>;
+        // }
+        let rec Trait: fn(Type(0)) -> fn(Type(0)) -> Type(1) = \(t: Type(0)) -> \(r: Type(0)) -> {
+            proof: Type(0),
+            proof_impl: Trait self.proof r,
+            proof_impl_constraint: self.proof_impl.proof == t,
+        } in
 
-            // impl<L, R> Trait<R> for L
-            // where
-            //     L: Trait<R>, // unsound if all trait bounds are coinductive
-            //     // unsoundness: in impl, use item bounds to normalize
-            //     // `<L::Proof as Trait<R>>::Proof = L`
-            //     R: Trait<R, Proof = <L::Proof as Trait<R>>::Proof>,
-            // {
-            //     type Proof = R;
-            // }
-            let TraitImpl =
-                \(l: Type(0)) ->
-                \(r: Type(0)) ->
-                \(l_trait: Trait l r) ->
-                \(r_trait: Trait r r) ->
-                \(r_trait_constraint: r_trait.proof == l_trait.proof_impl.proof) ->
-            make (Trait l r) {
-                proof = r,
-                proof_impl = r_trait,
-                proof_impl_constraint =
-                    let eq1: (l_trait.proof_impl.proof == l) = l_trait.proof_impl_constraint in
-                    let eq2: (r_trait.proof == l) = transitivity r_trait.proof l_trait.proof_impl.proof l r_trait_constraint eq1 in
-                    eq2
-            }
-            in
+        // impl<L, R> Trait<R> for L
+        // where
+        //     L: Trait<R>, // unsound if all trait bounds are coinductive
+        //     // unsoundness: in impl, use item bounds to normalize
+        //     // `<L::Proof as Trait<R>>::Proof = L`
+        //     R: Trait<R, Proof = <L::Proof as Trait<R>>::Proof>,
+        // {
+        //     type Proof = R;
+        // }
+        let TraitImpl =
+            \(l: Type(0)) ->
+            \(r: Type(0)) ->
+            \(l_trait: Trait l r) ->
+            \(r_trait: Trait r r) ->
+            \(r_trait_constraint: r_trait.proof == l_trait.proof_impl.proof) ->
+        make (Trait l r) {
+            proof = r,
+            proof_impl = r_trait,
+            proof_impl_constraint =
+                let eq1: (l_trait.proof_impl.proof == l) = l_trait.proof_impl_constraint in
+                let eq2: (r_trait.proof == l) = transitivity r_trait.proof l_trait.proof_impl.proof l r_trait_constraint eq1 in
+                eq2
+        }
+        in
 
-            // First coinductive impl dictionary.
-            let IdTraitImpl: fn(r: Type(0)) -> Trait r r =
-                \(r: Type(0)) ->
-                let rec Impl: Trait r r = TraitImpl r r Impl Impl (refl Impl.proof_impl.proof)
-                in Impl
-            in
-            // Second coinductive impl dictionary.
-            let GeneralTraitImpl: fn(l: Type(0)) -> fn(r: Type(0)) -> Trait l r =
-                \(l: Type(0)) ->
-                \(r: Type(0)) ->
-                let rec Impl: Trait l r =
-                    let l_trait: Trait l r = Impl in
-                    let r_trait: Trait r r = IdTraitImpl r in
-                    let r_trait_constraint: (r_trait.proof == l_trait.proof_impl.proof) = refl (l_trait.proof_impl.proof) in
-                    TraitImpl l r l_trait r_trait r_trait_constraint
-                in Impl
-            in
-            // Boom!
-            let transmute: fn(l: Type(0)) -> fn(r: Type(0)) -> l == r =
-                \(l: Type(0)) ->
-                \(r: Type(0)) ->
-                let l_impl: Trait l r = GeneralTraitImpl l r in
-                symmetry r l (l_impl.proof_impl_constraint)
-            in
+        // First coinductive impl dictionary.
+        let IdTraitImpl: fn(r: Type(0)) -> Trait r r =
+            \(r: Type(0)) ->
+            let rec Impl: Trait r r = TraitImpl r r Impl Impl (refl Impl.proof_impl.proof)
+            in Impl
+        in
+        // Second coinductive impl dictionary.
+        let GeneralTraitImpl: fn(l: Type(0)) -> fn(r: Type(0)) -> Trait l r =
+            \(l: Type(0)) ->
+            \(r: Type(0)) ->
+            let rec Impl: Trait l r =
+                let l_trait: Trait l r = Impl in
+                let r_trait: Trait r r = IdTraitImpl r in
+                let r_trait_constraint: (r_trait.proof == l_trait.proof_impl.proof) = refl (l_trait.proof_impl.proof) in
+                TraitImpl l r l_trait r_trait r_trait_constraint
+            in Impl
+        in
+        // Boom!
+        let transmute: fn(l: Type(0)) -> fn(r: Type(0)) -> l == r =
+            \(l: Type(0)) ->
+            \(r: Type(0)) ->
+            let l_impl: Trait l r = GeneralTraitImpl l r in
+            symmetry r l (l_impl.proof_impl_constraint)
+        in
 
-            // this creates a value of type `N` which is uninterpreted hihi (and stack overflows)
-            // transport (transmute {} N) (\(x: Type(0)) -> x) {=}
-            {=}
-            "
-        ));
+        // this creates a value of type `N` which is uninterpreted hihi (and stack overflows)
+        // transport (transmute {} N) (\(x: Type(0)) -> x) {=}
+        {=}
+        "
+    ));
 }
 
 // --- Rejection tests ---
