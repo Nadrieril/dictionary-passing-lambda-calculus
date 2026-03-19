@@ -15,21 +15,17 @@ use nom::sequence::{delimited, pair, preceded};
 #[derive(Debug)]
 struct DeepError<'a> {
     input: &'a str,
-    kind: ErrorKind,
 }
 
 impl<'a> nom::error::ParseError<&'a str> for DeepError<'a> {
-    fn from_error_kind(input: &'a str, kind: ErrorKind) -> Self {
-        DeepError { input, kind }
+    fn from_error_kind(input: &'a str, _kind: ErrorKind) -> Self {
+        DeepError { input }
     }
     fn append(_input: &'a str, _kind: ErrorKind, other: Self) -> Self {
         other
     }
     fn from_char(input: &'a str, _: char) -> Self {
-        DeepError {
-            input,
-            kind: ErrorKind::Char,
-        }
+        DeepError { input }
     }
     fn or(self, other: Self) -> Self {
         // Keep whichever error is deeper (shorter remaining input = further into parse).
