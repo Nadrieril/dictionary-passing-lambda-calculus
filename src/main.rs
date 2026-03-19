@@ -175,6 +175,7 @@ impl Expr {
     }
 }
 
+/// Convenience best-effort equality testing; used mostly for `assert_eq`.
 impl PartialEq for Expr {
     fn eq(&self, other: &Self) -> bool {
         /// Alpha-equality for abstractions: freshen both binders to a common variable.
@@ -227,7 +228,7 @@ impl PartialEq for Expr {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct Binding {
+pub struct Binding {
     /// `None` for uninterpreted symbols and normalizing under binders.
     value: Option<Expr>,
     ty: Expr,
@@ -235,85 +236,93 @@ struct Binding {
     nominal: bool,
 }
 
+impl Binding {
+    /// Create a binding whose only info we know is its type.
+    pub fn with_ty(ty: Expr) -> Self {
+        Self {
+            value: None,
+            ty,
+            nominal: false,
+        }
+    }
+    pub fn with_value(value: Expr, ty: Expr) -> Self {
+        Self {
+            value: Some(value),
+            ty,
+            nominal: false,
+        }
+    }
+    pub fn nominal(value: Expr, ty: Expr) -> Self {
+        Self {
+            value: Some(value),
+            ty,
+            nominal: true,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
-struct Context(Vec<(Variable, Binding)>);
+pub struct Context {
+    bindings: Vec<(Variable, Binding)>,
+}
 
 impl Context {
-    fn get(&self, x: Variable) -> Binding {
-        self.0
+    fn lookup_binding(&self, x: Variable) -> Option<Binding> {
+        self.bindings
             .iter()
             .rev()
             .find(|elem| x == elem.0)
-            .expect(&format!("Failed to find variable {x}!"))
-            .1
-    }
-    fn lookup_ty(&self, x: Variable) -> Expr {
-        self.get(x).ty
+            .map(|b| b.1)
     }
 
+    fn push_binding(&mut self, x: Variable, b: Binding) {
+        self.bindings.push((x, b));
+    }
     /// Add a new uninterpreted term to the environment. Used in tests.
-    fn add_uninterpreted(&mut self, x: &'static str, t: Expr) {
+    pub fn add_uninterpreted(&mut self, x: &'static str, t: Expr) {
         let x = Variable::User(x);
-        self.0.push((
-            x,
-            Binding {
-                ty: t,
-                value: None,
-                nominal: false,
-            },
-        ));
+        self.push_binding(x, Binding::with_ty(t));
     }
     /// Add a value to the environment. Used in tests.
-    fn add_val(&mut self, x: &'static str, value: Expr) {
+    pub fn add_val(&mut self, x: &'static str, value: Expr) {
         let x = Variable::User(x);
         let t = self.infer_type(value);
-        self.0.push((
-            x,
-            Binding {
-                ty: t,
-                value: Some(value),
-                nominal: false,
-            },
-        ));
+        self.push_binding(x, Binding::with_value(value, t));
     }
-    /// Push a variable to the context stack.
-    fn push(&mut self, x: Variable, t: Expr) {
-        self.0.push((
-            x,
-            Binding {
-                ty: t,
-                value: None,
-                nominal: false,
-            },
-        ));
-    }
-    /// Run `f` with a temporary scope: any `push` calls inside are undone on return.
-    fn scoped<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
-        let len = self.0.len();
+    /// Run `f` with a temporary scope where the given binding is declared.
+    fn with_binding_in_scope<T>(
+        &mut self,
+        x: Variable,
+        b: Binding,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        self.push_binding(x, b);
         let result = f(self);
-        self.0.truncate(len);
+        self.bindings.pop().unwrap();
         result
     }
 
     /// Infers the type of an expression. Also typechecks that expression.
-    fn infer_type(&mut self, e: Expr) -> Expr {
+    pub fn infer_type(&mut self, e: Expr) -> Expr {
         let ty = match e {
-            Var(x) => return self.lookup_ty(x),
+            Var(x) => {
+                return self
+                    .lookup_binding(x)
+                    .expect(&format!("Failed to find variable {x}!"))
+                    .ty;
+            }
             Type(k) => return Type(k + 1),
             Pi((x, t1, t2)) => {
                 let k1 = self.infer_universe(*t1);
-                let k2 = self.scoped(|ctx| {
-                    ctx.push(*x, *t1);
+                let k2 = self.with_binding_in_scope(*x, Binding::with_ty(*t1), |ctx| {
                     ctx.infer_universe(*t2)
                 });
                 Type(k1.max(k2))
             }
             Lambda((x, t, e)) => {
                 let _ = self.infer_universe(*t);
-                let te = self.scoped(|ctx| {
-                    ctx.push(*x, *t);
-                    ctx.infer_type(*e)
-                });
+                let te =
+                    self.with_binding_in_scope(*x, Binding::with_ty(*t), |ctx| ctx.infer_type(*e));
                 Pi(__((*x, *t, te)))
             }
             App(f, arg) => {
@@ -326,8 +335,7 @@ impl Context {
                 t.subst1(*x, *arg)
             }
             StructTy(x, fields) => {
-                let k = self.scoped(|ctx| {
-                    ctx.push(x, e);
+                let k = self.with_binding_in_scope(x, Binding::with_ty(e), |ctx| {
                     fields
                         .iter()
                         .map(|&(_, t)| ctx.infer_universe(t))
@@ -365,34 +373,18 @@ impl Context {
                 *ty
             }
             Let(x, e1, e2) => {
-                let t1 = self.infer_type(*e1);
-                return self.scoped(|ctx| {
-                    ctx.0.push((
-                        x,
-                        Binding {
-                            ty: t1,
-                            value: Some(*e1),
-                            nominal: false,
-                        },
-                    ));
+                let te1 = self.infer_type(*e1);
+                return self.with_binding_in_scope(x, Binding::with_value(*e1, te1), |ctx| {
                     ctx.infer_type(*e2)
                 });
             }
             LetRec(x, ty, e1, e2) => {
                 let _ = self.infer_universe(*ty);
-                return self.scoped(|ctx| {
-                    // Push x with value immediately so it can reduce during
-                    // its own typechecking (needed for self-referential types
-                    // like `Trait` whose fields reference `Trait` applied to args).
-                    // Marked nominal so whnf doesn't unfold it.
-                    ctx.0.push((
-                        x,
-                        Binding {
-                            ty: *ty,
-                            value: Some(*e1),
-                            nominal: true,
-                        },
-                    ));
+                // Push x with value immediately so it can reduce during its own typechecking
+                // (needed for self-referential types like `Trait` whose fields reference `Trait`
+                // applied to args). Marked nominal so whnf doesn't unfold it.
+                let binding = Binding::nominal(*e1, *ty);
+                return self.with_binding_in_scope(x, binding, |ctx| {
                     let t1 = ctx.infer_type(*e1);
                     ctx.assert_equal(*ty, t1);
                     ctx.infer_type(*e2)
@@ -462,10 +454,10 @@ impl Context {
     }
     fn whnf_inner(&mut self, e: Expr, unfold_nominal: bool) -> Expr {
         match e {
-            Var(x) => match self.0.iter().rev().find(|elem| x == elem.0) {
-                Some((_, b))
-                    if let Some(val) = b.value
-                        && (unfold_nominal || !b.nominal) =>
+            Var(x) => match self.lookup_binding(x) {
+                Some(binding)
+                    if let Some(val) = binding.value
+                        && (unfold_nominal || !binding.nominal) =>
                 {
                     self.whnf_inner(val, unfold_nominal)
                 }
@@ -509,7 +501,7 @@ impl Context {
     }
 
     /// Typecheck then fully normalize the value.
-    fn normalize(&mut self, e: Expr) -> Expr {
+    pub fn normalize(&mut self, e: Expr) -> Expr {
         struct Normalizer<'a>(&'a mut Context);
 
         impl<'a> ExprMapper for Normalizer<'a> {
@@ -525,10 +517,10 @@ impl Context {
                 f: impl for<'b> FnOnce(&mut Normalizer<'b>) -> T,
             ) -> T {
                 let ty = ty.expect("found a `let` after wnhf");
-                self.0.scoped(|ctx| {
-                    ctx.push(*var, ty);
-                    f(&mut Normalizer(ctx))
-                })
+                self.0
+                    .with_binding_in_scope(*var, Binding::with_ty(ty), |ctx| {
+                        f(&mut Normalizer(ctx))
+                    })
             }
         }
 
