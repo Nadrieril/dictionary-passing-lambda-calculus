@@ -369,8 +369,93 @@ fn test_unsound_traits() {
             symmetry r l (l_impl.proof_impl_constraint)
         in
 
-        // this creates a value of type `N` which is uninterpreted hihi (and stack overflows)
+        // This creates a value of arbitrary type hihi (and stack overflows)
         // transport (transmute {} N) (\(x: Type(0)) -> x) {=}
+        {=}
+        "
+    ));
+}
+
+#[test]
+fn test_unsound_traits2() {
+    // Reproduce https://github.com/rust-lang/rust/issues/135246
+    let mut ctx = EvalContext::default();
+    ctx.normalize(p(
+        r"
+        // Helpers
+        let symmetry: fn(a: Type(0)) -> fn(b: Type(0)) -> fn(a == b) -> b == a =
+            \(a: Type(0)) ->
+            \(b: Type(0)) ->
+            \(ab: a == b) ->
+            transport ab (\(x: Type(0)) -> x == a) (refl a)
+        in
+        let transitivity: fn(a: Type(0)) -> fn(b: Type(0)) -> fn(c: Type(0)) -> fn(a == b) -> fn(b == c) -> a == c =
+            \(a: Type(0)) ->
+            \(b: Type(0)) ->
+            \(c: Type(0)) ->
+            \(ab: a == b) ->
+            \(bc: b == c) ->
+            transport bc (\(x: Type(0)) -> a == x) ab
+        in
+
+        // trait Trait<R>: Sized {
+        //     type Proof: Trait<R, Proof = Self>;
+        // }
+        let rec Trait: fn(Type(0)) -> fn(Type(0)) -> Type(1) = \(t: Type(0)) -> \(r: Type(0)) -> {
+            proof: Type(0),
+            proof_impl: Trait self.proof r,
+            proof_impl_constraint: self.proof_impl.proof == t,
+        } in
+
+        // impl<L, R> Trait<R> for L {
+        //     // We prove that the impl item is compatible with the trait in the
+        //     // env of the trait, which is pretty much empty.
+        //     //
+        //     // `L: Trait<R>` is trivial
+        //     // `R: Trait<R, Proof = <L::Proof as Trait<R>>::Proof>` normalizes to
+        //     // `R: Trait<R, Proof = <R as Trait<R>>::Proof>` normalizes to
+        //     // `R: Trait<R, Proof = R>` is trivial
+        //     //
+        //     // Proving the item-bound holds assumes the *impl where-bounds*.
+        //     // For this we normalize the where-bound `R: Trait<R, Proof = <L::Proof as Trait<R>>::Proof>`
+        //     // by using the item-bound of `L::Proof`: `R: Trait<R, Proof = L>` 💀¹. Proving the
+        //     // item-bound of `<L as Trait<R>>::Proof` is now trivial.
+        //     type Proof
+        //         = R
+        //     where
+        //         L: Trait<R>,
+        //         R: Trait<R, Proof = <L::Proof as Trait<R>>::Proof>;
+        // }
+        let rec TraitImpl:
+            fn(l: Type(0)) ->
+            fn(r: Type(0)) ->
+            Trait l r
+        =
+            \(l: Type(0)) ->
+            \(r: Type(0)) ->
+            let rec Impl: Trait l r =
+                let l_trait: Trait l r = Impl in // direct coinduction
+                let r_trait: Trait r r = TraitImpl r r in // polymorphic coinduction
+                let r_trait_constraint: (r_trait.proof == l_trait.proof_impl.proof) = refl (l_trait.proof_impl.proof) in
+                make (Trait l r) {
+                    proof = r,
+                    proof_impl = r_trait,
+                    proof_impl_constraint =
+                        let eq1: (l_trait.proof_impl.proof == l) = l_trait.proof_impl_constraint in
+                        let eq2: (r_trait.proof == l) = transitivity r_trait.proof l_trait.proof_impl.proof l r_trait_constraint eq1 in
+                        eq2
+                }
+            in Impl
+        in
+
+        // Boom!
+        let transmute: fn(l: Type(0)) -> fn(r: Type(0)) -> l == r =
+            \(l: Type(0)) ->
+            \(r: Type(0)) ->
+            let l_impl: Trait l r = TraitImpl l r in
+            symmetry r l (l_impl.proof_impl_constraint)
+        in
+
         {=}
         "
     ));
