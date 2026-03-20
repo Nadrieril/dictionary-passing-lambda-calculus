@@ -1,4 +1,5 @@
 use crate::*;
+use ustr::Ustr;
 
 use Expr::*;
 
@@ -91,9 +92,49 @@ impl Binding {
     }
 }
 
+/// Describes which sub-expression position we are in within the expression tree.
+/// One variant per nested `Expr` location inside an `Expr`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PathElem {
+    // Let / LetRec
+    LetVal,
+    LetTy,
+    LetBody,
+    LetRecTy,
+    LetRecVal(Variable),
+    LetRecBody,
+    // Pi / Lambda
+    PiType,
+    PiBody,
+    LambdaType,
+    LambdaBody,
+    // App
+    AppFn,
+    AppArg,
+    // Struct / StructTy
+    StructAnnot,
+    StructField(Ustr),
+    StructTyField(Ustr),
+    // Field
+    FieldBase,
+    // Eq / Refl / Transport
+    EqArg,
+    ReflArg,
+    TransportEq,
+    TransportFn,
+    // Todo
+    TodoArg,
+    // Whenever we traverse the type of a subexpression.
+    HigherTy,
+}
+
 #[derive(Debug, Default)]
 pub struct EvalContext {
+    /// The bindings in scope.
     bindings: Vec<(Variable, Binding)>,
+    /// The path through the initial expression to the subexpression we're in the process of
+    /// typechecking.
+    path: Vec<PathElem>,
 }
 
 impl EvalContext {
@@ -116,7 +157,7 @@ impl EvalContext {
     /// Add a value to the environment. Used in tests.
     pub fn add_val(&mut self, x: &str, value: Expr) {
         let x = Variable::user(x);
-        let t = self.infer_type(&value);
+        let t = self.infer_type_inner(PathElem::LetVal, &value);
         self.push_binding(x, Binding::with_value(&value, &t));
     }
     /// Run `f` with a temporary scope where the given binding is declared.
@@ -132,6 +173,13 @@ impl EvalContext {
         result
     }
 
+    /// Typecheck a sub-expression, tracking its position in the expression tree.
+    fn infer_type_inner(&mut self, loc: PathElem, e: &Expr) -> Expr {
+        self.path.push(loc);
+        let ty = self.infer_type(e);
+        self.path.pop();
+        ty
+    }
     /// Infers the type of an expression. Also typechecks that expression.
     pub fn infer_type(&mut self, e: &Expr) -> Expr {
         let ty = match e {
@@ -144,23 +192,25 @@ impl EvalContext {
             }
             Type(k) => return Type(k + 1),
             Pi(x, t1, t2) => {
-                let k1 = self.infer_universe(t1);
-                let k2 = self
-                    .with_binding_in_scope(*x, Binding::abstrakt(t1), |ctx| ctx.infer_universe(t2));
+                let k1 = self.infer_universe(PathElem::PiType, t1);
+                let k2 = self.with_binding_in_scope(*x, Binding::abstrakt(t1), |ctx| {
+                    ctx.infer_universe(PathElem::PiBody, t2)
+                });
                 Type(k1.max(k2))
             }
             Lambda(x, t, e) => {
-                let _ = self.infer_universe(t);
-                let te =
-                    self.with_binding_in_scope(*x, Binding::abstrakt(t), |ctx| ctx.infer_type(e));
+                let _ = self.infer_universe(PathElem::LambdaType, t);
+                let te = self.with_binding_in_scope(*x, Binding::abstrakt(t), |ctx| {
+                    ctx.infer_type_inner(PathElem::LambdaBody, e)
+                });
                 Pi(*x, t.clone(), __(te))
             }
             App(f, arg) => {
-                let f_ty = self.infer_type(f);
+                let f_ty = self.infer_type_inner(PathElem::AppFn, f);
                 let Pi(x, s, t) = self.whnf_unfold(&f_ty) else {
                     panic!("Function expected.")
                 };
-                let arg_ty = self.infer_type(arg);
+                let arg_ty = self.infer_type_inner(PathElem::AppArg, arg);
                 self.assert_equal(&s, &arg_ty);
                 t.subst1(x, arg)
             }
@@ -168,7 +218,7 @@ impl EvalContext {
                 let k = self.with_binding_in_scope(*x, Binding::abstrakt(e), |ctx| {
                     fields
                         .iter()
-                        .map(|(_, t)| ctx.infer_universe(t))
+                        .map(|(&f, t)| ctx.infer_universe(PathElem::StructTyField(f), t))
                         .max()
                         .unwrap_or(0)
                 });
@@ -177,51 +227,51 @@ impl EvalContext {
             Struct(None, fields) => {
                 let ty_fields = fields
                     .iter()
-                    .map(|(n, e)| (*n, self.infer_type(e)))
+                    .map(|(&n, e)| (n, self.infer_type_inner(PathElem::StructField(n), e)))
                     .collect();
                 StructTy(Variable::user("self"), __(ty_fields))
             }
             Struct(Some(ty), fields) => {
-                let _ = self.infer_universe(ty);
+                let _ = self.infer_universe(PathElem::StructAnnot, ty);
                 let StructTy(self_var, field_tys) = self.whnf_unfold(ty) else {
                     panic!("Struct type expected for rec")
                 };
                 // Check each field against the expected type, with self = the rec expression.
-                for (name, val) in fields.iter() {
+                for (&name, val) in fields.iter() {
                     let expected = field_tys
-                        .get(name)
+                        .get(&name)
                         .unwrap_or_else(|| panic!("Field {name} not found in type"))
                         .clone();
                     let expected = expected.subst1(self_var, e);
-                    let actual = self.infer_type(val);
+                    let actual = self.infer_type_inner(PathElem::StructField(name), val);
                     self.assert_equal(&expected, &actual);
                 }
                 (**ty).clone()
             }
             Let(x, ty, e1, e2) => {
-                let te1 = self.infer_type(e1);
+                let te1 = self.infer_type_inner(PathElem::LetVal, e1);
                 if let Some(ty) = ty {
-                    let _ = self.infer_universe(ty);
+                    let _ = self.infer_universe(PathElem::LetTy, ty);
                     self.assert_equal(ty, &te1);
                 }
                 return self.with_binding_in_scope(*x, Binding::with_value(e1, &te1), |ctx| {
-                    ctx.infer_type(e2)
+                    ctx.infer_type_inner(PathElem::LetBody, e2)
                 });
             }
             LetRec(x, ty, e1, e2) => {
-                let _ = self.infer_universe(ty);
+                let _ = self.infer_universe(PathElem::LetRecTy, ty);
                 // Push x with value immediately so it can reduce during its own typechecking
                 // (needed for self-referential types like `Trait` whose fields reference `Trait`
                 // applied to args). Marked nominal so whnf doesn't unfold it.
                 let binding = Binding::nominal(e1, ty);
                 return self.with_binding_in_scope(*x, binding, |ctx| {
-                    let t1 = ctx.infer_type(e1);
+                    let t1 = ctx.infer_type_inner(PathElem::LetRecVal(*x), e1);
                     ctx.assert_equal(ty, &t1);
-                    ctx.infer_type(e2)
+                    ctx.infer_type_inner(PathElem::LetRecBody, e2)
                 });
             }
             Field(e, name) => {
-                let te = self.infer_type(e);
+                let te = self.infer_type_inner(PathElem::FieldBase, e);
                 let te = self.whnf_unfold(&te);
                 let StructTy(self_var, fields) = te else {
                     panic!("Struct type expected for field access, got `{te}`")
@@ -233,22 +283,22 @@ impl EvalContext {
                 field_ty.subst1(self_var, e)
             }
             Eq(a, b) => {
-                let ta = self.infer_type(a);
-                let tb = self.infer_type(b);
+                let ta = self.infer_type_inner(PathElem::EqArg, a);
+                let tb = self.infer_type_inner(PathElem::EqArg, b);
                 self.assert_equal(&ta, &tb);
-                let k = self.infer_universe(&ta);
+                let k = self.infer_universe(PathElem::HigherTy, &ta);
                 Type(k)
             }
             Refl(a) => {
-                let _ = self.infer_type(a);
+                let _ = self.infer_type_inner(PathElem::ReflArg, a);
                 Eq(a.clone(), a.clone())
             }
             Transport(eq, f) => {
-                let eq_ty = self.infer_type(eq);
+                let eq_ty = self.infer_type_inner(PathElem::TransportEq, eq);
                 let Eq(a, b) = self.whnf_unfold(&eq_ty) else {
                     panic!("Equality type expected for transport")
                 };
-                let f_ty = self.infer_type(f);
+                let f_ty = self.infer_type_inner(PathElem::TransportFn, f);
                 let Pi(..) = self.whnf_unfold(&f_ty) else {
                     panic!("Function expected for transport's second argument")
                 };
@@ -259,16 +309,16 @@ impl EvalContext {
                 )
             }
             Todo(t) => {
-                let _ = self.infer_universe(t);
+                let _ = self.infer_universe(PathElem::TodoArg, t);
                 return (**t).clone();
             }
         };
         // Recursively check the type is well-formed.
-        let _ = self.infer_type(&ty);
+        let _ = self.infer_type_inner(PathElem::HigherTy, &ty);
         self.whnf(&ty)
     }
-    fn infer_universe(&mut self, t: &Expr) -> usize {
-        match self.infer_type(t) {
+    fn infer_universe(&mut self, loc: PathElem, t: &Expr) -> usize {
+        match self.infer_type_inner(loc, t) {
             Type(k) => k,
             t => panic!("Type expected, got {t:?}."),
         }
@@ -330,6 +380,11 @@ impl EvalContext {
 
     /// Typecheck then fully normalize the value.
     pub fn normalize(&mut self, e: &Expr) -> Expr {
+        let _ = self.infer_type(e);
+        self.normalize_no_typeck(e)
+    }
+    /// Recursively normalize the value.
+    fn normalize_no_typeck(&mut self, e: &Expr) -> Expr {
         struct Normalizer<'a>(&'a mut EvalContext);
 
         impl<'a> ExprMapper for Normalizer<'a> {
@@ -352,7 +407,6 @@ impl EvalContext {
             }
         }
 
-        let _ = self.infer_type(e);
         Normalizer(self).map_expr(e)
     }
 
