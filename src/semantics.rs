@@ -253,7 +253,7 @@ impl EvalContext {
         };
         // Recursively check the type is well-formed.
         let _ = self.infer_type(ty);
-        ty
+        self.whnf(ty)
     }
     fn infer_universe(&mut self, t: Expr) -> usize {
         match self.infer_type(t) {

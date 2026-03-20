@@ -169,7 +169,10 @@ fn test_rec() {
 
     ctx.add_val("MyTy", p("{ val: N, same: self.val == self.val }"));
     let r = p("make (MyTy) { val = z, same = refl z }");
-    assert_eq!(ctx.infer_type(r).to_string(), "MyTy");
+    assert_eq!(
+        ctx.infer_type(r).to_string(),
+        "{ val: N, same: self.val == self.val }"
+    );
 }
 
 #[test]

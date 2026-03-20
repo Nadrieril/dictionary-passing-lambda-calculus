@@ -5,7 +5,7 @@ use nom::branch::alt;
 use nom::bytes::complete::{tag, take_while};
 use nom::character::complete::{char as nom_char, digit1};
 use nom::character::complete::{multispace0, satisfy};
-use nom::combinator::opt;
+use nom::combinator::{cut, opt};
 use nom::combinator::{map, recognize};
 use nom::error::{ErrorKind, ParseError as _};
 use nom::multi::{many0, separated_list0, separated_list1};
@@ -197,7 +197,8 @@ fn parse_lambda(input: &str) -> IResult<'_, Expr> {
             separated_list1(ws(nom_char(',')), param),
             opt(ws(nom_char(','))),
             ws(nom_char('|')),
-            parse_expr,
+            // Committed: we've seen `|params|`, the body must parse.
+            cut(parse_expr),
         ),
         |(_, params, _, _, body)| wrap_lambda(&params, body),
     )
@@ -359,21 +360,23 @@ fn parse_eq(input: &str) -> IResult<'_, Expr> {
 }
 
 /// All `let` forms: plain, annotated, rec, and function sugar variants.
+/// Uses `cut` after commitment points (`:`, `->`, `=`) so that deep errors
+/// propagate instead of being swallowed by backtracking.
 fn parse_let(input: &str) -> IResult<'_, Expr> {
     let (input, _) = keyword("let").parse(input)?;
     let (input, is_rec) = map(opt(keyword("rec")), |r| r.is_some()).parse(input)?;
     let (input, name) = variable(input)?;
 
-    // Try to parse optional params, optional return type annotation
+    // Try to parse optional params
     let (input, params) = opt(parse_params).parse(input)?;
 
     if let Some(params) = params {
-        // Function sugar: let [rec] f(params) [-> ret] = body in rest
-        if let Ok((input, (_, ret, _, body, _, rest))) =
-            (ws(tag("->")), parse_expr, ws(nom_char('=')), parse_expr, keyword("in"), parse_expr)
-                .parse(input)
-        {
-            // With return type annotation — always LetRec
+        // Function sugar: committed to function form.
+        if let Ok((input, _)) = ws(tag("->")).parse(input) {
+            // Committed to annotated function: let [rec] f(params) -> ret = body in rest
+            let (input, (ret, _, body, _, rest)) =
+                cut((parse_expr, ws(nom_char('=')), parse_expr, keyword("in"), parse_expr))
+                    .parse(input)?;
             return Ok((input, LetRec(
                 name,
                 __(wrap_pi(&params, ret)),
@@ -381,32 +384,26 @@ fn parse_let(input: &str) -> IResult<'_, Expr> {
                 __(rest),
             )));
         }
-        // Without return type — plain Let with lambda body (only if not rec)
-        let (input, (_, body, _, rest)) =
-            (ws(nom_char('=')), parse_expr, keyword("in"), parse_expr).parse(input)?;
+        // No return type: let f(params) = body in rest
         if is_rec {
-            // `let rec f(params) = body` doesn't make sense without a type
-            return Err(nom::Err::Error(DeepError::from_error_kind(input, ErrorKind::Tag)));
+            // `let rec f(params) = body` doesn't make sense without a type annotation
+            return Err(nom::Err::Failure(DeepError::from_error_kind(input, ErrorKind::Tag)));
         }
+        let (input, (_, body, _, rest)) =
+            cut((ws(nom_char('=')), parse_expr, keyword("in"), parse_expr)).parse(input)?;
         return Ok((input, Let(name, __(wrap_lambda(&params, body)), __(rest))));
     }
 
-    if is_rec {
-        // let rec x: T = e1 in e2
-        let (input, (_, ty, _, e1, _, e2)) =
-            (ws(nom_char(':')), parse_expr, ws(nom_char('=')), parse_expr, keyword("in"), parse_expr)
+    if let Ok((input, _)) = ws(nom_char(':')).parse(input) {
+        // Committed to annotated form: let [rec] x: T = e1 in e2
+        let (input, (ty, _, e1, _, e2)) =
+            cut((parse_expr, ws(nom_char('=')), parse_expr, keyword("in"), parse_expr))
                 .parse(input)?;
         Ok((input, LetRec(name, __(ty), __(e1), __(e2))))
-    } else if let Ok((input, (_, ty, _, e1, _, e2))) =
-        (ws(nom_char(':')), parse_expr, ws(nom_char('=')), parse_expr, keyword("in"), parse_expr)
-            .parse(input)
-    {
-        // let x: T = e1 in e2 — annotated let (desugars to LetRec)
-        Ok((input, LetRec(name, __(ty), __(e1), __(e2))))
     } else {
-        // let x = e1 in e2
+        // Plain form: let x = e1 in e2
         let (input, (_, e1, _, e2)) =
-            (ws(nom_char('=')), parse_expr, keyword("in"), parse_expr).parse(input)?;
+            cut((ws(nom_char('=')), parse_expr, keyword("in"), parse_expr)).parse(input)?;
         Ok((input, Let(name, __(e1), __(e2))))
     }
 }
