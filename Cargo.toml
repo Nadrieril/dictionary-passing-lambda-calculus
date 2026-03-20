@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 itertools = "0.14.0"
 nom = "8.0.0"
+ustr = "1.1.0"

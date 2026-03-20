@@ -1,20 +1,32 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use ustr::Ustr;
 
 use Expr::*;
 
-// A but good
-pub type __<A> = &'static A;
-pub(crate) fn __<A>(a: A) -> &'static A {
-    Box::leak(Box::new(a))
+pub type __<A> = Arc<A>;
+pub(crate) fn __<A>(a: A) -> Arc<A> {
+    Arc::new(a)
 }
+
+pub type Fields = Arc<[(Ustr, Expr)]>;
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Variable {
-    User(__<str>),
-    SorryDeBruijn(__<str>, u128),
+    User(Ustr),
+    SorryDeBruijn(Ustr, u128),
 }
 
 impl Variable {
+    pub fn user(s: &str) -> Variable {
+        Variable::User(Ustr::from(s))
+    }
+
+    pub(crate) fn anon() -> Variable {
+        Variable::user("_")
+    }
+
     pub(crate) fn refresh(self) -> Variable {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         match self {
@@ -26,100 +38,107 @@ impl Variable {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Expr {
     Var(Variable),
     Type(usize),
     Pi(Variable, __<Expr>, __<Expr>),
     Lambda(Variable, __<Expr>, __<Expr>),
     App(__<Expr>, __<Expr>),
-    Struct(__<[(__<str>, Expr)]>),
+    Struct(Fields),
     /// Struct type. Binds a variable (typically `self`) that has the type being constructed,
     /// making it an unordered dependent record.
-    StructTy(Variable, __<[(__<str>, Expr)]>),
+    StructTy(Variable, Fields),
     /// Record value with explicit type annotation: `make (ty) { a = e, ... }`.
-    TypedStruct(__<Expr>, __<[(__<str>, Expr)]>),
-    Field(__<Expr>, __<str>),
+    TypedStruct(__<Expr>, Fields),
+    Field(__<Expr>, Ustr),
     /// `let x [: T] = e1 in e2`. Non-recursive.
     Let(Variable, Option<__<Expr>>, __<Expr>, __<Expr>),
     /// `let rec x: T = e1 in e2`. Recursive and nominal binding.
     LetRec(Variable, __<Expr>, __<Expr>, __<Expr>),
     Eq(__<Expr>, __<Expr>),
     Refl(__<Expr>),
-    Transport(__<(Expr, Expr)>),
+    Transport(__<Expr>, __<Expr>),
     /// `todo ty` — has type `ty`, panics on normalization.
     Todo(__<Expr>),
 }
 
 pub trait ExprMapper {
-    fn map_expr(&mut self, e: Expr) -> Expr;
+    fn map_expr(&mut self, e: &Expr) -> Expr;
 
     type SelfWithNewLifetime<'a>: ExprMapper;
     fn under_abstraction<T>(
         &mut self,
         var: &mut Variable,
         // The already-mapped type of `var`, if any.
-        ty: Option<Expr>,
+        ty: Option<&Expr>,
         f: impl for<'a> FnOnce(&mut Self::SelfWithNewLifetime<'a>) -> T,
     ) -> T;
     fn under_recursive_abstraction<T>(
         &mut self,
         var: &mut Variable,
         // The not-yet-mapped type of `var`.
-        ty: Expr,
+        ty: &Expr,
         f: impl for<'a> FnOnce(&mut Self::SelfWithNewLifetime<'a>) -> T,
     ) -> T {
         self.under_abstraction(var, Some(ty), f)
     }
 
     // Helper
-    fn map_fields(&mut self, fields: __<[(__<str>, Expr)]>) -> __<[(__<str>, Expr)]> {
-        let fields: Vec<_> = fields.iter().map(|&(n, e)| (n, self.map_expr(e))).collect();
-        Box::leak(fields.into_boxed_slice())
+    fn map_fields(&mut self, fields: &[(Ustr, Expr)]) -> Fields {
+        fields.iter().map(|(n, e)| (*n, self.map_expr(e))).collect()
     }
 }
 
 impl Expr {
     /// Apply a transformation to all direct subexpressions of this expression.
-    pub fn map(self, v: &mut impl ExprMapper) -> Self {
+    pub fn map(&self, v: &mut impl ExprMapper) -> Self {
         match self {
-            Var(x) => Var(x),
-            Type(k) => Type(k),
-            App(e1, e2) => App(__(v.map_expr(*e1)), __(v.map_expr(*e2))),
-            Pi(mut x, t, e) => {
-                let t = v.map_expr(*t);
-                let e = v.under_abstraction(&mut x, Some(t), |v| v.map_expr(*e));
+            Var(x) => Var(*x),
+            Type(k) => Type(*k),
+            App(e1, e2) => App(__(v.map_expr(e1)), __(v.map_expr(e2))),
+            Pi(x, t, e) => {
+                let mut x = *x;
+                let t = v.map_expr(t);
+                let e = v.under_abstraction(&mut x, Some(&t), |v| v.map_expr(e));
                 Pi(x, __(t), __(e))
             }
-            Lambda(mut x, t, e) => {
-                let t = v.map_expr(*t);
-                let e = v.under_abstraction(&mut x, Some(t), |v| v.map_expr(*e));
+            Lambda(x, t, e) => {
+                let mut x = *x;
+                let t = v.map_expr(t);
+                let e = v.under_abstraction(&mut x, Some(&t), |v| v.map_expr(e));
                 Lambda(x, __(t), __(e))
             }
-            Let(mut x, ty, e1, e2) => {
-                let ty = ty.map(|ty| v.map_expr(*ty));
-                let e1 = v.map_expr(*e1);
-                let e2 = v.under_abstraction(&mut x, ty, |ctx| ctx.map_expr(*e2));
-                Let(x, ty.map(__), __(e1), __(e2))
+            Let(x, ty, e1, e2) => {
+                let mut x = *x;
+                let ty = ty.as_ref().map(|ty| v.map_expr(ty));
+                let e1 = v.map_expr(e1);
+                let e2 = v.under_abstraction(&mut x, ty.as_ref(), |ctx| ctx.map_expr(e2));
+                Let(x, ty.map(|t| __(t)), __(e1), __(e2))
             }
-            LetRec(mut x, ty, e1, e2) => {
-                let (ty, e1, e2) = v.under_recursive_abstraction(&mut x, *ty, |ctx| {
-                    (ctx.map_expr(*ty), ctx.map_expr(*e1), ctx.map_expr(*e2))
+            LetRec(x, ty, e1, e2) => {
+                let mut x = *x;
+                let ty = ty.clone();
+                let e1 = e1.clone();
+                let e2 = e2.clone();
+                let (ty, e1, e2) = v.under_recursive_abstraction(&mut x, &ty, |ctx| {
+                    (ctx.map_expr(&ty), ctx.map_expr(&e1), ctx.map_expr(&e2))
                 });
                 LetRec(x, __(ty), __(e1), __(e2))
             }
             Struct(fields) => Struct(v.map_fields(fields)),
-            TypedStruct(ty, fields) => TypedStruct(__(v.map_expr(*ty)), v.map_fields(fields)),
-            StructTy(mut x, fields) => {
+            TypedStruct(ty, fields) => TypedStruct(__(v.map_expr(ty)), v.map_fields(fields)),
+            StructTy(x, fields) => {
+                let mut x = *x;
                 let fields =
                     v.under_recursive_abstraction(&mut x, self, |ctx| ctx.map_fields(fields));
                 StructTy(x, fields)
             }
-            Field(e, name) => Field(__(v.map_expr(*e)), name),
-            Eq(a, b) => Eq(__(v.map_expr(*a)), __(v.map_expr(*b))),
-            Refl(a) => Refl(__(v.map_expr(*a))),
-            Transport((eq, f)) => Transport(__((v.map_expr(*eq), v.map_expr(*f)))),
-            Todo(t) => Todo(__(v.map_expr(*t))),
+            Field(e, name) => Field(__(v.map_expr(e)), *name),
+            Eq(a, b) => Eq(__(v.map_expr(a)), __(v.map_expr(b))),
+            Refl(a) => Refl(__(v.map_expr(a))),
+            Transport(eq, f) => Transport(__(v.map_expr(eq)), __(v.map_expr(f))),
+            Todo(t) => Todo(__(v.map_expr(t))),
         }
     }
 }

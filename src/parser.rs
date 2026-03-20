@@ -1,5 +1,5 @@
 use crate::Expr::{self, *};
-use crate::{__, Variable};
+use crate::{__, Fields, Variable};
 use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_while};
@@ -10,6 +10,7 @@ use nom::combinator::{cut, opt};
 use nom::error::{ErrorKind, ParseError as _};
 use nom::multi::{many0, separated_list0, separated_list1};
 use nom::sequence::{delimited, pair, preceded};
+use ustr::Ustr;
 
 /// Custom error that always keeps the error at the deepest (furthest) position.
 #[derive(Debug)]
@@ -40,14 +41,6 @@ impl<'a> nom::error::ParseError<&'a str> for DeepError<'a> {
 impl<'a> nom::error::ContextError<&'a str> for DeepError<'a> {}
 
 type IResult<'a, O> = nom::IResult<&'a str, O, DeepError<'a>>;
-
-fn leak_str(s: &str) -> &'static str {
-    Box::leak(s.to_string().into_boxed_str())
-}
-
-fn leak_slice<T>(v: Vec<T>) -> &'static [T] {
-    Box::leak(v.into_boxed_slice())
-}
 
 /// Skip a single `// ...` line comment.
 fn line_comment(input: &str) -> IResult<'_, &str> {
@@ -118,7 +111,7 @@ fn ident<'a>(original: &'a str) -> IResult<'a, &'a str> {
 }
 
 fn variable(input: &str) -> IResult<'_, Variable> {
-    ident.map(|id| Variable::User(leak_str(id))).parse(input)
+    ident.map(|id| Variable::user(id)).parse(input)
 }
 
 /// Match a keyword with word boundary check.
@@ -140,13 +133,21 @@ fn keyword<'a>(kw: &'static str) -> impl Parser<&'a str, Output = &'a str, Error
 }
 
 /// A single `name = expr` field.
-fn field_val(input: &str) -> IResult<'_, (&'static str, Expr)> {
-    (ident.map(leak_str), preceded(ws(nom_char('=')), parse_expr)).parse(input)
+fn field_val(input: &str) -> IResult<'_, (Ustr, Expr)> {
+    (
+        ident.map(|s| Ustr::from(s)),
+        preceded(ws(nom_char('=')), parse_expr),
+    )
+        .parse(input)
 }
 
 /// A single `name: expr` field.
-fn field_ty(input: &str) -> IResult<'_, (&'static str, Expr)> {
-    (ident.map(leak_str), preceded(ws(nom_char(':')), parse_expr)).parse(input)
+fn field_ty(input: &str) -> IResult<'_, (Ustr, Expr)> {
+    (
+        ident.map(|s| Ustr::from(s)),
+        preceded(ws(nom_char(':')), parse_expr),
+    )
+        .parse(input)
 }
 
 /// A single `variable: expr` parameter.
@@ -164,7 +165,7 @@ fn wrap_pi(params: &[(Variable, Expr)], ret: Expr) -> Expr {
     params
         .iter()
         .rev()
-        .fold(ret, |acc, (x, t)| Pi(*x, __(*t), __(acc)))
+        .fold(ret, |acc, (x, t)| Pi(*x, __(t.clone()), __(acc)))
 }
 
 /// Wrap a body in nested lambdas for each parameter.
@@ -172,7 +173,7 @@ fn wrap_lambda(params: &[(Variable, Expr)], body: Expr) -> Expr {
     params
         .iter()
         .rev()
-        .fold(body, |acc, (x, t)| Lambda(*x, __(*t), __(acc)))
+        .fold(body, |acc, (x, t)| Lambda(*x, __(t.clone()), __(acc)))
 }
 
 /// `Type(n)` or `Type` (shorthand for `Type(0)`)
@@ -213,7 +214,7 @@ fn parse_pi(input: &str) -> IResult<'_, Expr> {
                 delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
                 preceded(ws(tag("->")), parse_expr),
             )
-                .map(|(t, e)| Pi(Variable::User("_"), __(t), __(e))),
+                .map(|(t, e)| Pi(Variable::anon(), __(t), __(e))),
         )),
     )
     .parse(input)
@@ -223,16 +224,17 @@ fn parse_pi(input: &str) -> IResult<'_, Expr> {
 fn parse_struct(input: &str) -> IResult<'_, Expr> {
     alt((
         // {=} — empty struct value
-        (ws(nom_char('{')), ws(nom_char('=')), ws(nom_char('}'))).map(|_| Struct(&[])),
+        (ws(nom_char('{')), ws(nom_char('=')), ws(nom_char('}')))
+            .map(|_| Struct(Fields::default())),
         // { a = e, ... } — struct value
-        comma_list('{', '}', field_val).map(|fields| Struct(leak_slice(fields))),
+        comma_list('{', '}', field_val).map(|fields| Struct(fields.into())),
         // { a: T, ... } or {} — struct type
         delimited(
             ws(nom_char('{')),
             separated_list0(ws(nom_char(',')), field_ty),
             (opt(ws(nom_char(','))), ws(nom_char('}'))),
         )
-        .map(|fields| StructTy(Variable::User("self"), leak_slice(fields))),
+        .map(|fields| StructTy(Variable::user("self"), fields.into())),
     ))
     .parse(input)
 }
@@ -250,7 +252,7 @@ fn parse_atom(input: &str) -> IResult<'_, Expr> {
 }
 
 enum PostfixOp {
-    Field(&'static str),
+    Field(Ustr),
     Call(Vec<Expr>),
 }
 
@@ -263,7 +265,7 @@ fn parse_postfix_op(input: &str) -> IResult<'_, PostfixOp> {
             .parse(input)
     } else {
         preceded(ws(nom_char('.')), ident)
-            .map(|name| PostfixOp::Field(leak_str(name)))
+            .map(|name| PostfixOp::Field(Ustr::from(name)))
             .parse(input)
     }
 }
@@ -305,8 +307,8 @@ fn parse_make(input: &str) -> IResult<'_, Expr> {
             delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
         ),
         alt((
-            (ws(nom_char('{')), ws(nom_char('=')), ws(nom_char('}'))).map(|_| &[] as &[_]),
-            comma_list('{', '}', field_val).map(|f| leak_slice(f)),
+            (ws(nom_char('{')), ws(nom_char('=')), ws(nom_char('}'))).map(|_| Fields::default()),
+            comma_list('{', '}', field_val).map(|f| -> Fields { f.into() }),
         )),
     )
         .map(|(ty, fields)| TypedStruct(__(ty), fields))
@@ -330,7 +332,7 @@ fn parse_todo(input: &str) -> IResult<'_, Expr> {
 /// `transport eq f`
 fn parse_transport(input: &str) -> IResult<'_, Expr> {
     preceded(keyword("transport"), (parse_postfix, parse_postfix))
-        .map(|(eq, f)| Transport(__((eq, f))))
+        .map(|(eq, f)| Transport(__(eq), __(f)))
         .parse(input)
 }
 
@@ -339,7 +341,7 @@ fn parse_transport(input: &str) -> IResult<'_, Expr> {
 fn parse_arrow(input: &str) -> IResult<'_, Expr> {
     (parse_eq, opt(preceded(ws(tag("->")), cut(parse_arrow))))
         .map(|(lhs, rhs)| match rhs {
-            Some(rhs) => Pi(Variable::User("_"), __(lhs), __(rhs)),
+            Some(rhs) => Pi(Variable::anon(), __(lhs), __(rhs)),
             None => lhs,
         })
         .parse(input)

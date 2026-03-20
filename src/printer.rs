@@ -1,5 +1,7 @@
 use std::fmt;
 
+use ustr::Ustr;
+
 use crate::Expr::{self, *};
 use crate::Variable;
 
@@ -18,7 +20,7 @@ impl Expr {
             Var(x) => write!(f, "{x}"),
             Type(0) => write!(f, "Type"),
             Type(k) => write!(f, "Type({k})"),
-            Pi(x, t, e) if *x == Variable::User("_") => {
+            Pi(x, t, e) if *x == Variable::anon() => {
                 // Anonymous Pi: print as `A -> B`
                 if prec > 1 {
                     write!(f, "(")?;
@@ -37,9 +39,9 @@ impl Expr {
                 }
                 write!(f, "fn({x}: ")?;
                 t.fmt_prec(f, 0)?;
-                let mut inner = &**e;
+                let mut inner: &Expr = e;
                 while let Pi(x2, t2, e2) = inner
-                    && *x2 != Variable::User("_")
+                    && *x2 != Variable::anon()
                 {
                     write!(f, ", {x2}: ")?;
                     t2.fmt_prec(f, 0)?;
@@ -58,7 +60,7 @@ impl Expr {
                 }
                 write!(f, "|{x}: ")?;
                 t.fmt_prec(f, 0)?;
-                let mut inner = &**e;
+                let mut inner: &Expr = e;
                 while let Lambda(x2, t2, e2) = inner {
                     write!(f, ", {x2}: ")?;
                     t2.fmt_prec(f, 0)?;
@@ -98,8 +100,8 @@ impl Expr {
                 fmt_fields(f, fields, " = ")
             }
             Let(x, ty, e1, e2) => {
-                let ty = ty.map(|t| *t);
-                fmt_let(f, prec, false, *x, ty.as_ref(), e1, e2)
+                let ty = ty.as_ref().map(|t| &**t);
+                fmt_let(f, prec, false, *x, ty, e1, e2)
             }
             LetRec(x, ty, e1, e2) => fmt_let(f, prec, true, *x, Some(ty), e1, e2),
             Field(e, name) => {
@@ -129,7 +131,7 @@ impl Expr {
                 }
                 Ok(())
             }
-            Transport((eq, ff)) => {
+            Transport(eq, ff) => {
                 if prec > 3 {
                     write!(f, "(")?;
                 }
@@ -248,7 +250,7 @@ fn fmt_param_list(f: &mut fmt::Formatter<'_>, params: &[(Variable, &Expr)]) -> f
     Ok(())
 }
 
-fn fmt_fields(f: &mut fmt::Formatter<'_>, fields: &[(&str, Expr)], sep: &str) -> fmt::Result {
+fn fmt_fields(f: &mut fmt::Formatter<'_>, fields: &[(Ustr, Expr)], sep: &str) -> fmt::Result {
     if fields.is_empty() {
         return write!(f, "{{}}");
     }
@@ -273,22 +275,22 @@ impl fmt::Display for Expr {
 fn test_print() {
     use crate::*;
     let expr = Lambda(
-        Variable::User("f"),
+        Variable::user("f"),
         __(Pi(
-            Variable::User("_"),
-            __(Var(Variable::User("N"))),
-            __(Var(Variable::User("N"))),
+            Variable::anon(),
+            __(Var(Variable::user("N"))),
+            __(Var(Variable::user("N"))),
         )),
         __(Lambda(
-            Variable::User("x"),
-            __(Var(Variable::User("N"))),
+            Variable::user("x"),
+            __(Var(Variable::user("N"))),
             __(App(
-                __(Var(Variable::User("f"))),
+                __(Var(Variable::user("f"))),
                 __(App(
-                    __(Var(Variable::User("f"))),
+                    __(Var(Variable::user("f"))),
                     __(App(
-                        __(Var(Variable::User("f"))),
-                        __(Var(Variable::User("x"))),
+                        __(Var(Variable::user("f"))),
+                        __(Var(Variable::user("x"))),
                     )),
                 )),
             )),
