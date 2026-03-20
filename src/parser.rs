@@ -380,17 +380,18 @@ fn parse_let(input: &str) -> IResult<'_, Expr> {
             // Committed to annotated function: let [rec] f(params) -> ret = body in rest
             cut((parse_expr, parse_eq_body_in))
                 .map(|(ret, (body, rest))| {
-                    LetRec(
-                        name,
-                        __(wrap_pi(&params, ret)),
-                        __(wrap_lambda(&params, body)),
-                        __(rest),
-                    )
+                    let ty = __(wrap_pi(&params, ret));
+                    let body = __(wrap_lambda(&params, body));
+                    if is_rec {
+                        LetRec(name, ty, body, __(rest))
+                    } else {
+                        Let(name, Some(ty), body, __(rest))
+                    }
                 })
                 .parse(input)
         } else if !is_rec {
             parse_eq_body_in
-                .map(|(body, rest)| Let(name, __(wrap_lambda(&params, body)), __(rest)))
+                .map(|(body, rest)| Let(name, None, __(wrap_lambda(&params, body)), __(rest)))
                 .parse(input)
         } else {
             // No return type: let f(params) = body in rest
@@ -402,13 +403,26 @@ fn parse_let(input: &str) -> IResult<'_, Expr> {
     } else if let Ok((input, _)) = ws(nom_char(':')).parse(input) {
         // Committed to annotated form: let [rec] x: T = e1 in e2
         cut((parse_expr, parse_eq_body_in))
-            .map(|(ty, (e1, e2))| LetRec(name, __(ty), __(e1), __(e2)))
+            .map(|(ty, (e1, e2))| {
+                if is_rec {
+                    LetRec(name, __(ty), __(e1), __(e2))
+                } else {
+                    Let(name, Some(__(ty)), __(e1), __(e2))
+                }
+            })
             .parse(input)
     } else {
         // Plain form: let x = e1 in e2
-        parse_eq_body_in
-            .map(|(e1, e2)| Let(name, __(e1), __(e2)))
-            .parse(input)
+        if is_rec {
+            Err(nom::Err::Failure(DeepError::from_error_kind(
+                input,
+                ErrorKind::Tag,
+            )))
+        } else {
+            parse_eq_body_in
+                .map(|(e1, e2)| Let(name, None, __(e1), __(e2)))
+                .parse(input)
+        }
     }
 }
 
@@ -518,7 +532,9 @@ mod tests {
             "make ({ a: Type(0) }) { a = x }",
             // Let
             "let x = y in x",
+            "let x: Type(0) = N in x",
             "let rec x: Type(0) = N in x",
+            r"let f(x: Type(0), y: Type(0)) -> Type(0) = x in f",
             r"let rec f(x: Type(0), y: Type(0)) -> Type(0) = x in f",
             "let f(x: Type(0)) = x in f",
         ];
@@ -542,17 +558,19 @@ mod tests {
     #[test]
     fn test_desugaring() {
         let cases = [
-            ("let x: Type(0) = N in x", "let rec x: Type(0) = N in x"),
             ("|x: A| |y: B| x", "|x: A, y: B| x"),
             ("fn(x: A) -> fn(y: B) -> C", "fn(x: A, y: B) -> C"),
             ("fn(A) -> fn(B) -> C", "A -> B -> C"),
-            (
-                r"let f(x: A) -> B = x in f",
-                r"let rec f(x: A) -> B = x in f",
-            ),
+            // Function with return type (non-rec)
+            (r"let f(x: A) -> B = x in f", r"let f(x: A) -> B = x in f"),
             (
                 r"let f(x: A, y: B) -> C = x in f",
-                r"let rec f(x: A, y: B) -> C = x in f",
+                r"let f(x: A, y: B) -> C = x in f",
+            ),
+            // Function with return type (rec)
+            (
+                r"let rec f(x: A) -> B = x in f",
+                r"let rec f(x: A) -> B = x in f",
             ),
             ("fn(f: |x: A| x) -> B", "fn(f: |x: A| x) -> B"),
             // Arrow syntax desugaring

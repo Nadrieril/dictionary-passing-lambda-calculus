@@ -96,65 +96,11 @@ impl Expr {
                 write!(f, ") ")?;
                 fmt_fields(f, fields, " = ")
             }
-            Let(x, e1, e2) => {
-                if prec > 0 {
-                    write!(f, "(")?;
-                }
-                // Detect function sugar: body is nested Lambda
-                let (params, body) = peel_lambda(e1);
-                if params.is_empty() {
-                    write!(f, "let {x} = ")?;
-                    body.fmt_prec(f, 0)?;
-                } else {
-                    write!(f, "let {x}(")?;
-                    for (i, (px, pt)) in params.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{px}: ")?;
-                        pt.fmt_prec(f, 0)?;
-                    }
-                    write!(f, ") = ")?;
-                    body.fmt_prec(f, 0)?;
-                }
-                write!(f, " in ")?;
-                e2.fmt_prec(f, 0)?;
-                if prec > 0 {
-                    write!(f, ")")?;
-                }
-                Ok(())
+            Let(x, ty, e1, e2) => {
+                let ty = ty.map(|t| *t);
+                fmt_let(f, prec, false, *x, ty.as_ref(), e1, e2)
             }
-            LetRec(x, ty, e1, e2) => {
-                if prec > 0 {
-                    write!(f, "(")?;
-                }
-                // Detect function sugar: type is nested Pi, body is nested Lambda
-                // with matching parameters.
-                let (params, ret, body) = peel_fun_sugar(ty, e1);
-                if params.is_empty() {
-                    write!(f, "let rec {x}: ")?;
-                    ret.fmt_prec(f, 0)?;
-                } else {
-                    write!(f, "let rec {x}(")?;
-                    for (i, (px, pt)) in params.iter().enumerate() {
-                        if i > 0 {
-                            write!(f, ", ")?;
-                        }
-                        write!(f, "{px}: ")?;
-                        pt.fmt_prec(f, 0)?;
-                    }
-                    write!(f, ") -> ")?;
-                    ret.fmt_prec(f, 0)?;
-                }
-                write!(f, " = ")?;
-                body.fmt_prec(f, 0)?;
-                write!(f, " in ")?;
-                e2.fmt_prec(f, 0)?;
-                if prec > 0 {
-                    write!(f, ")")?;
-                }
-                Ok(())
-            }
+            LetRec(x, ty, e1, e2) => fmt_let(f, prec, true, *x, Some(ty), e1, e2),
             Field(e, name) => {
                 e.fmt_prec(f, 4)?;
                 write!(f, ".{name}")
@@ -241,6 +187,66 @@ fn peel_fun_sugar<'a>(
     (params, ty, body)
 }
 
+fn fmt_let(
+    f: &mut fmt::Formatter<'_>,
+    prec: usize,
+    is_rec: bool,
+    x: Variable,
+    ty: Option<&Expr>,
+    e1: &Expr,
+    e2: &Expr,
+) -> fmt::Result {
+    let rec_str = if is_rec { "rec " } else { "" };
+    if prec > 0 {
+        write!(f, "(")?;
+    }
+    if let Some(ty) = ty {
+        // Detect function sugar: type is nested Pi, body is nested Lambda
+        // with matching parameters.
+        let (params, ret, body) = peel_fun_sugar(ty, e1);
+        if params.is_empty() {
+            write!(f, "let {rec_str}{x}: ")?;
+            ret.fmt_prec(f, 0)?;
+        } else {
+            write!(f, "let {rec_str}{x}(")?;
+            fmt_param_list(f, &params)?;
+            write!(f, ") -> ")?;
+            ret.fmt_prec(f, 0)?;
+        }
+        write!(f, " = ")?;
+        body.fmt_prec(f, 0)?;
+    } else {
+        // Detect function sugar: body is nested Lambda
+        let (params, body) = peel_lambda(e1);
+        if params.is_empty() {
+            write!(f, "let {x} = ")?;
+            body.fmt_prec(f, 0)?;
+        } else {
+            write!(f, "let {x}(")?;
+            fmt_param_list(f, &params)?;
+            write!(f, ") = ")?;
+            body.fmt_prec(f, 0)?;
+        }
+    }
+    write!(f, " in ")?;
+    e2.fmt_prec(f, 0)?;
+    if prec > 0 {
+        write!(f, ")")?;
+    }
+    Ok(())
+}
+
+fn fmt_param_list(f: &mut fmt::Formatter<'_>, params: &[(Variable, &Expr)]) -> fmt::Result {
+    for (i, (px, pt)) in params.iter().enumerate() {
+        if i > 0 {
+            write!(f, ", ")?;
+        }
+        write!(f, "{px}: ")?;
+        pt.fmt_prec(f, 0)?;
+    }
+    Ok(())
+}
+
 fn fmt_fields(f: &mut fmt::Formatter<'_>, fields: &[(&str, Expr)], sep: &str) -> fmt::Result {
     if fields.is_empty() {
         return write!(f, "{{}}");
@@ -287,8 +293,5 @@ fn test_print() {
             )),
         )),
     );
-    assert_eq!(
-        expr.to_string(),
-        "|f: N -> N, x: N| f (f (f x))"
-    );
+    assert_eq!(expr.to_string(), "|f: N -> N, x: N| f (f (f x))");
 }

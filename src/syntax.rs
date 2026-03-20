@@ -40,9 +40,9 @@ pub enum Expr {
     /// Record value with explicit type annotation: `make (ty) { a = e, ... }`.
     TypedStruct(__<Expr>, __<[(__<str>, Expr)]>),
     Field(__<Expr>, __<str>),
-    /// `let x = e1 in e2`.
-    Let(Variable, __<Expr>, __<Expr>),
-    /// `let rec x: T = e1 in e2`.
+    /// `let x [: T] = e1 in e2`. Non-recursive.
+    Let(Variable, Option<__<Expr>>, __<Expr>, __<Expr>),
+    /// `let rec x: T = e1 in e2`. Recursive and nominal binding.
     LetRec(Variable, __<Expr>, __<Expr>, __<Expr>),
     Eq(__<Expr>, __<Expr>),
     Refl(__<Expr>),
@@ -96,10 +96,11 @@ impl Expr {
                 let e = v.under_abstraction(&mut x, Some(t), |v| v.map_expr(*e));
                 Lambda(x, __(t), __(e))
             }
-            Let(mut x, e1, e2) => {
+            Let(mut x, ty, e1, e2) => {
+                let ty = ty.map(|ty| v.map_expr(*ty));
                 let e1 = v.map_expr(*e1);
-                let e2 = v.under_abstraction(&mut x, None, |ctx| ctx.map_expr(*e2));
-                Let(x, __(e1), __(e2))
+                let e2 = v.under_abstraction(&mut x, ty, |ctx| ctx.map_expr(*e2));
+                Let(x, ty.map(__), __(e1), __(e2))
             }
             LetRec(mut x, ty, e1, e2) => {
                 let (ty, e1, e2) = v.under_recursive_abstraction(&mut x, *ty, |ctx| {

@@ -193,8 +193,12 @@ impl EvalContext {
                 }
                 *ty
             }
-            Let(x, e1, e2) => {
+            Let(x, ty, e1, e2) => {
                 let te1 = self.infer_type(*e1);
+                if let Some(ty) = ty {
+                    let _ = self.infer_universe(*ty);
+                    self.assert_equal(*ty, te1);
+                }
                 return self.with_binding_in_scope(x, Binding::with_value(*e1, te1), |ctx| {
                     ctx.infer_type(*e2)
                 });
@@ -299,7 +303,7 @@ impl EvalContext {
                 ),
                 e => Field(__(e), name),
             },
-            Let(x, e1, e2) => self.whnf_inner(e2.subst1(x, *e1), unfold_nominal),
+            Let(x, _, e1, e2) => self.whnf_inner(e2.subst1(x, *e1), unfold_nominal),
             LetRec(x, ty, e1, e2) => {
                 let fixpoint = LetRec(x, ty, e1, __(Var(x)));
                 let e1_unrolled = e1.subst1(x, fixpoint);
