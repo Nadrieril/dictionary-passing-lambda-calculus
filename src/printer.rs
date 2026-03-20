@@ -16,6 +16,7 @@ impl Expr {
     fn fmt_prec(&self, f: &mut fmt::Formatter<'_>, prec: usize) -> fmt::Result {
         match self {
             Var(x) => write!(f, "{x}"),
+            Type(0) => write!(f, "Type"),
             Type(k) => write!(f, "Type({k})"),
             Pi(x, t, e) if *x == Variable::User("_") => {
                 // Anonymous Pi: print as `A -> B`

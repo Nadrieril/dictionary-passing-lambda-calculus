@@ -90,6 +90,7 @@ fn comma_list<'a, O>(
 }
 
 const KEYWORDS: &[&str] = &[
+    "Type",
     "fn",
     "in",
     "let",
@@ -174,13 +175,13 @@ fn wrap_lambda(params: &[(Variable, Expr)], body: Expr) -> Expr {
         .fold(body, |acc, (x, t)| Lambda(*x, __(*t), __(acc)))
 }
 
-/// `Type(n)`
+/// `Type(n)` or `Type` (shorthand for `Type(0)`)
 fn parse_type(input: &str) -> IResult<'_, Expr> {
     preceded(
-        ws(tag("Type")),
-        delimited(ws(nom_char('(')), ws(digit1), ws(nom_char(')'))),
+        keyword("Type"),
+        opt(delimited(ws(nom_char('(')), ws(digit1), ws(nom_char(')')))),
     )
-    .map(|digits: &str| Type(digits.parse::<usize>().unwrap()))
+    .map(|digits: Option<&str>| Type(digits.map_or(0, |d| d.parse::<usize>().unwrap())))
     .parse(input)
 }
 
@@ -490,19 +491,20 @@ mod tests {
     fn test_roundtrip() {
         let cases = [
             "x",
-            "Type(0)",
+            "Type",
+            "Type(1)",
             "f x",
             "f x y",
             "f (g x)",
-            "|x: Type(0)| x",
-            "fn(x: Type(0)) -> x",
+            "|x: Type| x",
+            "fn(x: Type) -> x",
             "|f: N -> N, x: N| f (f (f x))",
             // Arrow syntax
             "N -> N",
             "A -> B -> C",
             "(A -> B) -> C",
             // Structs
-            "{ a: Type(0), b: Type(0) }",
+            "{ a: Type, b: Type }",
             "{ a = x, b = y }",
             "{ x = f y, y = z }",
             "{}",
@@ -514,7 +516,7 @@ mod tests {
             "(f x).a",
             "{ a = x, b = y }.a",
             // Nested structs
-            "{ a: { b: Type(0) } }",
+            "{ a: { b: Type } }",
             "{ f = |x: N| x }",
             // Equality
             "x == y",
@@ -528,15 +530,15 @@ mod tests {
             // Todo
             "todo N",
             // Make
-            "make ({ a: Type(0) }) {=}",
-            "make ({ a: Type(0) }) { a = x }",
+            "make ({ a: Type }) {=}",
+            "make ({ a: Type }) { a = x }",
             // Let
             "let x = y in x",
-            "let x: Type(0) = N in x",
-            "let rec x: Type(0) = N in x",
-            r"let f(x: Type(0), y: Type(0)) -> Type(0) = x in f",
-            r"let rec f(x: Type(0), y: Type(0)) -> Type(0) = x in f",
-            "let f(x: Type(0)) = x in f",
+            "let x: Type = N in x",
+            "let rec x: Type = N in x",
+            r"let f(x: Type, y: Type) -> Type = x in f",
+            r"let rec f(x: Type, y: Type) -> Type = x in f",
+            "let f(x: Type) = x in f",
         ];
         for input in cases {
             let expr = parse(input).unwrap_or_else(|e| panic!("failed to parse {input:?}: {e}"));
@@ -558,6 +560,8 @@ mod tests {
     #[test]
     fn test_desugaring() {
         let cases = [
+            // Type(0) prints as Type
+            ("Type(0)", "Type"),
             ("|x: A| |y: B| x", "|x: A, y: B| x"),
             ("fn(x: A) -> fn(y: B) -> C", "fn(x: A, y: B) -> C"),
             ("fn(A) -> fn(B) -> C", "A -> B -> C"),
