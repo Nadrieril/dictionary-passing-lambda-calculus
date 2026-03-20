@@ -335,6 +335,18 @@ fn parse_transport(input: &str) -> IResult<'_, Expr> {
     .parse(input)
 }
 
+/// Arrow: `eq -> arrow` (right-associative) or just `eq`.
+/// `A -> B` desugars to `fn(_: A) -> B`.
+fn parse_arrow(input: &str) -> IResult<'_, Expr> {
+    let (input, lhs) = parse_eq(input)?;
+    if let Ok((input, _)) = ws(tag("->")).parse(input) {
+        let (input, rhs) = parse_arrow(input)?;
+        Ok((input, Pi(Variable::User("_"), __(lhs), __(rhs))))
+    } else {
+        Ok((input, lhs))
+    }
+}
+
 /// Equality: `app == app` or just `app`.
 fn parse_eq(input: &str) -> IResult<'_, Expr> {
     let (input, lhs) = parse_app(input)?;
@@ -400,7 +412,7 @@ fn parse_let(input: &str) -> IResult<'_, Expr> {
 }
 
 fn parse_expr(input: &str) -> IResult<'_, Expr> {
-    alt((parse_let, parse_lambda, parse_pi, parse_eq)).parse(input)
+    alt((parse_let, parse_lambda, parse_pi, parse_arrow)).parse(input)
 }
 
 /// Parse error with position information. Uses `Display` for pretty-printing,
@@ -469,8 +481,11 @@ mod tests {
             "f (g x)",
             "|x: Type(0)| x",
             "fn(x: Type(0)) -> x",
-            "|f: fn(_: N) -> N, x: N| f (f (f x))",
-            "fn(_: fn(_: N) -> N, _: N) -> N",
+            "|f: N -> N, x: N| f (f (f x))",
+            // Arrow syntax
+            "N -> N",
+            "A -> B -> C",
+            "(A -> B) -> C",
             // Structs
             "{ a: Type(0), b: Type(0) }",
             "{ a = x, b = y }",
@@ -515,11 +530,11 @@ mod tests {
 
     #[test]
     fn test_pi_shorthand() {
-        // `fn(A) -> B` parses as `fn(_: A) -> B`
-        assert_eq!(parse("fn(N) -> N").unwrap().to_string(), "fn(_: N) -> N");
+        // `fn(A) -> B` parses as `fn(_: A) -> B`, prints as `A -> B`
+        assert_eq!(parse("fn(N) -> N").unwrap().to_string(), "N -> N");
         assert_eq!(
             parse("fn(fn(A) -> B) -> C").unwrap().to_string(),
-            "fn(_: fn(_: A) -> B) -> C"
+            "(A -> B) -> C"
         );
     }
 
@@ -529,7 +544,7 @@ mod tests {
             ("let x: Type(0) = N in x", "let rec x: Type(0) = N in x"),
             ("|x: A| |y: B| x", "|x: A, y: B| x"),
             ("fn(x: A) -> fn(y: B) -> C", "fn(x: A, y: B) -> C"),
-            ("fn(A) -> fn(B) -> C", "fn(_: A, _: B) -> C"),
+            ("fn(A) -> fn(B) -> C", "A -> B -> C"),
             (
                 r"let f(x: A) -> B = x in f",
                 r"let rec f(x: A) -> B = x in f",
@@ -539,6 +554,9 @@ mod tests {
                 r"let rec f(x: A, y: B) -> C = x in f",
             ),
             ("fn(f: |x: A| x) -> B", "fn(f: |x: A| x) -> B"),
+            // Arrow syntax desugaring
+            ("A -> B", "A -> B"),
+            ("A -> B -> C", "A -> B -> C"),
             // Unannotated function let
             ("let f(x: A) = x in f", "let f(x: A) = x in f"),
             (

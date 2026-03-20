@@ -11,8 +11,8 @@ fn test_application() {
     let mut ctx = EvalContext::default();
     ctx.add_uninterpreted("N", Type(0));
     ctx.add_uninterpreted("z", p("N"));
-    ctx.add_uninterpreted("s", p("fn(_: N) -> N"));
-    ctx.add_val("three", p(r"|f: fn(_: N) -> N, x: N| f(f(f(x)))"));
+    ctx.add_uninterpreted("s", p("N -> N"));
+    ctx.add_val("three", p(r"|f: N -> N, x: N| f(f(f(x)))"));
 
     let expr = p("three(three(s), z)");
     let normalized = ctx.normalize(expr);
@@ -30,7 +30,7 @@ fn test_types() {
     ctx.add_uninterpreted("N", Type(0));
     ctx.add_uninterpreted("z", p("N"));
 
-    let sty = p("fn(_: fn(_: N) -> N, _: N) -> N");
+    let sty = p("(N -> N) -> N -> N");
     assert_eq!(ctx.infer_type(sty).to_string(), "Type(0)");
 }
 
@@ -80,7 +80,7 @@ fn test_equality() {
     let tr = p("transport eq f");
     let ty = ctx.infer_type(tr);
     let ty = ctx.normalize(ty);
-    assert_eq!(ty.to_string(), "fn(_: N == N) -> M == N");
+    assert_eq!(ty.to_string(), "N == N -> M == N");
 
     // transport with refl reduces to identity
     assert_eq!(
@@ -251,7 +251,7 @@ fn test_traits() {
     let mut ctx = EvalContext::default();
     ctx.normalize(p(r"
         let Clone(t: Type(0)) = {
-            clone_method: fn(_: t) -> t,
+            clone_method: t -> t,
         } in
         let Copy(t: Type(0)) = {
             clone_supertrait: Clone t,
@@ -470,7 +470,7 @@ fn test_reject_arg_type_mismatch() {
     let mut ctx = EvalContext::default();
     ctx.add_uninterpreted("N", Type(0));
     ctx.add_uninterpreted("M", Type(0));
-    ctx.add_uninterpreted("f", p("fn(_: N) -> N"));
+    ctx.add_uninterpreted("f", p("N -> N"));
     ctx.add_uninterpreted("m", p("M"));
     // f expects N but gets M
     ctx.infer_type(p("f m"));
@@ -520,7 +520,7 @@ fn test_reject_transport_non_eq() {
     let mut ctx = EvalContext::default();
     ctx.add_uninterpreted("N", Type(0));
     ctx.add_uninterpreted("z", p("N"));
-    ctx.add_uninterpreted("f", p("fn(_: N) -> N"));
+    ctx.add_uninterpreted("f", p("N -> N"));
     ctx.infer_type(p("transport z f"));
 }
 
@@ -543,7 +543,7 @@ fn test_reject_transport_domain_mismatch() {
     ctx.add_uninterpreted("M", Type(0));
     ctx.add_uninterpreted("x", p("N"));
     ctx.add_uninterpreted("eq", p("x == x"));
-    ctx.add_uninterpreted("f", p("fn(_: M) -> M"));
+    ctx.add_uninterpreted("f", p("M -> M"));
     // eq proves x == x where x: N, but f expects M
     ctx.infer_type(p("transport eq f"));
 }

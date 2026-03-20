@@ -17,6 +17,19 @@ impl Expr {
         match self {
             Var(x) => write!(f, "{x}"),
             Type(k) => write!(f, "Type({k})"),
+            Pi(x, t, e) if *x == Variable::User("_") => {
+                // Anonymous Pi: print as `A -> B`
+                if prec > 1 {
+                    write!(f, "(")?;
+                }
+                t.fmt_prec(f, 2)?;
+                write!(f, " -> ")?;
+                e.fmt_prec(f, 0)?;
+                if prec > 1 {
+                    write!(f, ")")?;
+                }
+                Ok(())
+            }
             Pi(x, t, e) => {
                 if prec > 0 {
                     write!(f, "(")?;
@@ -24,7 +37,9 @@ impl Expr {
                 write!(f, "fn({x}: ")?;
                 t.fmt_prec(f, 0)?;
                 let mut inner = &**e;
-                while let Pi(x2, t2, e2) = inner {
+                while let Pi(x2, t2, e2) = inner
+                    && *x2 != Variable::User("_")
+                {
                     write!(f, ", {x2}: ")?;
                     t2.fmt_prec(f, 0)?;
                     inner = e2;
@@ -56,13 +71,13 @@ impl Expr {
                 Ok(())
             }
             App(e1, e2) => {
-                if prec > 2 {
+                if prec > 3 {
                     write!(f, "(")?;
                 }
-                e1.fmt_prec(f, 2)?;
+                e1.fmt_prec(f, 3)?;
                 write!(f, " ")?;
-                e2.fmt_prec(f, 3)?;
-                if prec > 2 {
+                e2.fmt_prec(f, 4)?;
+                if prec > 3 {
                     write!(f, ")")?;
                 }
                 Ok(())
@@ -141,52 +156,52 @@ impl Expr {
                 Ok(())
             }
             Field(e, name) => {
-                e.fmt_prec(f, 3)?;
+                e.fmt_prec(f, 4)?;
                 write!(f, ".{name}")
             }
             Eq(a, b) => {
-                if prec > 1 {
+                if prec > 2 {
                     write!(f, "(")?;
                 }
-                a.fmt_prec(f, 2)?;
+                a.fmt_prec(f, 3)?;
                 write!(f, " == ")?;
-                b.fmt_prec(f, 2)?;
-                if prec > 1 {
+                b.fmt_prec(f, 3)?;
+                if prec > 2 {
                     write!(f, ")")?;
                 }
                 Ok(())
             }
             Refl(a) => {
-                if prec > 2 {
+                if prec > 3 {
                     write!(f, "(")?;
                 }
                 write!(f, "refl ")?;
-                a.fmt_prec(f, 3)?;
-                if prec > 2 {
+                a.fmt_prec(f, 4)?;
+                if prec > 3 {
                     write!(f, ")")?;
                 }
                 Ok(())
             }
             Transport((eq, ff)) => {
-                if prec > 2 {
+                if prec > 3 {
                     write!(f, "(")?;
                 }
                 write!(f, "transport ")?;
-                eq.fmt_prec(f, 3)?;
+                eq.fmt_prec(f, 4)?;
                 write!(f, " ")?;
-                ff.fmt_prec(f, 3)?;
-                if prec > 2 {
+                ff.fmt_prec(f, 4)?;
+                if prec > 3 {
                     write!(f, ")")?;
                 }
                 Ok(())
             }
             Todo(t) => {
-                if prec > 2 {
+                if prec > 3 {
                     write!(f, "(")?;
                 }
                 write!(f, "todo ")?;
-                t.fmt_prec(f, 3)?;
-                if prec > 2 {
+                t.fmt_prec(f, 4)?;
+                if prec > 3 {
                     write!(f, ")")?;
                 }
                 Ok(())
@@ -274,6 +289,6 @@ fn test_print() {
     );
     assert_eq!(
         expr.to_string(),
-        "|f: fn(_: N) -> N, x: N| f (f (f x))"
+        "|f: N -> N, x: N| f (f (f x))"
     );
 }
