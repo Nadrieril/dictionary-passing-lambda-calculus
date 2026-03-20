@@ -86,20 +86,20 @@ impl Expr {
                 }
                 Ok(())
             }
-            Struct(fields) if fields.is_empty() => write!(f, "{{=}}"),
-            Struct(fields) => fmt_fields(f, fields, " = "),
-            StructTy(_, fields) => fmt_fields(f, fields, ": "),
-            TypedStruct(ty, fields) if fields.is_empty() => {
+            Struct(None, fields) if fields.is_empty() => write!(f, "{{=}}"),
+            Struct(None, fields) => fmt_fields(f, fields, " = "),
+            Struct(Some(ty), fields) if fields.is_empty() => {
                 write!(f, "make (")?;
                 ty.fmt_prec(f, 0)?;
                 write!(f, ") {{=}}")
             }
-            TypedStruct(ty, fields) => {
+            Struct(Some(ty), fields) => {
                 write!(f, "make (")?;
                 ty.fmt_prec(f, 0)?;
                 write!(f, ") ")?;
                 fmt_fields(f, fields, " = ")
             }
+            StructTy(_, fields) => fmt_fields(f, fields, ": "),
             Let(x, ty, e1, e2) => {
                 let ty = ty.as_ref().map(|t| &**t);
                 fmt_let(f, prec, false, *x, ty, e1, e2)

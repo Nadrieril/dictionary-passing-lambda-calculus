@@ -229,9 +229,9 @@ fn parse_struct(input: &str) -> IResult<'_, Expr> {
     alt((
         // {=} — empty struct value
         (ws(nom_char('{')), ws(nom_char('=')), ws(nom_char('}')))
-            .map(|_| Struct(Fields::default())),
+            .map(|_| Struct(None, Fields::default())),
         // { a = e, ... } — struct value
-        comma_list('{', '}', field_val).map(|fields| Struct(fields_from_vec(fields))),
+        comma_list('{', '}', field_val).map(|fields| Struct(None, fields_from_vec(fields))),
         // { a: T, ... } or {} — struct type
         delimited(
             ws(nom_char('{')),
@@ -316,7 +316,7 @@ fn parse_make(input: &str) -> IResult<'_, Expr> {
             comma_list('{', '}', field_val).map(fields_from_vec),
         )),
     )
-        .map(|(ty, fields)| TypedStruct(__(ty), fields))
+        .map(|(ty, fields)| Struct(Some(__(ty)), fields))
         .parse(input)
 }
 

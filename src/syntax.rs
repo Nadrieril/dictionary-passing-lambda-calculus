@@ -46,12 +46,11 @@ pub enum Expr {
     Pi(Variable, __<Expr>, __<Expr>),
     Lambda(Variable, __<Expr>, __<Expr>),
     App(__<Expr>, __<Expr>),
-    Struct(Fields),
+    /// Struct value, optionally with explicit type annotation: `{ a = e }` or `make (ty) { a = e }`.
+    Struct(Option<__<Expr>>, Fields),
     /// Struct type. Binds a variable (typically `self`) that has the type being constructed,
     /// making it an unordered dependent record.
     StructTy(Variable, Fields),
-    /// Record value with explicit type annotation: `make (ty) { a = e, ... }`.
-    TypedStruct(__<Expr>, Fields),
     Field(__<Expr>, Ustr),
     /// `let x [: T] = e1 in e2`. Non-recursive.
     Let(Variable, Option<__<Expr>>, __<Expr>, __<Expr>),
@@ -127,8 +126,10 @@ impl Expr {
                 });
                 LetRec(x, __(ty), __(e1), __(e2))
             }
-            Struct(fields) => Struct(v.map_fields(&fields)),
-            TypedStruct(ty, fields) => TypedStruct(__(v.map_expr(ty)), v.map_fields(&fields)),
+            Struct(ty, fields) => Struct(
+                ty.as_ref().map(|ty| __(v.map_expr(ty))),
+                v.map_fields(&fields),
+            ),
             StructTy(x, fields) => {
                 let mut x = *x;
                 let fields =

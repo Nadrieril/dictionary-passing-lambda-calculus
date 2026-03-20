@@ -162,14 +162,14 @@ impl EvalContext {
                 });
                 Type(k)
             }
-            Struct(fields) => {
+            Struct(None, fields) => {
                 let ty_fields = fields
                     .iter()
                     .map(|(n, e)| (*n, self.infer_type(e)))
                     .collect();
                 StructTy(Variable::user("self"), __(ty_fields))
             }
-            TypedStruct(ty, fields) => {
+            Struct(Some(ty), fields) => {
                 let _ = self.infer_universe(ty);
                 let StructTy(self_var, field_tys) = self.whnf_unfold(ty) else {
                     panic!("Struct type expected for rec")
@@ -289,7 +289,7 @@ impl EvalContext {
                 e1 => App(__(e1), e2.clone()),
             },
             Field(e, name) => match self.whnf_inner(e, true) {
-                Struct(fields) | TypedStruct(_, fields) => {
+                Struct(_, fields) => {
                     let val = fields
                         .get(name)
                         .unwrap_or_else(|| panic!("Field {name} not found"));
@@ -376,7 +376,7 @@ impl EvalContext {
             }
             // Should only happen for uninterpreted symbols.
             (App(f1, a1), App(f2, a2)) => self.equal(f1, f2) && self.equal(a1, a2),
-            (Struct(f1), Struct(f2)) | (TypedStruct(_, f1), TypedStruct(_, f2)) => {
+            (Struct(_, f1), Struct(_, f2)) => {
                 f1.len() == f2.len()
                     && f1
                         .iter()
