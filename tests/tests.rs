@@ -250,19 +250,19 @@ fn test_reject_rec_self_mismatch() {
 fn test_traits() {
     let mut ctx = EvalContext::default();
     ctx.normalize(p(r"
-        let Clone = |t: Type(0)| {
+        let Clone(t: Type(0)) = {
             clone_method: fn(_: t) -> t,
         } in
-        let Copy = |t: Type(0)| {
+        let Copy(t: Type(0)) = {
             clone_supertrait: Clone t,
         } in
 
-        let Iterator = |t: Type(0)| {
+        let Iterator(t: Type(0)) = {
             item_ty: Type(0),
             next_method: fn(t) -> self.item_ty,
         } in
 
-        let IntoIterator = |t: Type(0)| {
+        let IntoIterator(t: Type(0)) = {
             item_ty: Type(0),
             into_iter_ty: Type(0),
             iterator_bound: Iterator self.into_iter_ty,
@@ -286,7 +286,7 @@ fn test_traits() {
             IntoIteratorImpl(t, t_iter).type_eq
         in
 
-        let contractible = |t: Type(1)| fn(x: t, y: t) -> x == y in
+        let contractible(t: Type(1)) = fn(x: t, y: t) -> x == y in
         // assume coherence for IntoIterator
         let coherence(t: Type(0)) -> contractible(IntoIterator t)
             = todo (contractible(IntoIterator t))

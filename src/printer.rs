@@ -85,8 +85,23 @@ impl Expr {
                 if prec > 0 {
                     write!(f, "(")?;
                 }
-                write!(f, "let {x} = ")?;
-                e1.fmt_prec(f, 0)?;
+                // Detect function sugar: body is nested Lambda
+                let (params, body) = peel_lambda(e1);
+                if params.is_empty() {
+                    write!(f, "let {x} = ")?;
+                    body.fmt_prec(f, 0)?;
+                } else {
+                    write!(f, "let {x}(")?;
+                    for (i, (px, pt)) in params.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{px}: ")?;
+                        pt.fmt_prec(f, 0)?;
+                    }
+                    write!(f, ") = ")?;
+                    body.fmt_prec(f, 0)?;
+                }
                 write!(f, " in ")?;
                 e2.fmt_prec(f, 0)?;
                 if prec > 0 {
@@ -178,6 +193,17 @@ impl Expr {
             }
         }
     }
+}
+
+/// Peel Lambda layers for unannotated function sugar printing.
+/// Returns (params, inner_body).
+fn peel_lambda(mut e: &Expr) -> (Vec<(Variable, &Expr)>, &Expr) {
+    let mut params = Vec::new();
+    while let Lambda(x, t, body) = e {
+        params.push((*x, &**t));
+        e = body;
+    }
+    (params, e)
 }
 
 /// Peel matching Pi/Lambda layers for function sugar printing.

@@ -396,6 +396,19 @@ fn parse_let(input: &str) -> IResult<'_, Expr> {
                 )
             },
         ),
+        // let x(params) = e1 in e2 — function sugar without return type
+        map(
+            (
+                keyword("let"),
+                variable,
+                parse_params,
+                ws(nom_char('=')),
+                parse_expr,
+                keyword("in"),
+                parse_expr,
+            ),
+            |(_, x, params, _, body, _, e2)| Let(x, __(wrap_lambda(&params, body)), __(e2)),
+        ),
         // let x: T = e1 in e2 — annotated let (desugars to LetRec)
         map(
             (
@@ -576,7 +589,7 @@ mod tests {
             "let x = y in x",
             "let rec x: Type(0) = N in x",
             r"let rec f(x: Type(0), y: Type(0)) -> Type(0) = x in f",
-            // NB: `let f(x: T): R = ...` also roundtrips as `let rec` since annotated let desugars to LetRec
+            "let f(x: Type(0)) = x in f",
         ];
         for input in cases {
             let expr = parse(input).unwrap_or_else(|e| panic!("failed to parse {input:?}: {e}"));
@@ -611,6 +624,12 @@ mod tests {
                 r"let rec f(x: A, y: B) -> C = x in f",
             ),
             ("fn(f: |x: A| x) -> B", "fn(f: |x: A| x) -> B"),
+            // Unannotated function let
+            ("let f(x: A) = x in f", "let f(x: A) = x in f"),
+            (
+                "let f(x: A, y: B) = x in f",
+                "let f(x: A, y: B) = x in f",
+            ),
             // Call syntax
             ("f(x)", "f x"),
             ("f(x, y)", "f x y"),
