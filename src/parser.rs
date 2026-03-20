@@ -220,6 +220,10 @@ fn parse_pi(input: &str) -> IResult<'_, Expr> {
     .parse(input)
 }
 
+fn fields_from_vec(v: Vec<(Ustr, Expr)>) -> crate::Fields {
+    __(v.into_iter().collect())
+}
+
 /// `{ a = e, b = e }` or `{ a: T, b: T }` or `{}` or `{=}`
 fn parse_struct(input: &str) -> IResult<'_, Expr> {
     alt((
@@ -227,14 +231,14 @@ fn parse_struct(input: &str) -> IResult<'_, Expr> {
         (ws(nom_char('{')), ws(nom_char('=')), ws(nom_char('}')))
             .map(|_| Struct(Fields::default())),
         // { a = e, ... } — struct value
-        comma_list('{', '}', field_val).map(|fields| Struct(fields.into())),
+        comma_list('{', '}', field_val).map(|fields| Struct(fields_from_vec(fields))),
         // { a: T, ... } or {} — struct type
         delimited(
             ws(nom_char('{')),
             separated_list0(ws(nom_char(',')), field_ty),
             (opt(ws(nom_char(','))), ws(nom_char('}'))),
         )
-        .map(|fields| StructTy(Variable::user("self"), fields.into())),
+        .map(|fields| StructTy(Variable::user("self"), fields_from_vec(fields))),
     ))
     .parse(input)
 }
@@ -307,8 +311,9 @@ fn parse_make(input: &str) -> IResult<'_, Expr> {
             delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
         ),
         alt((
-            (ws(nom_char('{')), ws(nom_char('=')), ws(nom_char('}'))).map(|_| Fields::default()),
-            comma_list('{', '}', field_val).map(|f| -> Fields { f.into() }),
+            (ws(nom_char('{')), ws(nom_char('=')), ws(nom_char('}')))
+                .map(|_| __(Default::default())),
+            comma_list('{', '}', field_val).map(fields_from_vec),
         )),
     )
         .map(|(ty, fields)| TypedStruct(__(ty), fields))

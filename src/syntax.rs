@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use indexmap::IndexMap;
 use ustr::Ustr;
 
 use Expr::*;
@@ -10,7 +11,7 @@ pub(crate) fn __<A>(a: A) -> Arc<A> {
     Arc::new(a)
 }
 
-pub type Fields = Arc<[(Ustr, Expr)]>;
+pub type Fields = Arc<IndexMap<Ustr, Expr>>;
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Variable {
@@ -85,8 +86,8 @@ pub trait ExprMapper {
     }
 
     // Helper
-    fn map_fields(&mut self, fields: &[(Ustr, Expr)]) -> Fields {
-        fields.iter().map(|(n, e)| (*n, self.map_expr(e))).collect()
+    fn map_fields(&mut self, fields: &IndexMap<Ustr, Expr>) -> Fields {
+        Arc::new(fields.iter().map(|(n, e)| (*n, self.map_expr(e))).collect())
     }
 }
 
@@ -126,12 +127,12 @@ impl Expr {
                 });
                 LetRec(x, __(ty), __(e1), __(e2))
             }
-            Struct(fields) => Struct(v.map_fields(fields)),
-            TypedStruct(ty, fields) => TypedStruct(__(v.map_expr(ty)), v.map_fields(fields)),
+            Struct(fields) => Struct(v.map_fields(&fields)),
+            TypedStruct(ty, fields) => TypedStruct(__(v.map_expr(ty)), v.map_fields(&fields)),
             StructTy(x, fields) => {
                 let mut x = *x;
                 let fields =
-                    v.under_recursive_abstraction(&mut x, self, |ctx| ctx.map_fields(fields));
+                    v.under_recursive_abstraction(&mut x, self, |ctx| ctx.map_fields(&fields));
                 StructTy(x, fields)
             }
             Field(e, name) => Field(__(v.map_expr(e)), *name),

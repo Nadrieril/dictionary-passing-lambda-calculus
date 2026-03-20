@@ -1,5 +1,6 @@
 use std::fmt;
 
+use indexmap::IndexMap;
 use ustr::Ustr;
 
 use crate::Expr::{self, *};
@@ -250,7 +251,7 @@ fn fmt_param_list(f: &mut fmt::Formatter<'_>, params: &[(Variable, &Expr)]) -> f
     Ok(())
 }
 
-fn fmt_fields(f: &mut fmt::Formatter<'_>, fields: &[(Ustr, Expr)], sep: &str) -> fmt::Result {
+fn fmt_fields(f: &mut fmt::Formatter<'_>, fields: &IndexMap<Ustr, Expr>, sep: &str) -> fmt::Result {
     if fields.is_empty() {
         return write!(f, "{{}}");
     }

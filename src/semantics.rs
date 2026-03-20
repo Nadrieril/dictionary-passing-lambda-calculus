@@ -1,25 +1,21 @@
 use crate::*;
-use std::collections::HashMap;
 
 use Expr::*;
 
 impl Expr {
     fn subst1(&self, x: Variable, e: &Expr) -> Expr {
-        self.subst([(x, e.clone())].into())
+        self.subst(vec![(x, e.clone())])
     }
-    fn subst(&self, s: HashMap<Variable, Expr>) -> Expr {
-        struct Substituter(HashMap<Variable, Expr>);
+    fn subst(&self, s: Vec<(Variable, Expr)>) -> Expr {
+        struct Substituter(Vec<(Variable, Expr)>);
 
         impl Substituter {
-            fn scoped<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
-                let old = self.0.clone();
-                let result = f(self);
-                self.0 = old;
-                result
+            fn lookup(&self, x: Variable) -> Option<&Expr> {
+                self.0.iter().rev().find(|(v, _)| *v == x).map(|(_, e)| e)
             }
             fn subst(&mut self, e: &Expr) -> Expr {
                 match e {
-                    Var(x) => self.0.get(x).unwrap_or(e).clone(),
+                    Var(x) => self.lookup(*x).unwrap_or(e).clone(),
                     _ => e.map(self),
                 }
             }
@@ -36,12 +32,12 @@ impl Expr {
                 _ty: Option<&Expr>,
                 f: impl FnOnce(&mut Self) -> T,
             ) -> T {
-                self.scoped(|ctx| {
-                    let x_fresh = x.refresh();
-                    ctx.0.insert(*x, Var(x_fresh));
-                    *x = x_fresh;
-                    f(ctx)
-                })
+                let x_fresh = x.refresh();
+                self.0.push((*x, Var(x_fresh)));
+                *x = x_fresh;
+                let result = f(self);
+                self.0.pop();
+                result
             }
         }
 
@@ -167,11 +163,11 @@ impl EvalContext {
                 Type(k)
             }
             Struct(fields) => {
-                let ty_fields: Vec<_> = fields
+                let ty_fields = fields
                     .iter()
                     .map(|(n, e)| (*n, self.infer_type(e)))
                     .collect();
-                StructTy(Variable::user("self"), ty_fields.into())
+                StructTy(Variable::user("self"), __(ty_fields))
             }
             TypedStruct(ty, fields) => {
                 let _ = self.infer_universe(ty);
@@ -181,10 +177,8 @@ impl EvalContext {
                 // Check each field against the expected type, with self = the rec expression.
                 for (name, val) in fields.iter() {
                     let expected = field_tys
-                        .iter()
-                        .find(|(n, _)| n == name)
+                        .get(name)
                         .unwrap_or_else(|| panic!("Field {name} not found in type"))
-                        .1
                         .clone();
                     let expected = expected.subst1(self_var, e);
                     let actual = self.infer_type(val);
@@ -221,10 +215,8 @@ impl EvalContext {
                     panic!("Struct type expected for field access, got `{te}`")
                 };
                 let field_ty = fields
-                    .iter()
-                    .find(|(n, _)| n == name)
+                    .get(name)
                     .unwrap_or_else(|| panic!("Field {name} not found"))
-                    .1
                     .clone();
                 field_ty.subst1(self_var, e)
             }
@@ -298,11 +290,9 @@ impl EvalContext {
             },
             Field(e, name) => match self.whnf_inner(e, true) {
                 Struct(fields) | TypedStruct(_, fields) => {
-                    let val = &fields
-                        .iter()
-                        .find(|(n, _)| n == name)
-                        .unwrap_or_else(|| panic!("Field {name} not found"))
-                        .1;
+                    let val = fields
+                        .get(name)
+                        .unwrap_or_else(|| panic!("Field {name} not found"));
                     self.whnf_inner(val, unfold_nominal)
                 }
                 e => Field(__(e), *name),
@@ -390,7 +380,7 @@ impl EvalContext {
                 f1.len() == f2.len()
                     && f1
                         .iter()
-                        .all(|(n, e)| f2.iter().any(|(n2, e2)| n == n2 && self.equal(e, e2)))
+                        .all(|(n, e)| f2.get(n).is_some_and(|e2| self.equal(e, e2)))
             }
             (StructTy(x1, f1), StructTy(x2, f2)) => {
                 if f1.len() != f2.len() {
@@ -399,8 +389,8 @@ impl EvalContext {
                 // Fields are under the self-binder; compare syntactically.
                 let z = x1.refresh();
                 f1.iter().all(|(n, e)| {
-                    f2.iter().any(|(n2, e2)| {
-                        n == n2 && self.equal(&e.subst1(*x1, &Var(z)), &e2.subst1(*x2, &Var(z)))
+                    f2.get(n).is_some_and(|e2| {
+                        self.equal(&e.subst1(*x1, &Var(z)), &e2.subst1(*x2, &Var(z)))
                     })
                 })
             }
