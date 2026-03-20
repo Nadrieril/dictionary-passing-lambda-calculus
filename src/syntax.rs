@@ -43,23 +43,28 @@ impl Variable {
 pub enum Expr {
     Var(Variable),
     Type(usize),
-    Pi(Variable, __<Expr>, __<Expr>),
-    Lambda(Variable, __<Expr>, __<Expr>),
-    App(__<Expr>, __<Expr>),
-    /// Struct value, optionally with explicit type annotation: `{ a = e }` or `make (ty) { a = e }`.
-    Struct(Option<__<Expr>>, Fields),
-    /// Struct type. Binds a variable (typically `self`) that has the type being constructed,
-    /// making it an unordered dependent record.
-    StructTy(Variable, Fields),
-    Field(__<Expr>, Ustr),
+
     /// `let x [: T] = e1 in e2`. Non-recursive.
     Let(Variable, Option<__<Expr>>, __<Expr>, __<Expr>),
     /// `let rec x: T = e1 in e2`. Recursive and nominal binding.
     LetRec(Variable, __<Expr>, __<Expr>, __<Expr>),
+
+    Pi(Variable, __<Expr>, __<Expr>),
+    Lambda(Variable, __<Expr>, __<Expr>),
+    App(__<Expr>, __<Expr>),
+
+    /// Struct type. Binds a variable (typically `self`) that has the type being constructed,
+    /// making it an unordered dependent record.
+    StructTy(Variable, Fields),
+    /// Struct value, optionally with explicit type annotation: `{ a = e }` or `make (ty) { a = e }`.
+    Struct(Option<__<Expr>>, Fields),
+    Field(__<Expr>, Ustr),
+
     Eq(__<Expr>, __<Expr>),
     Refl(__<Expr>),
     Transport(__<Expr>, __<Expr>),
-    /// `todo ty` — has type `ty`, panics on normalization.
+
+    /// `todo ty` has type `ty`, panics on normalization.
     Todo(__<Expr>),
 }
 
