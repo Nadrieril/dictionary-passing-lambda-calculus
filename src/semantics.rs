@@ -46,35 +46,47 @@ impl Expr {
 }
 
 #[derive(Debug, Clone)]
+pub enum BindingKind {
+    /// The value is known and is observed freely.
+    Normal(Expr),
+    /// The value is known but is only inspected when deconstructing it. Helps with inference.
+    Nominal(Expr),
+    /// The value is never inspected, only its type is known.
+    Abstract,
+}
+
+#[derive(Debug, Clone)]
 pub struct Binding {
-    /// `None` for uninterpreted symbols and normalizing under binders.
-    value: Option<Expr>,
+    kind: BindingKind,
     ty: Expr,
-    /// Nominal variables are not unfolded by whnf. These come from `let rec` binders.
-    nominal: bool,
 }
 
 impl Binding {
     /// Create a binding whose only info we know is its type.
-    pub fn with_ty(ty: &Expr) -> Self {
+    /// (`abstract` is a reserved keyword).
+    pub fn abstrakt(ty: &Expr) -> Self {
         Self {
-            value: None,
+            kind: BindingKind::Abstract,
             ty: ty.clone(),
-            nominal: false,
         }
     }
     pub fn with_value(value: &Expr, ty: &Expr) -> Self {
         Self {
-            value: Some(value.clone()),
+            kind: BindingKind::Normal(value.clone()),
             ty: ty.clone(),
-            nominal: false,
         }
     }
     pub fn nominal(value: &Expr, ty: &Expr) -> Self {
         Self {
-            value: Some(value.clone()),
+            kind: BindingKind::Nominal(value.clone()),
             ty: ty.clone(),
-            nominal: true,
+        }
+    }
+    pub fn value(&self, unfold_nominal: bool) -> Option<&Expr> {
+        match &self.kind {
+            BindingKind::Normal(expr) => Some(expr),
+            BindingKind::Nominal(expr) if unfold_nominal => Some(expr),
+            BindingKind::Nominal(..) | BindingKind::Abstract => None,
         }
     }
 }
@@ -99,7 +111,7 @@ impl EvalContext {
     /// Add a new uninterpreted term to the environment. Used in tests.
     pub fn add_uninterpreted(&mut self, x: &str, t: Expr) {
         let x = Variable::user(x);
-        self.push_binding(x, Binding::with_ty(&t));
+        self.push_binding(x, Binding::abstrakt(&t));
     }
     /// Add a value to the environment. Used in tests.
     pub fn add_val(&mut self, x: &str, value: Expr) {
@@ -134,13 +146,13 @@ impl EvalContext {
             Pi(x, t1, t2) => {
                 let k1 = self.infer_universe(t1);
                 let k2 = self
-                    .with_binding_in_scope(*x, Binding::with_ty(t1), |ctx| ctx.infer_universe(t2));
+                    .with_binding_in_scope(*x, Binding::abstrakt(t1), |ctx| ctx.infer_universe(t2));
                 Type(k1.max(k2))
             }
             Lambda(x, t, e) => {
                 let _ = self.infer_universe(t);
                 let te =
-                    self.with_binding_in_scope(*x, Binding::with_ty(t), |ctx| ctx.infer_type(e));
+                    self.with_binding_in_scope(*x, Binding::abstrakt(t), |ctx| ctx.infer_type(e));
                 Pi(*x, t.clone(), __(te))
             }
             App(f, arg) => {
@@ -153,7 +165,7 @@ impl EvalContext {
                 t.subst1(x, arg)
             }
             StructTy(x, fields) => {
-                let k = self.with_binding_in_scope(*x, Binding::with_ty(e), |ctx| {
+                let k = self.with_binding_in_scope(*x, Binding::abstrakt(e), |ctx| {
                     fields
                         .iter()
                         .map(|(_, t)| ctx.infer_universe(t))
@@ -276,10 +288,7 @@ impl EvalContext {
     fn whnf_inner(&mut self, e: &Expr, unfold_nominal: bool) -> Expr {
         match e {
             Var(x) => match self.lookup_binding(*x) {
-                Some(binding)
-                    if let Some(val) = &binding.value
-                        && (unfold_nominal || !binding.nominal) =>
-                {
+                Some(binding) if let Some(val) = binding.value(unfold_nominal) => {
                     self.whnf_inner(&val.clone(), unfold_nominal)
                 }
                 _ => Var(*x),
@@ -337,7 +346,7 @@ impl EvalContext {
             ) -> T {
                 let ty = ty.expect("found a `let` after whnf");
                 self.0
-                    .with_binding_in_scope(*var, Binding::with_ty(ty), |ctx| {
+                    .with_binding_in_scope(*var, Binding::abstrakt(ty), |ctx| {
                         f(&mut Normalizer(ctx))
                     })
             }
@@ -374,7 +383,6 @@ impl EvalContext {
                 self.equal(t1, t2)
                     && self.equal(&body1.subst1(*x, &Var(z)), &body2.subst1(*y, &Var(z)))
             }
-            // Should only happen for uninterpreted symbols.
             (App(f1, a1), App(f2, a2)) => self.equal(f1, f2) && self.equal(a1, a2),
             (Struct(_, f1), Struct(_, f2)) => {
                 f1.len() == f2.len()
