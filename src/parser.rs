@@ -5,8 +5,8 @@ use nom::branch::alt;
 use nom::bytes::complete::{tag, take_while};
 use nom::character::complete::{char as nom_char, digit1};
 use nom::character::complete::{multispace0, satisfy};
+use nom::combinator::recognize;
 use nom::combinator::{cut, opt};
-use nom::combinator::{map, recognize};
 use nom::error::{ErrorKind, ParseError as _};
 use nom::multi::{many0, separated_list0, separated_list1};
 use nom::sequence::{delimited, pair, preceded};
@@ -117,7 +117,7 @@ fn ident<'a>(original: &'a str) -> IResult<'a, &'a str> {
 }
 
 fn variable(input: &str) -> IResult<'_, Variable> {
-    map(ident, |id| Variable::User(leak_str(id))).parse(input)
+    ident.map(|id| Variable::User(leak_str(id))).parse(input)
 }
 
 /// Match a keyword with word boundary check.
@@ -140,23 +140,17 @@ fn keyword<'a>(kw: &'static str) -> impl Parser<&'a str, Output = &'a str, Error
 
 /// A single `name = expr` field.
 fn field_val(input: &str) -> IResult<'_, (&'static str, Expr)> {
-    (ident, ws(nom_char('=')), parse_expr)
-        .map(|(n, _, e)| (leak_str(n), e))
-        .parse(input)
+    (ident.map(leak_str), preceded(ws(nom_char('=')), parse_expr)).parse(input)
 }
 
 /// A single `name: expr` field.
 fn field_ty(input: &str) -> IResult<'_, (&'static str, Expr)> {
-    (ident, ws(nom_char(':')), parse_expr)
-        .map(|(n, _, e)| (leak_str(n), e))
-        .parse(input)
+    (ident.map(leak_str), preceded(ws(nom_char(':')), parse_expr)).parse(input)
 }
 
 /// A single `variable: expr` parameter.
 fn param(input: &str) -> IResult<'_, (Variable, Expr)> {
-    (variable, ws(nom_char(':')), parse_expr)
-        .map(|(x, _, t)| (x, t))
-        .parse(input)
+    (variable, preceded(ws(nom_char(':')), parse_expr)).parse(input)
 }
 
 /// Parse a parenthesized parameter list: `(x: A, y: B, ...)`
@@ -182,48 +176,45 @@ fn wrap_lambda(params: &[(Variable, Expr)], body: Expr) -> Expr {
 
 /// `Type(n)`
 fn parse_type(input: &str) -> IResult<'_, Expr> {
-    map(
-        (ws(tag("Type")), ws(nom_char('(')), ws(digit1), ws(nom_char(')'))),
-        |(_, _, digits, _): (_, _, &str, _)| Type(digits.parse::<usize>().unwrap()),
+    preceded(
+        ws(tag("Type")),
+        delimited(ws(nom_char('(')), ws(digit1), ws(nom_char(')'))),
     )
+    .map(|digits: &str| Type(digits.parse::<usize>().unwrap()))
     .parse(input)
 }
 
 /// `|x: A| body` or `|x: A, y: B| body` (multi-param sugar)
 fn parse_lambda(input: &str) -> IResult<'_, Expr> {
-    map(
-        (
+    (
+        delimited(
             ws(nom_char('|')),
             separated_list1(ws(nom_char(',')), param),
-            opt(ws(nom_char(','))),
-            ws(nom_char('|')),
-            // Committed: we've seen `|params|`, the body must parse.
-            cut(parse_expr),
+            (opt(ws(nom_char(','))), ws(nom_char('|'))),
         ),
-        |(_, params, _, _, body)| wrap_lambda(&params, body),
+        // Committed: we've seen `|params|`, the body must parse.
+        cut(parse_expr),
     )
-    .parse(input)
+        .map(|(params, body)| wrap_lambda(&params, body))
+        .parse(input)
 }
 
 /// `fn(x: A) -> B`, `fn(x: A, y: B) -> C` (multi-param sugar), or `fn(A) -> B` (shorthand for `fn(_: A) -> B`)
 fn parse_pi(input: &str) -> IResult<'_, Expr> {
-    alt((
-        // fn(x: A, ...) -> B — named params (possibly multiple)
-        map(
-            (keyword("fn"), parse_params, ws(tag("->")), parse_expr),
-            |(_, params, _, ret)| wrap_pi(&params, ret),
-        ),
-        // fn(A) -> B — anonymous param
-        map(
+    preceded(
+        keyword("fn"),
+        alt((
+            // fn(x: A, ...) -> B — named params (possibly multiple)
+            (parse_params, preceded(ws(tag("->")), parse_expr))
+                .map(|(params, ret)| wrap_pi(&params, ret)),
+            // fn(A) -> B — anonymous param
             (
-                keyword("fn"),
                 delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
-                ws(tag("->")),
-                parse_expr,
-            ),
-            |(_, t, _, e)| Pi(Variable::User("_"), __(t), __(e)),
-        ),
-    ))
+                preceded(ws(tag("->")), parse_expr),
+            )
+                .map(|(t, e)| Pi(Variable::User("_"), __(t), __(e))),
+        )),
+    )
     .parse(input)
 }
 
@@ -231,23 +222,16 @@ fn parse_pi(input: &str) -> IResult<'_, Expr> {
 fn parse_struct(input: &str) -> IResult<'_, Expr> {
     alt((
         // {=} — empty struct value
-        map(
-            (ws(nom_char('{')), ws(nom_char('=')), ws(nom_char('}'))),
-            |_| Struct(&[]),
-        ),
+        (ws(nom_char('{')), ws(nom_char('=')), ws(nom_char('}'))).map(|_| Struct(&[])),
         // { a = e, ... } — struct value
-        map(comma_list('{', '}', field_val), |fields| {
-            Struct(leak_slice(fields))
-        }),
+        comma_list('{', '}', field_val).map(|fields| Struct(leak_slice(fields))),
         // { a: T, ... } or {} — struct type
-        map(
-            delimited(
-                ws(nom_char('{')),
-                separated_list0(ws(nom_char(',')), field_ty),
-                (opt(ws(nom_char(','))), ws(nom_char('}'))),
-            ),
-            |fields| StructTy(Variable::User("self"), leak_slice(fields)),
-        ),
+        delimited(
+            ws(nom_char('{')),
+            separated_list0(ws(nom_char(',')), field_ty),
+            (opt(ws(nom_char(','))), ws(nom_char('}'))),
+        )
+        .map(|fields| StructTy(Variable::User("self"), leak_slice(fields))),
     ))
     .parse(input)
 }
@@ -258,36 +242,45 @@ fn parse_atom(input: &str) -> IResult<'_, Expr> {
         parse_type,
         parse_make,
         parse_struct,
-        map(variable, Var),
+        variable.map(Var),
         delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
     ))
     .parse(input)
+}
+
+enum PostfixOp {
+    Field(&'static str),
+    Call(Vec<Expr>),
+}
+
+/// A single postfix operation: `.field` or `(args)` (no whitespace before `(`).
+fn parse_postfix_op(input: &str) -> IResult<'_, PostfixOp> {
+    if input.starts_with('(') {
+        // No whitespace before '(' — parse as call syntax
+        comma_list('(', ')', parse_expr)
+            .map(PostfixOp::Call)
+            .parse(input)
+    } else {
+        preceded(ws(nom_char('.')), ident)
+            .map(|name| PostfixOp::Field(leak_str(name)))
+            .parse(input)
+    }
 }
 
 /// Postfix: atom followed by zero or more `.field` accesses or `(args)` calls.
 /// Call syntax `f(a, b)` requires no whitespace before the `(` to distinguish
 /// from juxtaposition application `f (a)`.
 fn parse_postfix(input: &str) -> IResult<'_, Expr> {
-    let (mut input, mut expr) = parse_atom(input)?;
-    loop {
-        if let Ok((rest, (_, name))) = (ws(nom_char('.')), ident).parse(input) {
-            expr = Field(__(expr), leak_str(name));
-            input = rest;
-        } else if input.starts_with('(') {
-            // No whitespace before '(' — parse as call syntax
-            if let Ok((rest, args)) = comma_list('(', ')', parse_expr).parse(input) {
-                for arg in args {
-                    expr = App(__(expr), __(arg));
+    (parse_atom, many0(parse_postfix_op))
+        .map(|(init, ops)| {
+            ops.into_iter().fold(init, |acc, op| match op {
+                PostfixOp::Field(name) => Field(__(acc), name),
+                PostfixOp::Call(args) => {
+                    args.into_iter().fold(acc, |acc, arg| App(__(acc), __(arg)))
                 }
-                input = rest;
-            } else {
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-    Ok((input, expr))
+            })
+        })
+        .parse(input)
 }
 
 /// Application: left-associative sequence of postfix expressions.
@@ -305,106 +298,117 @@ fn parse_app(input: &str) -> IResult<'_, Expr> {
 
 /// `make (ty) { a = e, ... }` or `make (ty) {=}`
 fn parse_make(input: &str) -> IResult<'_, Expr> {
-    let (input, _) = keyword("make").parse(input)?;
-    let (input, ty) = delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))).parse(input)?;
-    if let Ok((input, _)) =
-        (ws(nom_char('{')), ws(nom_char('=')), ws(nom_char('}'))).parse(input)
-    {
-        Ok((input, TypedStruct(__(ty), &[])))
-    } else {
-        let (input, fields) = comma_list('{', '}', field_val).parse(input)?;
-        Ok((input, TypedStruct(__(ty), leak_slice(fields))))
-    }
+    (
+        preceded(
+            keyword("make"),
+            delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
+        ),
+        alt((
+            (ws(nom_char('{')), ws(nom_char('=')), ws(nom_char('}'))).map(|_| &[] as &[_]),
+            comma_list('{', '}', field_val).map(|f| leak_slice(f)),
+        )),
+    )
+        .map(|(ty, fields)| TypedStruct(__(ty), fields))
+        .parse(input)
 }
 
 /// `refl e`
 fn parse_refl(input: &str) -> IResult<'_, Expr> {
-    map((keyword("refl"), parse_postfix), |(_, e)| Refl(__(e))).parse(input)
+    preceded(keyword("refl"), parse_postfix)
+        .map(|e| Refl(__(e)))
+        .parse(input)
 }
 
 /// `todo ty`
 fn parse_todo(input: &str) -> IResult<'_, Expr> {
-    map((keyword("todo"), parse_postfix), |(_, t)| Todo(__(t))).parse(input)
+    preceded(keyword("todo"), parse_postfix)
+        .map(|t| Todo(__(t)))
+        .parse(input)
 }
 
 /// `transport eq f`
 fn parse_transport(input: &str) -> IResult<'_, Expr> {
-    map(
-        (keyword("transport"), parse_postfix, parse_postfix),
-        |(_, eq, f)| Transport(__((eq, f))),
-    )
-    .parse(input)
+    preceded(keyword("transport"), (parse_postfix, parse_postfix))
+        .map(|(eq, f)| Transport(__((eq, f))))
+        .parse(input)
 }
 
 /// Arrow: `eq -> arrow` (right-associative) or just `eq`.
 /// `A -> B` desugars to `fn(_: A) -> B`.
 fn parse_arrow(input: &str) -> IResult<'_, Expr> {
-    let (input, lhs) = parse_eq(input)?;
-    if let Ok((input, _)) = ws(tag("->")).parse(input) {
-        let (input, rhs) = parse_arrow(input)?;
-        Ok((input, Pi(Variable::User("_"), __(lhs), __(rhs))))
-    } else {
-        Ok((input, lhs))
-    }
+    (parse_eq, opt(preceded(ws(tag("->")), cut(parse_arrow))))
+        .map(|(lhs, rhs)| match rhs {
+            Some(rhs) => Pi(Variable::User("_"), __(lhs), __(rhs)),
+            None => lhs,
+        })
+        .parse(input)
 }
 
 /// Equality: `app == app` or just `app`.
 fn parse_eq(input: &str) -> IResult<'_, Expr> {
-    let (input, lhs) = parse_app(input)?;
-    if let Ok((input, _)) = ws(tag("==")).parse(input) {
-        let (input, rhs) = parse_app(input)?;
-        Ok((input, Eq(__(lhs), __(rhs))))
-    } else {
-        Ok((input, lhs))
-    }
+    (parse_app, opt(preceded(ws(tag("==")), cut(parse_app))))
+        .map(|(lhs, rhs)| match rhs {
+            Some(rhs) => Eq(__(lhs), __(rhs)),
+            None => lhs,
+        })
+        .parse(input)
+}
+
+/// Parse `= body in rest`, cutting after `=`.
+fn parse_eq_body_in(input: &str) -> IResult<'_, (Expr, Expr)> {
+    cut(preceded(
+        ws(nom_char('=')),
+        (parse_expr, preceded(keyword("in"), parse_expr)),
+    ))
+    .parse(input)
 }
 
 /// All `let` forms: plain, annotated, rec, and function sugar variants.
 /// Uses `cut` after commitment points (`:`, `->`, `=`) so that deep errors
 /// propagate instead of being swallowed by backtracking.
 fn parse_let(input: &str) -> IResult<'_, Expr> {
-    let (input, _) = keyword("let").parse(input)?;
-    let (input, is_rec) = map(opt(keyword("rec")), |r| r.is_some()).parse(input)?;
-    let (input, name) = variable(input)?;
-
-    // Try to parse optional params
-    let (input, params) = opt(parse_params).parse(input)?;
-
+    let (input, (_, is_rec, name, params)) = (
+        keyword("let"),
+        opt(keyword("rec")).map(|r| r.is_some()),
+        variable,
+        opt(parse_params),
+    )
+        .parse(input)?;
     if let Some(params) = params {
         // Function sugar: committed to function form.
         if let Ok((input, _)) = ws(tag("->")).parse(input) {
             // Committed to annotated function: let [rec] f(params) -> ret = body in rest
-            let (input, (ret, _, body, _, rest)) =
-                cut((parse_expr, ws(nom_char('=')), parse_expr, keyword("in"), parse_expr))
-                    .parse(input)?;
-            return Ok((input, LetRec(
-                name,
-                __(wrap_pi(&params, ret)),
-                __(wrap_lambda(&params, body)),
-                __(rest),
-            )));
+            cut((parse_expr, parse_eq_body_in))
+                .map(|(ret, (body, rest))| {
+                    LetRec(
+                        name,
+                        __(wrap_pi(&params, ret)),
+                        __(wrap_lambda(&params, body)),
+                        __(rest),
+                    )
+                })
+                .parse(input)
+        } else if !is_rec {
+            parse_eq_body_in
+                .map(|(body, rest)| Let(name, __(wrap_lambda(&params, body)), __(rest)))
+                .parse(input)
+        } else {
+            // No return type: let f(params) = body in rest
+            Err(nom::Err::Failure(DeepError::from_error_kind(
+                input,
+                ErrorKind::Tag,
+            )))
         }
-        // No return type: let f(params) = body in rest
-        if is_rec {
-            // `let rec f(params) = body` doesn't make sense without a type annotation
-            return Err(nom::Err::Failure(DeepError::from_error_kind(input, ErrorKind::Tag)));
-        }
-        let (input, (_, body, _, rest)) =
-            cut((ws(nom_char('=')), parse_expr, keyword("in"), parse_expr)).parse(input)?;
-        return Ok((input, Let(name, __(wrap_lambda(&params, body)), __(rest))));
-    }
-
-    if let Ok((input, _)) = ws(nom_char(':')).parse(input) {
+    } else if let Ok((input, _)) = ws(nom_char(':')).parse(input) {
         // Committed to annotated form: let [rec] x: T = e1 in e2
-        let (input, (ty, _, e1, _, e2)) =
-            cut((parse_expr, ws(nom_char('=')), parse_expr, keyword("in"), parse_expr))
-                .parse(input)?;
-        Ok((input, LetRec(name, __(ty), __(e1), __(e2))))
+        cut((parse_expr, parse_eq_body_in))
+            .map(|(ty, (e1, e2))| LetRec(name, __(ty), __(e1), __(e2)))
+            .parse(input)
     } else {
         // Plain form: let x = e1 in e2
-        let (input, (_, e1, _, e2)) =
-            cut((ws(nom_char('=')), parse_expr, keyword("in"), parse_expr)).parse(input)?;
-        Ok((input, Let(name, __(e1), __(e2))))
+        parse_eq_body_in
+            .map(|(e1, e2)| Let(name, __(e1), __(e2)))
+            .parse(input)
     }
 }
 
@@ -556,10 +560,7 @@ mod tests {
             ("A -> B -> C", "A -> B -> C"),
             // Unannotated function let
             ("let f(x: A) = x in f", "let f(x: A) = x in f"),
-            (
-                "let f(x: A, y: B) = x in f",
-                "let f(x: A, y: B) = x in f",
-            ),
+            ("let f(x: A, y: B) = x in f", "let f(x: A, y: B) = x in f"),
             // Call syntax
             ("f(x)", "f x"),
             ("f(x, y)", "f x y"),
