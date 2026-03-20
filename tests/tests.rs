@@ -12,7 +12,7 @@ fn test_application() {
     ctx.add_uninterpreted("N", Type(0));
     ctx.add_uninterpreted("z", p("N"));
     ctx.add_uninterpreted("s", p("fn(_: N) -> N"));
-    ctx.add_val("three", p(r"\(f: fn(_: N) -> N, x: N) -> f(f(f(x)))"));
+    ctx.add_val("three", p(r"|f: fn(_: N) -> N, x: N| f(f(f(x)))"));
 
     let expr = p("three(three(s), z)");
     let normalized = ctx.normalize(expr);
@@ -65,7 +65,7 @@ fn test_equality() {
     let mut ctx = EvalContext::default();
     ctx.add_uninterpreted("N", Type(0));
     ctx.add_uninterpreted("M", Type(0));
-    ctx.add_val("f", p(r"\(t: Type(0)) -> t == N"));
+    ctx.add_val("f", p(r"|t: Type(0)| t == N"));
 
     // Eq type has a type
     let eq_ty = p("N == M");
@@ -98,16 +98,16 @@ fn test_scoping() {
     ctx.add_uninterpreted("x", p("N"));
 
     // Type-checking a lambda that shadows x should not leak x:M
-    ctx.infer_type(p(r"\(x: M) -> x"));
+    ctx.infer_type(p(r"|x: M| x"));
     assert_eq!(ctx.infer_type(p("x")).to_string(), "N");
 
     // Same for normalization
-    ctx.normalize(p(r"\(x: M) -> x"));
+    ctx.normalize(p(r"|x: M| x"));
     assert_eq!(ctx.infer_type(p("x")).to_string(), "N");
 
     // A defined variable should still reduce after normalizing a shadowing binder
     ctx.add_val("y", p("x"));
-    ctx.normalize(p(r"\(y: M) -> y"));
+    ctx.normalize(p(r"|y: M| y"));
     assert_eq!(ctx.normalize(p("y")).to_string(), "x");
 }
 
@@ -120,32 +120,26 @@ fn test_capture_avoidance() {
     ctx.add_uninterpreted("z", p("N"));
     ctx.add_uninterpreted("s", p("fn(N) -> N"));
 
+    assert_eq!(ctx.normalize(p(r"(|y: N, x: N| y)(x, z)")).to_string(), "x");
+    assert_eq!(ctx.normalize(p(r"(|x: N, x: N| x)(y, z)")).to_string(), "z");
     assert_eq!(
-        ctx.normalize(p(r"(\(y: N, x: N) -> y)(x, z)")).to_string(),
-        "x"
-    );
-    assert_eq!(
-        ctx.normalize(p(r"(\(x: N, x: N) -> x)(y, z)")).to_string(),
-        "z"
-    );
-    assert_eq!(
-        ctx.normalize(p(r"(\(x: N) -> (\(y: N, x: N) -> y)(x))(z, y)"))
+        ctx.normalize(p(r"(|x: N| (|y: N, x: N| y)(x))(z, y)"))
             .to_string(),
         "z"
     );
     assert_eq!(
-        ctx.normalize(p(r"(\(f: fn(N) -> N) -> f(f(x)))(\(x: N) -> s(x))"))
+        ctx.normalize(p(r"(|f: fn(N) -> N| f(f(x)))(|x: N| s(x))"))
             .to_string(),
         "s (s x)"
     );
 
     ctx.add_val(
         "ap",
-        p(r"\(t: Type(0), u: Type(0), f: fn(t) -> u, x: t) -> f(x)"),
+        p(r"|t: Type(0), u: Type(0), f: fn(t) -> u, x: t| f(x)"),
     );
     ctx.assert_equal(
         p("ap(fn(N) -> N, fn(N) -> N, ap(N, N))"),
-        p(r"\(x1: fn(N) -> N, x2: N) -> x1(x2)"),
+        p(r"|x1: fn(N) -> N, x2: N| x1(x2)"),
     );
 }
 
@@ -227,7 +221,7 @@ fn test_todo() {
     assert_eq!(ctx.infer_type(p("todo N")).to_string(), "N");
     // todo works in larger expressions
     assert_eq!(
-        ctx.infer_type(p(r"\(x: N) -> todo N")).to_string(),
+        ctx.infer_type(p(r"|x: N| todo N")).to_string(),
         "fn(x: N) -> N"
     );
 }
@@ -256,19 +250,19 @@ fn test_reject_rec_self_mismatch() {
 fn test_traits() {
     let mut ctx = EvalContext::default();
     ctx.normalize(p(r"
-        let Clone = \(t: Type(0)) -> {
+        let Clone = |t: Type(0)| {
             clone_method: fn(_: t) -> t,
         } in
-        let Copy = \(t: Type(0)) -> {
+        let Copy = |t: Type(0)| {
             clone_supertrait: Clone t,
         } in
 
-        let Iterator = \(t: Type(0)) -> {
+        let Iterator = |t: Type(0)| {
             item_ty: Type(0),
             next_method: fn(t) -> self.item_ty,
         } in
 
-        let IntoIterator = \(t: Type(0)) -> {
+        let IntoIterator = |t: Type(0)| {
             item_ty: Type(0),
             into_iter_ty: Type(0),
             iterator_bound: Iterator self.into_iter_ty,
@@ -292,7 +286,7 @@ fn test_traits() {
             IntoIteratorImpl(t, t_iter).type_eq
         in
 
-        let contractible = \(t: Type(1)) -> fn(x: t, y: t) -> x == y in
+        let contractible = |t: Type(1)| fn(x: t, y: t) -> x == y in
         // assume coherence for IntoIterator
         let coherence(t: Type(0)) -> contractible(IntoIterator t)
             = todo (contractible(IntoIterator t))
@@ -307,7 +301,7 @@ fn test_traits() {
             t_iter.item_ty == t_into_iter.item_ty
         =
             let use_coherence = coherence(t, IntoIteratorImpl(t, t_iter), t_into_iter) in
-            transport use_coherence (\(impl: IntoIterator t) -> t_iter.item_ty == impl.item_ty) conv(t, t_iter)
+            transport use_coherence (|impl: IntoIterator t| t_iter.item_ty == impl.item_ty) conv(t, t_iter)
         in
 
         {=}
@@ -323,10 +317,10 @@ fn test_unsound_traits() {
         r"
         // Helpers
         let symmetry(a: Type(0), b: Type(0), ab: a == b) -> b == a =
-            transport ab (\(x: Type(0)) -> x == a) (refl a)
+            transport ab (|x: Type(0)| x == a) (refl a)
         in
         let transitivity(a: Type(0), b: Type(0), c: Type(0), ab: a == b, bc: b == c) -> a == c =
-            transport bc (\(x: Type(0)) -> a == x) ab
+            transport bc (|x: Type(0)| a == x) ab
         in
 
         // trait Trait<R>: Sized {
@@ -384,7 +378,7 @@ fn test_unsound_traits() {
         in
 
         // This creates a value of arbitrary type hihi (and stack overflows)
-        // transport(transmute({}, N), \(x: Type(0)) -> x, {=})
+        // transport(transmute({}, N), |x: Type(0)| x, {=})
         {=}
         "
     ));
@@ -398,10 +392,10 @@ fn test_unsound_traits2() {
         r"
         // Helpers
         let symmetry(a: Type(0), b: Type(0), ab: a == b) -> b == a =
-            transport ab (\(x: Type(0)) -> x == a) (refl a)
+            transport ab (|x: Type(0)| x == a) (refl a)
         in
         let transitivity(a: Type(0), b: Type(0), c: Type(0), ab: a == b, bc: b == c) -> a == c =
-            transport bc (\(x: Type(0)) -> a == x) ab
+            transport bc (|x: Type(0)| a == x) ab
         in
 
         // trait Trait<R>: Sized {
@@ -489,7 +483,7 @@ fn test_reject_value_as_type() {
     ctx.add_uninterpreted("N", Type(0));
     ctx.add_uninterpreted("z", p("N"));
     // z is a value, not a type — can't use as binder type
-    ctx.infer_type(p(r"\(x: z) -> x"));
+    ctx.infer_type(p(r"|x: z| x"));
 }
 
 #[test]

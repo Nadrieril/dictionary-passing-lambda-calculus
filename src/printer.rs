@@ -40,7 +40,7 @@ impl Expr {
                 if prec > 0 {
                     write!(f, "(")?;
                 }
-                write!(f, "\\({x}: ")?;
+                write!(f, "|{x}: ")?;
                 t.fmt_prec(f, 0)?;
                 let mut inner = &**e;
                 while let Lambda(x2, t2, e2) = inner {
@@ -48,7 +48,7 @@ impl Expr {
                     t2.fmt_prec(f, 0)?;
                     inner = e2;
                 }
-                write!(f, ") -> ")?;
+                write!(f, "| ")?;
                 inner.fmt_prec(f, 0)?;
                 if prec > 0 {
                     write!(f, ")")?;
@@ -248,6 +248,6 @@ fn test_print() {
     );
     assert_eq!(
         expr.to_string(),
-        r"\(f: fn(_: N) -> N, x: N) -> f (f (f x))"
+        "|f: fn(_: N) -> N, x: N| f (f (f x))"
     );
 }

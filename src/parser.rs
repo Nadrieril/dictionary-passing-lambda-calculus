@@ -135,11 +135,22 @@ fn parse_type(input: &str) -> IResult<'_, Expr> {
     .parse(input)
 }
 
-/// `\(x: A) -> e` or `\(x: A, y: B) -> e` (multi-param sugar)
+/// `|x: A| body` or `|x: A, y: B| body` (multi-param sugar)
 fn parse_lambda(input: &str) -> IResult<'_, Expr> {
+    let param = |input| {
+        (variable, ws(nom_char(':')), parse_expr)
+            .map(|(x, _, t)| (x, t))
+            .parse(input)
+    };
     map(
-        (ws(nom_char('\\')), parse_params, ws(tag("->")), parse_expr),
-        |(_, params, _, body)| wrap_lambda(&params, body),
+        (
+            ws(nom_char('|')),
+            separated_list1(ws(nom_char(',')), param),
+            opt(ws(nom_char(','))),
+            ws(nom_char('|')),
+            parse_expr,
+        ),
+        |(_, params, _, _, body)| wrap_lambda(&params, body),
     )
     .parse(input)
 }
@@ -528,9 +539,9 @@ mod tests {
             "f x",
             "f x y",
             "f (g x)",
-            r"\(x: Type(0)) -> x",
+            "|x: Type(0)| x",
             "fn(x: Type(0)) -> x",
-            r"\(f: fn(_: N) -> N, x: N) -> f (f (f x))",
+            "|f: fn(_: N) -> N, x: N| f (f (f x))",
             "fn(_: fn(_: N) -> N, _: N) -> N",
             // Structs
             "{ a: Type(0), b: Type(0) }",
@@ -546,7 +557,7 @@ mod tests {
             "{ a = x, b = y }.a",
             // Nested structs
             "{ a: { b: Type(0) } }",
-            r"{ f = \(x: N) -> x }",
+            "{ f = |x: N| x }",
             // Equality
             "x == y",
             "f x == g y",
@@ -554,7 +565,7 @@ mod tests {
             "transport eq f",
             "transport eq f x",
             "(x == y) == (y == x)",
-            r"\(x: N) -> x == x",
+            "|x: N| x == x",
             "refl (f x)",
             // Todo
             "todo N",
@@ -588,7 +599,7 @@ mod tests {
     fn test_desugaring() {
         let cases = [
             ("let x: Type(0) = N in x", "let rec x: Type(0) = N in x"),
-            (r"\(x: A) -> \(y: B) -> x", r"\(x: A, y: B) -> x"),
+            ("|x: A| |y: B| x", "|x: A, y: B| x"),
             ("fn(x: A) -> fn(y: B) -> C", "fn(x: A, y: B) -> C"),
             ("fn(A) -> fn(B) -> C", "fn(_: A, _: B) -> C"),
             (
@@ -599,7 +610,7 @@ mod tests {
                 r"let f(x: A, y: B) -> C = x in f",
                 r"let rec f(x: A, y: B) -> C = x in f",
             ),
-            (r"fn(f: \(x: A) -> x) -> B", r"fn(f: \(x: A) -> x) -> B"),
+            ("fn(f: |x: A| x) -> B", "fn(f: |x: A| x) -> B"),
             // Call syntax
             ("f(x)", "f x"),
             ("f(x, y)", "f x y"),
