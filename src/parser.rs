@@ -45,6 +45,10 @@ fn leak_str(s: &str) -> &'static str {
     Box::leak(s.to_string().into_boxed_str())
 }
 
+fn leak_slice<T>(v: Vec<T>) -> &'static [T] {
+    Box::leak(v.into_boxed_slice())
+}
+
 /// Skip a single `// ...` line comment.
 fn line_comment(input: &str) -> IResult<'_, &str> {
     recognize((tag("//"), take_while(|c| c != '\n'))).parse(input)
@@ -70,6 +74,19 @@ fn ws<'a, O>(
     inner: impl Parser<&'a str, Output = O, Error = DeepError<'a>>,
 ) -> impl Parser<&'a str, Output = O, Error = DeepError<'a>> {
     preceded(skip_ws_and_comments, inner)
+}
+
+/// Parse a comma-separated list with optional trailing comma, wrapped in delimiters.
+fn comma_list<'a, O>(
+    open: char,
+    close: char,
+    item: impl Parser<&'a str, Output = O, Error = DeepError<'a>> + Copy,
+) -> impl Parser<&'a str, Output = Vec<O>, Error = DeepError<'a>> {
+    delimited(
+        ws(nom_char(open)),
+        separated_list1(ws(nom_char(',')), item),
+        (opt(ws(nom_char(','))), ws(nom_char(close))),
+    )
 }
 
 const KEYWORDS: &[&str] = &[
@@ -121,15 +138,52 @@ fn keyword<'a>(kw: &'static str) -> impl Parser<&'a str, Output = &'a str, Error
     }
 }
 
+/// A single `name = expr` field.
+fn field_val(input: &str) -> IResult<'_, (&'static str, Expr)> {
+    (ident, ws(nom_char('=')), parse_expr)
+        .map(|(n, _, e)| (leak_str(n), e))
+        .parse(input)
+}
+
+/// A single `name: expr` field.
+fn field_ty(input: &str) -> IResult<'_, (&'static str, Expr)> {
+    (ident, ws(nom_char(':')), parse_expr)
+        .map(|(n, _, e)| (leak_str(n), e))
+        .parse(input)
+}
+
+/// A single `variable: expr` parameter.
+fn param(input: &str) -> IResult<'_, (Variable, Expr)> {
+    (variable, ws(nom_char(':')), parse_expr)
+        .map(|(x, _, t)| (x, t))
+        .parse(input)
+}
+
+/// Parse a parenthesized parameter list: `(x: A, y: B, ...)`
+fn parse_params(input: &str) -> IResult<'_, Vec<(Variable, Expr)>> {
+    comma_list('(', ')', param).parse(input)
+}
+
+/// Wrap a return type in nested Pi types for each parameter.
+fn wrap_pi(params: &[(Variable, Expr)], ret: Expr) -> Expr {
+    params
+        .iter()
+        .rev()
+        .fold(ret, |acc, (x, t)| Pi(*x, __(*t), __(acc)))
+}
+
+/// Wrap a body in nested lambdas for each parameter.
+fn wrap_lambda(params: &[(Variable, Expr)], body: Expr) -> Expr {
+    params
+        .iter()
+        .rev()
+        .fold(body, |acc, (x, t)| Lambda(*x, __(*t), __(acc)))
+}
+
 /// `Type(n)`
 fn parse_type(input: &str) -> IResult<'_, Expr> {
     map(
-        (
-            ws(tag("Type")),
-            ws(nom_char('(')),
-            ws(digit1),
-            ws(nom_char(')')),
-        ),
+        (ws(tag("Type")), ws(nom_char('(')), ws(digit1), ws(nom_char(')'))),
         |(_, _, digits, _): (_, _, &str, _)| Type(digits.parse::<usize>().unwrap()),
     )
     .parse(input)
@@ -137,11 +191,6 @@ fn parse_type(input: &str) -> IResult<'_, Expr> {
 
 /// `|x: A| body` or `|x: A, y: B| body` (multi-param sugar)
 fn parse_lambda(input: &str) -> IResult<'_, Expr> {
-    let param = |input| {
-        (variable, ws(nom_char(':')), parse_expr)
-            .map(|(x, _, t)| (x, t))
-            .parse(input)
-    };
     map(
         (
             ws(nom_char('|')),
@@ -167,13 +216,11 @@ fn parse_pi(input: &str) -> IResult<'_, Expr> {
         map(
             (
                 keyword("fn"),
-                ws(nom_char('(')),
-                parse_expr,
-                ws(nom_char(')')),
+                delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
                 ws(tag("->")),
                 parse_expr,
             ),
-            |(_, _, t, _, _, e)| Pi(Variable::User("_"), __(t), __(e)),
+            |(_, t, _, e)| Pi(Variable::User("_"), __(t), __(e)),
         ),
     ))
     .parse(input)
@@ -181,31 +228,16 @@ fn parse_pi(input: &str) -> IResult<'_, Expr> {
 
 /// `{ a = e, b = e }` or `{ a: T, b: T }` or `{}` or `{=}`
 fn parse_struct(input: &str) -> IResult<'_, Expr> {
-    let field_val = |input| {
-        (ident, ws(nom_char('=')), parse_expr)
-            .map(|(n, _, e)| (leak_str(n), e))
-            .parse(input)
-    };
-    let field_ty = |input| {
-        (ident, ws(nom_char(':')), parse_expr)
-            .map(|(n, _, e)| (leak_str(n), e))
-            .parse(input)
-    };
     alt((
         // {=} — empty struct value
         map(
             (ws(nom_char('{')), ws(nom_char('=')), ws(nom_char('}'))),
-            |_| Struct(Box::leak(Vec::new().into_boxed_slice())),
+            |_| Struct(&[]),
         ),
         // { a = e, ... } — struct value
-        map(
-            delimited(
-                ws(nom_char('{')),
-                separated_list1(ws(nom_char(',')), field_val),
-                (opt(ws(nom_char(','))), ws(nom_char('}'))),
-            ),
-            |fields| Struct(Box::leak(fields.into_boxed_slice())),
-        ),
+        map(comma_list('{', '}', field_val), |fields| {
+            Struct(leak_slice(fields))
+        }),
         // { a: T, ... } or {} — struct type
         map(
             delimited(
@@ -213,7 +245,7 @@ fn parse_struct(input: &str) -> IResult<'_, Expr> {
                 separated_list0(ws(nom_char(',')), field_ty),
                 (opt(ws(nom_char(','))), ws(nom_char('}'))),
             ),
-            |fields| StructTy(Variable::User("self"), Box::leak(fields.into_boxed_slice())),
+            |fields| StructTy(Variable::User("self"), leak_slice(fields)),
         ),
     ))
     .parse(input)
@@ -242,13 +274,7 @@ fn parse_postfix(input: &str) -> IResult<'_, Expr> {
             input = rest;
         } else if input.starts_with('(') {
             // No whitespace before '(' — parse as call syntax
-            if let Ok((rest, args)) = delimited(
-                nom_char('('),
-                separated_list1(ws(nom_char(',')), parse_expr),
-                (opt(ws(nom_char(','))), ws(nom_char(')'))),
-            )
-            .parse(input)
-            {
+            if let Ok((rest, args)) = comma_list('(', ')', parse_expr).parse(input) {
                 for arg in args {
                     expr = App(__(expr), __(arg));
                 }
@@ -278,36 +304,16 @@ fn parse_app(input: &str) -> IResult<'_, Expr> {
 
 /// `make (ty) { a = e, ... }` or `make (ty) {=}`
 fn parse_make(input: &str) -> IResult<'_, Expr> {
-    let field_val = |input| {
-        (ident, ws(nom_char('=')), parse_expr)
-            .map(|(n, _, e)| (leak_str(n), e))
-            .parse(input)
-    };
-    alt((
-        map(
-            (
-                keyword("make"),
-                delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
-                ws(nom_char('{')),
-                ws(nom_char('=')),
-                ws(nom_char('}')),
-            ),
-            |(_, ty, _, _, _)| TypedStruct(__(ty), Box::leak(Vec::new().into_boxed_slice())),
-        ),
-        map(
-            (
-                keyword("make"),
-                delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
-                delimited(
-                    ws(nom_char('{')),
-                    separated_list1(ws(nom_char(',')), field_val),
-                    (opt(ws(nom_char(','))), ws(nom_char('}'))),
-                ),
-            ),
-            |(_, ty, fields)| TypedStruct(__(ty), Box::leak(fields.into_boxed_slice())),
-        ),
-    ))
-    .parse(input)
+    let (input, _) = keyword("make").parse(input)?;
+    let (input, ty) = delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))).parse(input)?;
+    if let Ok((input, _)) =
+        (ws(nom_char('{')), ws(nom_char('=')), ws(nom_char('}'))).parse(input)
+    {
+        Ok((input, TypedStruct(__(ty), &[])))
+    } else {
+        let (input, fields) = comma_list('{', '}', field_val).parse(input)?;
+        Ok((input, TypedStruct(__(ty), leak_slice(fields))))
+    }
 }
 
 /// `refl e`
@@ -340,152 +346,61 @@ fn parse_eq(input: &str) -> IResult<'_, Expr> {
     }
 }
 
-/// Parse a parameter list: `(x: A, y: B, ...)`
-fn parse_params(input: &str) -> IResult<'_, Vec<(Variable, Expr)>> {
-    let param = |input| {
-        (variable, ws(nom_char(':')), parse_expr)
-            .map(|(x, _, t)| (x, t))
-            .parse(input)
-    };
-    delimited(
-        ws(nom_char('(')),
-        separated_list1(ws(nom_char(',')), param),
-        (opt(ws(nom_char(','))), ws(nom_char(')'))),
-    )
-    .parse(input)
-}
-
-/// Wrap a return type in nested Pi types for each parameter.
-fn wrap_pi(params: &[(Variable, Expr)], ret: Expr) -> Expr {
-    params
-        .iter()
-        .rev()
-        .fold(ret, |acc, (x, t)| Pi(*x, __(*t), __(acc)))
-}
-
-/// Wrap a body in nested lambdas for each parameter.
-fn wrap_lambda(params: &[(Variable, Expr)], body: Expr) -> Expr {
-    params
-        .iter()
-        .rev()
-        .fold(body, |acc, (x, t)| Lambda(*x, __(*t), __(acc)))
-}
-
-/// `let x = e1 in e2` or `let x: T = e1 in e2` or `let x(params): T = e1 in e2`
+/// All `let` forms: plain, annotated, rec, and function sugar variants.
 fn parse_let(input: &str) -> IResult<'_, Expr> {
-    alt((
-        // let x(params) -> T = e1 in e2 — function sugar
-        map(
-            (
-                keyword("let"),
-                variable,
-                parse_params,
-                ws(tag("->")),
-                parse_expr,
-                ws(nom_char('=')),
-                parse_expr,
-                keyword("in"),
-                parse_expr,
-            ),
-            |(_, x, params, _, ret, _, body, _, e2)| {
-                LetRec(
-                    x,
-                    __(wrap_pi(&params, ret)),
-                    __(wrap_lambda(&params, body)),
-                    __(e2),
-                )
-            },
-        ),
-        // let x(params) = e1 in e2 — function sugar without return type
-        map(
-            (
-                keyword("let"),
-                variable,
-                parse_params,
-                ws(nom_char('=')),
-                parse_expr,
-                keyword("in"),
-                parse_expr,
-            ),
-            |(_, x, params, _, body, _, e2)| Let(x, __(wrap_lambda(&params, body)), __(e2)),
-        ),
-        // let x: T = e1 in e2 — annotated let (desugars to LetRec)
-        map(
-            (
-                keyword("let"),
-                variable,
-                ws(nom_char(':')),
-                parse_expr,
-                ws(nom_char('=')),
-                parse_expr,
-                keyword("in"),
-                parse_expr,
-            ),
-            |(_, x, _, ty, _, e1, _, e2)| LetRec(x, __(ty), __(e1), __(e2)),
-        ),
-        // let x = e1 in e2
-        map(
-            (
-                keyword("let"),
-                variable,
-                ws(nom_char('=')),
-                parse_expr,
-                keyword("in"),
-                parse_expr,
-            ),
-            |(_, x, _, e1, _, e2)| Let(x, __(e1), __(e2)),
-        ),
-    ))
-    .parse(input)
-}
+    let (input, _) = keyword("let").parse(input)?;
+    let (input, is_rec) = map(opt(keyword("rec")), |r| r.is_some()).parse(input)?;
+    let (input, name) = variable(input)?;
 
-/// `let rec x: T = e1 in e2` or `let rec x(params): T = e1 in e2`
-fn parse_let_rec(input: &str) -> IResult<'_, Expr> {
-    alt((
-        // let rec x(params) -> T = e1 in e2 — function sugar
-        map(
-            (
-                keyword("let"),
-                keyword("rec"),
-                variable,
-                parse_params,
-                ws(tag("->")),
-                parse_expr,
-                ws(nom_char('=')),
-                parse_expr,
-                keyword("in"),
-                parse_expr,
-            ),
-            |(_, _, x, params, _, ret, _, body, _, e2)| {
-                LetRec(
-                    x,
-                    __(wrap_pi(&params, ret)),
-                    __(wrap_lambda(&params, body)),
-                    __(e2),
-                )
-            },
-        ),
+    // Try to parse optional params, optional return type annotation
+    let (input, params) = opt(parse_params).parse(input)?;
+
+    if let Some(params) = params {
+        // Function sugar: let [rec] f(params) [-> ret] = body in rest
+        if let Ok((input, (_, ret, _, body, _, rest))) =
+            (ws(tag("->")), parse_expr, ws(nom_char('=')), parse_expr, keyword("in"), parse_expr)
+                .parse(input)
+        {
+            // With return type annotation — always LetRec
+            return Ok((input, LetRec(
+                name,
+                __(wrap_pi(&params, ret)),
+                __(wrap_lambda(&params, body)),
+                __(rest),
+            )));
+        }
+        // Without return type — plain Let with lambda body (only if not rec)
+        let (input, (_, body, _, rest)) =
+            (ws(nom_char('=')), parse_expr, keyword("in"), parse_expr).parse(input)?;
+        if is_rec {
+            // `let rec f(params) = body` doesn't make sense without a type
+            return Err(nom::Err::Error(DeepError::from_error_kind(input, ErrorKind::Tag)));
+        }
+        return Ok((input, Let(name, __(wrap_lambda(&params, body)), __(rest))));
+    }
+
+    if is_rec {
         // let rec x: T = e1 in e2
-        map(
-            (
-                keyword("let"),
-                keyword("rec"),
-                variable,
-                ws(nom_char(':')),
-                parse_expr,
-                ws(nom_char('=')),
-                parse_expr,
-                keyword("in"),
-                parse_expr,
-            ),
-            |(_, _, x, _, ty, _, e1, _, e2)| LetRec(x, __(ty), __(e1), __(e2)),
-        ),
-    ))
-    .parse(input)
+        let (input, (_, ty, _, e1, _, e2)) =
+            (ws(nom_char(':')), parse_expr, ws(nom_char('=')), parse_expr, keyword("in"), parse_expr)
+                .parse(input)?;
+        Ok((input, LetRec(name, __(ty), __(e1), __(e2))))
+    } else if let Ok((input, (_, ty, _, e1, _, e2))) =
+        (ws(nom_char(':')), parse_expr, ws(nom_char('=')), parse_expr, keyword("in"), parse_expr)
+            .parse(input)
+    {
+        // let x: T = e1 in e2 — annotated let (desugars to LetRec)
+        Ok((input, LetRec(name, __(ty), __(e1), __(e2))))
+    } else {
+        // let x = e1 in e2
+        let (input, (_, e1, _, e2)) =
+            (ws(nom_char('=')), parse_expr, keyword("in"), parse_expr).parse(input)?;
+        Ok((input, Let(name, __(e1), __(e2))))
+    }
 }
 
 fn parse_expr(input: &str) -> IResult<'_, Expr> {
-    alt((parse_let_rec, parse_let, parse_lambda, parse_pi, parse_eq)).parse(input)
+    alt((parse_let, parse_lambda, parse_pi, parse_eq)).parse(input)
 }
 
 /// Parse error with position information. Uses `Display` for pretty-printing,
