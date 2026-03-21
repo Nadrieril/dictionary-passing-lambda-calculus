@@ -502,7 +502,7 @@ impl EvalContext {
                 });
                 Type(k)
             }
-            Struct(None, fields) => {
+            Struct(ty, fields) => {
                 let ty_fields = fields
                     .iter()
                     .map(|(&n, e)| {
@@ -510,25 +510,18 @@ impl EvalContext {
                         (n, self.infer_type_inner(loc, e))
                     })
                     .collect();
-                StructTy(Variable::user("self"), __(ty_fields))
-            }
-            Struct(Some(ty), fields) => {
-                let _ = self.infer_universe(PathElem::StructAnnot, ty);
-                let StructTy(self_var, field_tys) = self.whnf_unfold(ty) else {
-                    panic!("Struct type expected for rec")
-                };
-                // Check each field against the expected type, with self = the rec expression.
-                for (&name, val) in fields.iter() {
-                    let expected = field_tys
-                        .get(&name)
-                        .unwrap_or_else(|| panic!("Field {name} not found in type"))
-                        .clone();
-                    let expected = expected.subst1(self_var, e);
-                    let loc = PathElem::Construct(Constructor::StructField(name));
-                    let actual = self.infer_type_inner(loc, val);
+                let actual = StructTy(Variable::user("self"), __(ty_fields));
+                if let Some(ty) = ty {
+                    let _ = self.infer_universe(PathElem::StructAnnot, ty);
+                    let StructTy(self_var, field_tys) = self.whnf_unfold(ty) else {
+                        panic!("Struct type expected for rec")
+                    };
+                    let expected = StructTy(self_var.refresh(), field_tys).subst1(self_var, e);
                     self.assert_equal(&expected, &actual);
+                    ty.as_ref().clone()
+                } else {
+                    actual
                 }
-                (**ty).clone()
             }
             Let(x, ty, e1, e2) => {
                 let te1 = self.infer_type_inner(PathElem::LetVal, e1);

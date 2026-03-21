@@ -302,6 +302,47 @@ fn test_reject_missing_field() {
 }
 
 #[test]
+#[should_panic(expected = "Struct type expected for rec")]
+fn test_reject_make_non_struct_type() {
+    let mut ctx = EvalContext::default();
+    ctx.add_uninterpreted("N", Type(0));
+    ctx.add_uninterpreted("z", p("N"));
+    // Annotation is N, not a struct type
+    ctx.infer_type(&p("make (N) { a = z }"));
+}
+
+#[test]
+#[should_panic(expected = "assertion `left == right` failed")]
+fn test_reject_make_field_type_mismatch() {
+    let mut ctx = EvalContext::default();
+    ctx.add_uninterpreted("N", Type(0));
+    ctx.add_uninterpreted("M", Type(0));
+    ctx.add_uninterpreted("z", p("N"));
+    // Field a has type N but annotation says M
+    ctx.infer_type(&p("make ({ a: M }) { a = z }"));
+}
+
+#[test]
+#[should_panic(expected = "assertion `left == right` failed")]
+fn test_reject_make_missing_field() {
+    let mut ctx = EvalContext::default();
+    ctx.add_uninterpreted("N", Type(0));
+    ctx.add_uninterpreted("z", p("N"));
+    // Annotation expects two fields but value only has one
+    ctx.infer_type(&p("make ({ a: N, b: N }) { a = z }"));
+}
+
+#[test]
+#[should_panic(expected = "assertion `left == right` failed")]
+fn test_reject_make_extra_field() {
+    let mut ctx = EvalContext::default();
+    ctx.add_uninterpreted("N", Type(0));
+    ctx.add_uninterpreted("z", p("N"));
+    // Value has extra field not in annotation
+    ctx.infer_type(&p("make ({ a: N }) { a = z, b = z }"));
+}
+
+#[test]
 #[should_panic(expected = "assertion `left == right` failed")]
 fn test_reject_eq_different_types() {
     let mut ctx = EvalContext::default();
