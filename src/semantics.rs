@@ -237,7 +237,11 @@ impl MentionPath {
     fn from_path<'a>(
         path: impl IntoIterator<Item = &'a PathElem> + Clone,
     ) -> Result<Vec<Self>, (ConstructorPath, PathElem)> {
-        if path.clone().into_iter().any(|pe| pe.is_app_arg()) {
+        if path
+            .clone()
+            .into_iter()
+            .any(|pe| matches!(pe, PathElem::AppArg(..) | PathElem::LetVal))
+        {
             // Compute all the possible combinations of paths.
             path.into_iter()
                 .map(|pe| match pe {
@@ -245,6 +249,9 @@ impl MentionPath {
                         // Each item here is a possible path we can take.
                         mentions.iter().map(|m| Either::Left(*m)).collect_vec()
                     }
+                    // We skip paths bound to a `let` because we'll explore them when we encounter
+                    // the binding instead.
+                    PathElem::LetVal => vec![],
                     pe => vec![Either::Right(pe.clone())],
                 })
                 .multi_cartesian_product()
@@ -319,7 +326,6 @@ pub enum PathElem {
     // Let / LetRec
     LetVal,
     LetTy,
-    LetBody,
     LetRecTy,
     LetRecVal(Variable),
     LetRecBody,
@@ -408,35 +414,54 @@ impl EvalContext {
             Var(x) => {
                 let binding = self
                     .lookup_binding(*x)
-                    .expect(&format!("Failed to find variable {x}!"));
-                let binding_ty = binding.ty.clone();
-                if matches!(binding.kind, BindingKind::Nominal(..))
-                    && let mut subpath = self.path.iter()
-                    && subpath
-                        .by_ref()
-                        .find(|e| matches!(e, PathElem::LetRecVal(v) if v == x))
-                        .is_some()
-                {
-                    // We're inside a `let rec val` definition, and we found a recursive reference
-                    // to `val`.
-                    match MentionPath::from_path(subpath) {
-                        Ok(mention_paths) => {
-                            // We can handle all the paths from the start of the `let rec` to here;
-                            // add them to the graph.
-                            for mention_path in mention_paths {
-                                let graph = self.progress_graphs.entry(*x).or_default();
-                                graph.add_edge(mention_path.ctor_path, mention_path.dtor_path, ());
-                            }
-                        }
-                        Err((ctor_path, pe)) => {
-                            panic!(
-                                "failed to prove progress of {x}: \
-                                recursive mention found under a {pe:?}\n  \
-                                location: {}",
-                                ctor_path.display_on(*x),
-                            );
+                    .expect(&format!("Failed to find variable {x}!"))
+                    .clone();
+                let binding_ty = binding.ty;
+                match binding.kind {
+                    BindingKind::Normal(v) => {
+                        if self
+                            .path
+                            .iter()
+                            .any(|e| matches!(e, PathElem::LetRecVal(..)))
+                        {
+                            // A let-binding may contain recursive mentions of a recursive variable.
+                            let _ = self.infer_type(&v);
                         }
                     }
+                    BindingKind::Nominal(..) => {
+                        if let mut subpath = self.path.iter()
+                            && subpath
+                                .by_ref()
+                                .find(|e| matches!(e, PathElem::LetRecVal(v) if v == x))
+                                .is_some()
+                        {
+                            // We're inside a `let rec val` definition, and we found a recursive reference
+                            // to `val`.
+                            match MentionPath::from_path(subpath) {
+                                Ok(mention_paths) => {
+                                    // We can handle all the paths from the start of the `let rec` to here;
+                                    // add them to the graph.
+                                    for mention_path in mention_paths {
+                                        let graph = self.progress_graphs.entry(*x).or_default();
+                                        graph.add_edge(
+                                            mention_path.ctor_path,
+                                            mention_path.dtor_path,
+                                            (),
+                                        );
+                                    }
+                                }
+                                Err((ctor_path, pe)) => {
+                                    panic!(
+                                        "failed to prove progress of {x}: \
+                                        recursive mention found under a {pe:?}\n  \
+                                        location: {}",
+                                        ctor_path.display_on(*x),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    _ => (),
                 }
                 return binding_ty;
             }
@@ -530,7 +555,8 @@ impl EvalContext {
                     self.assert_equal(ty, &te1);
                 }
                 return self.with_binding_in_scope(*x, Binding::with_value(e1, &te1), |ctx| {
-                    ctx.infer_type_inner(PathElem::LetBody, e2)
+                    // No `PathElem` here: a `let` body doesn't count wrt constructors.
+                    ctx.infer_type(e2)
                 });
             }
             LetRec(x, ty, e1, e2) => {
@@ -567,7 +593,7 @@ impl EvalContext {
                             );
                         }
                     }
-                    if toposort(&graph, None).is_err() {
+                    if let Err(_cycle) = toposort(&graph, None) {
                         panic!(
                             "failed to prove progress of {x}: \
                             recursive uses are not productive.\n\

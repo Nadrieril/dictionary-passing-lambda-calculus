@@ -102,7 +102,9 @@ fn test_sound_traits2() {
         let rec Trait(t: Type, r: Type) -> Type(1) = {
             proof: Type,
             proof_impl: Trait(self.proof, r),
-            proof_impl_constraint: self.proof_impl.proof == t,
+            proof_impl_constraint:
+                let proof_ty = self.proof_impl.proof in
+                proof_ty == t,
         } in
 
         {=}
@@ -290,9 +292,31 @@ fn magic_bad1() {
             supertrait: Copy t,
         } in
 
-        // impl<T: Magic> Magic for T {}
+        // impl<T: Magic> Magic for T {}, kinda
         let rec MagicImpl(t: Type) -> Magic t = make (Magic t) {
             supertrait = (MagicImpl t).supertrait,
+        } in
+
+        {=}
+    "));
+}
+
+#[test]
+#[should_panic(expected = "recursive uses are not productive")]
+fn magic_bad1_with_let() {
+    let mut ctx = EvalContext::default();
+    ctx.normalize(&p(r"
+        // trait Copy {}
+        let rec Copy(t: Type) -> Type = {} in
+
+        // trait Magic: Copy {}
+        let rec Magic(t: Type) -> Type = {
+            supertrait: Copy t,
+        } in
+
+        // impl<T: Magic> Magic for T {}, kinda
+        let rec MagicImpl(t: Type) -> Magic t = make (Magic t) {
+            supertrait = let sup = (MagicImpl t).supertrait in sup,
         } in
 
         {=}
