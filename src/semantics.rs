@@ -162,17 +162,36 @@ impl ConstructorPath {
     }
 
     fn display_on(&self, var: Variable) -> impl Display {
-        [var.to_string()]
-            .into_iter()
-            .chain(self.iter().map(|ctor| match ctor {
-                Constructor::Lambda | Constructor::Pi => "(_)".to_string(),
-                Constructor::StructField(f) | Constructor::StructTyField(f) => format!(".{f}"),
-                Constructor::TypeOf => format!(".value_of"),
-                Constructor::EqLeft => format!(".eq_left"),
-                Constructor::EqRight => format!(".eq_right"),
-                Constructor::Refl => format!(".refl_arg"),
-            }))
-            .format("")
+        let mut parts = vec![var.to_string()];
+        let mut arg_count = 0usize;
+        let n_args = |n| format!("({})", std::iter::repeat_n("_", n).format(", "));
+        for ctor in self.iter() {
+            match ctor {
+                Constructor::Lambda | Constructor::Pi => {
+                    arg_count += 1;
+                }
+                other => {
+                    if arg_count > 0 {
+                        parts.push(n_args(arg_count));
+                        arg_count = 0;
+                    }
+                    parts.push(match other {
+                        Constructor::Lambda | Constructor::Pi => unreachable!(),
+                        Constructor::StructField(f) | Constructor::StructTyField(f) => {
+                            format!(".{f}")
+                        }
+                        Constructor::TypeOf => format!(".value_of"),
+                        Constructor::EqLeft => format!(".eq_left"),
+                        Constructor::EqRight => format!(".eq_right"),
+                        Constructor::Refl => format!(".refl_arg"),
+                    });
+                }
+            }
+        }
+        if arg_count > 0 {
+            parts.push(n_args(arg_count));
+        }
+        parts.into_iter().format("")
     }
 }
 
@@ -290,25 +309,20 @@ impl EvalContext {
                     }
                     dtor_path.reverse();
 
+                    let ctor_path = ConstructorPath::new(ctor_path);
+                    let dtor_path = ConstructorPath::new(dtor_path);
                     if let Some(pe) = subpath.next() {
-                        let path = self
-                            .path
-                            .iter()
-                            .skip_while(|e| !matches!(e, PathElem::LetRecVal(v) if v == x))
-                            .skip(1)
-                            .collect_vec();
                         panic!(
                             "failed to prove progress of {x}: \
-                            recursive mention under a {pe:?}\n  \
-                            full path: {path:?}"
+                            recursive mention found under a {pe:?}\n  \
+                            location: {}",
+                            ctor_path.display_on(*x),
                         );
                     } else {
                         // Here, the path was a series of constructors followed by a series of
                         // destructors. Iow, we're accessing the `dtor_path` projection of the
                         // current value and putting the result inside `ctor_path`. We record that
                         // dependency in the graph.
-                        let ctor_path = ConstructorPath::new(ctor_path);
-                        let dtor_path = ConstructorPath::new(dtor_path);
                         let graph = self.progress_graphs.entry(*x).or_default();
                         graph.add_edge(ctor_path, dtor_path, ());
                     }

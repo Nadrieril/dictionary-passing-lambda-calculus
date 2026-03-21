@@ -110,7 +110,7 @@ fn test_sound_traits2() {
 }
 
 #[test]
-#[should_panic(expected = "recursive mention under")]
+#[should_panic(expected = "recursive mention found under")]
 fn test_unsound_traits() {
     // Reproduce https://github.com/rust-lang/rust/issues/135246#issuecomment-4066328421
     let mut ctx = EvalContext::default();
@@ -187,7 +187,7 @@ fn test_unsound_traits() {
 }
 
 #[test]
-#[should_panic(expected = "recursive mention under")]
+#[should_panic(expected = "recursive mention found under")]
 fn test_unsound_traits2() {
     // Reproduce https://github.com/rust-lang/rust/issues/135246
     let mut ctx = EvalContext::default();
