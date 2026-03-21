@@ -1,11 +1,13 @@
 use std::{
     collections::{HashMap, VecDeque},
-    fmt::{Display, Write},
+    convert::Infallible,
+    fmt::{Debug, Display, Write},
 };
 
 use enum_as_inner::EnumAsInner;
+use fallible_iterator::{FallibleIterator, IteratorExt};
 use internment::Intern;
-use itertools::Itertools;
+use itertools::{Either, Itertools};
 use petgraph::{algo::toposort, prelude::DiGraphMap};
 use ustr::Ustr;
 
@@ -62,7 +64,10 @@ pub enum BindingKind {
     /// The value is known but is only inspected when deconstructing it. Helps with inference.
     Nominal(Expr),
     /// The value is never inspected, only its type is known.
-    Abstract,
+    Abstract {
+        /// Paths leading to uses of that variable.
+        paths: Vec<Vec<PathElem>>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -76,7 +81,7 @@ impl Binding {
     /// (`abstract` is a reserved keyword).
     pub fn abstrakt(ty: &Expr) -> Self {
         Self {
-            kind: BindingKind::Abstract,
+            kind: BindingKind::Abstract { paths: vec![] },
             ty: ty.clone(),
         }
     }
@@ -96,7 +101,7 @@ impl Binding {
         match &self.kind {
             BindingKind::Normal(expr) => Some(expr),
             BindingKind::Nominal(expr) if unfold_nominal => Some(expr),
-            BindingKind::Nominal(..) | BindingKind::Abstract => None,
+            BindingKind::Nominal(..) | BindingKind::Abstract { .. } => None,
         }
     }
 }
@@ -115,6 +120,7 @@ pub enum Constructor {
     TypeOf,
 }
 
+/// A series of constructors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, EnumAsInner)]
 enum ConstructorPath {
     Empty,
@@ -134,17 +140,25 @@ impl ConstructorPath {
             .fold(self, |acc, c| Self::Cons(Intern::new((acc, c))))
     }
 
-    fn iter(&self) -> impl Iterator<Item = Constructor> {
+    fn iter(self) -> impl Iterator<Item = Constructor> {
         self.iter_prefixes().map(|(_, c)| c)
     }
-    fn iter_prefixes(&self) -> impl Iterator<Item = (Self, Constructor)> {
+    fn iter_prefixes(self) -> impl Iterator<Item = (Self, Constructor)> {
         let mut elems = VecDeque::new();
-        let mut cur = *self;
+        let mut cur = self;
         while let Self::Cons(pair) = cur {
             elems.push_front(*pair);
             cur = pair.0;
         }
         elems.into_iter()
+    }
+    fn rev_iter(self) -> impl Iterator<Item = Constructor> {
+        let mut cur = self;
+        std::iter::from_fn(move || {
+            let (prefix, ctor) = **cur.as_cons()?;
+            cur = prefix;
+            Some(ctor)
+        })
     }
     /// Iterates over all ways to split `self` into `(prefix, suffix)` such that
     /// `prefix.concat(suffix) == self`. Yields `len + 1` pairs.
@@ -195,9 +209,108 @@ impl ConstructorPath {
     }
 }
 
+/// The path to a mention of a variable in a body. We only represent a simple kind of path: those
+/// where a projection of the value (e.g. `(x a).foo.bar`) is stored directly inside a series of
+/// constructors. E.g.:
+///   { foo = |a: u32| (x a).foo.bar }
+/// gives paths:
+///   ctor_path = [Field(foo), Lambda]
+///   dtor_path = [Lambda, Field(foo), Field(bar)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MentionPath {
+    ctor_path: ConstructorPath,
+    dtor_path: ConstructorPath,
+}
+
+impl MentionPath {
+    /// The shape of the identity function: the variable is mentioned directly, with no
+    /// projections nor constructors.
+    fn identity() -> Self {
+        MentionPath {
+            ctor_path: ConstructorPath::Empty,
+            dtor_path: ConstructorPath::Empty,
+        }
+    }
+
+    /// Convert a location to a number of `MentionPath`s. There can be several if we encounter a
+    /// function application that uses its argument several times.
+    fn from_path<'a>(
+        path: impl IntoIterator<Item = &'a PathElem> + Clone,
+    ) -> Result<Vec<Self>, (ConstructorPath, PathElem)> {
+        if path.clone().into_iter().any(|pe| pe.is_app_arg()) {
+            // Compute all the possible combinations of paths.
+            path.into_iter()
+                .map(|pe| match pe {
+                    PathElem::AppArg(Some(mentions)) => {
+                        // Each item here is a possible path we can take.
+                        mentions.iter().map(|m| Either::Left(*m)).collect_vec()
+                    }
+                    pe => vec![Either::Right(pe.clone())],
+                })
+                .multi_cartesian_product()
+                .map(|vv: Vec<Either<MentionPath, PathElem>>| {
+                    let path: Vec<PathElem> = vv
+                        .into_iter()
+                        .flat_map(|either| match either {
+                            Either::Left(m) => Either::Left(m.to_path()),
+                            Either::Right(pe) => Either::Right([pe].into_iter()),
+                        })
+                        .collect_vec();
+                    Self::from_single_path(&path)
+                })
+                .try_collect()
+        } else {
+            Self::from_single_path(path).map(|x| vec![x])
+        }
+    }
+    /// `from_path` but without support for function application.
+    fn from_single_path<'a>(
+        path: impl IntoIterator<Item = &'a PathElem> + Clone,
+    ) -> Result<Self, (ConstructorPath, PathElem)> {
+        let mut path = path.into_iter().cloned().peekable();
+
+        let mut ctor_path = vec![];
+        while let Some(ctor) = path.next_if_map(|e| e.into_construct()) {
+            ctor_path.push(ctor);
+        }
+        let mut dtor_path = vec![];
+        while let Some(ctor) = path.next_if_map(|e| e.into_destruct()) {
+            dtor_path.push(ctor);
+        }
+        dtor_path.reverse();
+
+        let ctor_path = ConstructorPath::new(ctor_path);
+        let dtor_path = ConstructorPath::new(dtor_path);
+        if let Some(pe) = path.next() {
+            Err((ctor_path, pe))
+        } else {
+            Ok(Self {
+                ctor_path,
+                dtor_path,
+            })
+        }
+    }
+    fn to_path(self) -> impl Iterator<Item = PathElem> {
+        let ctors = self.ctor_path.iter().map(PathElem::Construct);
+        let dtors = self.dtor_path.rev_iter().map(PathElem::Destruct);
+        ctors.chain(dtors)
+    }
+}
+
+impl Debug for MentionPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "MentionPath({} = {})",
+            self.ctor_path.display_on(Variable::user("output")),
+            self.dtor_path.display_on(Variable::user("input")),
+        )
+    }
+}
+
 /// Describes which sub-expression position we are in within the expression tree.
 /// One variant per nested `Expr` location inside an `Expr`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumAsInner)]
+#[derive(Debug, Clone, PartialEq, Eq, EnumAsInner)]
 pub enum PathElem {
     /// We're inside the given destructor.
     Construct(Constructor),
@@ -213,8 +326,8 @@ pub enum PathElem {
     // Pi / Lambda
     PiType,
     LambdaType,
-    // App
-    AppArg,
+    // Argument of a function application. If known, stores the shape of the function.
+    AppArg(Option<__<[MentionPath]>>),
     // Struct / StructTy
     StructAnnot,
     // Eq / Refl / Transport
@@ -238,12 +351,12 @@ pub struct EvalContext {
 }
 
 impl EvalContext {
-    fn lookup_binding(&self, x: Variable) -> Option<&Binding> {
-        self.bindings
-            .iter()
-            .rev()
-            .find(|elem| x == elem.0)
-            .map(|b| &b.1)
+    fn lookup_binding(&mut self, x: Variable) -> Option<&Binding> {
+        let b = &mut self.bindings.iter_mut().rev().find(|elem| x == elem.0)?.1;
+        if let BindingKind::Abstract { paths } = &mut b.kind {
+            paths.push(self.path.clone());
+        }
+        Some(b)
     }
 
     fn push_binding(&mut self, x: Variable, b: Binding) {
@@ -267,10 +380,19 @@ impl EvalContext {
         b: Binding,
         f: impl FnOnce(&mut Self) -> T,
     ) -> T {
+        self.with_binding_in_scope_keep_binding(x, b, f).0
+    }
+    /// Like `with_binding_in_scope` and also returns the binding.
+    fn with_binding_in_scope_keep_binding<T>(
+        &mut self,
+        x: Variable,
+        b: Binding,
+        f: impl FnOnce(&mut Self) -> T,
+    ) -> (T, Binding) {
         self.push_binding(x, b);
         let result = f(self);
-        self.bindings.pop().unwrap();
-        result
+        let (_, b) = self.bindings.pop().unwrap();
+        (result, b)
     }
 
     /// Typecheck a sub-expression, tracking its position in the expression tree.
@@ -289,48 +411,37 @@ impl EvalContext {
                     .expect(&format!("Failed to find variable {x}!"));
                 let binding_ty = binding.ty.clone();
                 if matches!(binding.kind, BindingKind::Nominal(..))
-                    && let mut subpath = self
-                        .path
-                        .iter()
-                        .copied()
-                        .skip_while(|e| !matches!(e, PathElem::LetRecVal(v) if v == x))
-                        .peekable()
-                    && subpath.next().is_some()
+                    && let mut subpath = self.path.iter()
+                    && subpath
+                        .by_ref()
+                        .find(|e| matches!(e, PathElem::LetRecVal(v) if v == x))
+                        .is_some()
                 {
-                    // We're inside a `let rec` definition, and we found a recursive reference.
-                    let mut ctor_path = vec![];
-                    while let Some(ctor) = subpath.next_if_map(|e| e.into_construct()) {
-                        ctor_path.push(ctor);
-                    }
-
-                    let mut dtor_path = vec![];
-                    while let Some(ctor) = subpath.next_if_map(|e| e.into_destruct()) {
-                        dtor_path.push(ctor);
-                    }
-                    dtor_path.reverse();
-
-                    let ctor_path = ConstructorPath::new(ctor_path);
-                    let dtor_path = ConstructorPath::new(dtor_path);
-                    if let Some(pe) = subpath.next() {
-                        panic!(
-                            "failed to prove progress of {x}: \
-                            recursive mention found under a {pe:?}\n  \
-                            location: {}",
-                            ctor_path.display_on(*x),
-                        );
-                    } else {
-                        // Here, the path was a series of constructors followed by a series of
-                        // destructors. Iow, we're accessing the `dtor_path` projection of the
-                        // current value and putting the result inside `ctor_path`. We record that
-                        // dependency in the graph.
-                        let graph = self.progress_graphs.entry(*x).or_default();
-                        graph.add_edge(ctor_path, dtor_path, ());
+                    // We're inside a `let rec val` definition, and we found a recursive reference
+                    // to `val`.
+                    match MentionPath::from_path(subpath) {
+                        Ok(mention_paths) => {
+                            // We can handle all the paths from the start of the `let rec` to here;
+                            // add them to the graph.
+                            for mention_path in mention_paths {
+                                let graph = self.progress_graphs.entry(*x).or_default();
+                                graph.add_edge(mention_path.ctor_path, mention_path.dtor_path, ());
+                            }
+                        }
+                        Err((ctor_path, pe)) => {
+                            panic!(
+                                "failed to prove progress of {x}: \
+                                recursive mention found under a {pe:?}\n  \
+                                location: {}",
+                                ctor_path.display_on(*x),
+                            );
+                        }
                     }
                 }
                 return binding_ty;
             }
             Type(k) => return Type(k + 1),
-            Pi(x, t1, t2) => {
+            Pi(x, t1, t2, _) => {
                 let k1 = self.infer_universe(PathElem::PiType, t1);
                 let k2 = self.with_binding_in_scope(*x, Binding::abstrakt(t1), |ctx| {
                     ctx.infer_universe(PathElem::Construct(Constructor::Pi), t2)
@@ -339,17 +450,42 @@ impl EvalContext {
             }
             Lambda(x, t, e) => {
                 let _ = self.infer_universe(PathElem::LambdaType, t);
-                let te = self.with_binding_in_scope(*x, Binding::abstrakt(t), |ctx| {
-                    ctx.infer_type_inner(PathElem::Construct(Constructor::Lambda), e)
-                });
-                Pi(*x, t.clone(), __(te))
+                let (te, b) =
+                    self.with_binding_in_scope_keep_binding(*x, Binding::abstrakt(t), |ctx| {
+                        ctx.infer_type_inner(PathElem::Construct(Constructor::Lambda), e)
+                    });
+                let mentions = {
+                    let BindingKind::Abstract { paths } = b.kind else {
+                        unreachable!()
+                    };
+                    let cur_path_len = self.path.len() + 1;
+                    // Each path is one location where the input variable is mentioned in the body.
+                    // Each such location may give rise to several `MentionPath`s because of other
+                    // function calls. We flatten everything here. If any of the locations could
+                    // not be transformed to a `MentionPath`, we get `None` to ensure that the set
+                    // of paths is always exhaustive..
+                    paths
+                        .into_iter()
+                        .map(|p| MentionPath::from_path(&p[cur_path_len..]))
+                        .transpose_into_fallible()
+                        .map(|vec| {
+                            Ok(vec
+                                .into_iter()
+                                .into_fallible()
+                                .map_err(|x: Infallible| match x {}))
+                        })
+                        .flatten()
+                        .collect()
+                        .ok()
+                };
+                Pi(*x, t.clone(), __(te), mentions)
             }
             App(f, arg) => {
                 let f_ty = self.infer_type_inner(PathElem::Destruct(Constructor::Lambda), f);
-                let Pi(x, s, t) = self.whnf_unfold(&f_ty) else {
+                let Pi(x, s, t, mentions) = self.whnf_unfold(&f_ty) else {
                     panic!("Function expected.")
                 };
-                let arg_ty = self.infer_type_inner(PathElem::AppArg, arg);
+                let arg_ty = self.infer_type_inner(PathElem::AppArg(mentions), arg);
                 self.assert_equal(&s, &arg_ty);
                 t.subst1(x, arg)
             }
@@ -487,6 +623,7 @@ impl EvalContext {
                     Variable::anon(),
                     __(App(f.clone(), a)),
                     __(App(f.clone(), b)),
+                    Some(__([MentionPath::identity()])), // it's an identity function
                 )
             }
             Todo(t) => {
@@ -519,8 +656,8 @@ impl EvalContext {
     fn whnf_inner(&mut self, e: &Expr, unfold_nominal: bool) -> Expr {
         match e {
             Var(x) => match self.lookup_binding(*x) {
-                Some(binding) if let Some(val) = binding.value(unfold_nominal) => {
-                    self.whnf_inner(&val.clone(), unfold_nominal)
+                Some(binding) if let Some(val) = binding.value(unfold_nominal).cloned() => {
+                    self.whnf_inner(&val, unfold_nominal)
                 }
                 _ => Var(*x),
             },
@@ -613,7 +750,7 @@ impl EvalContext {
                 self.equal(t1, t2)
                     && self.equal(&body1.subst1(*x, &Var(z)), &body2.subst1(*y, &Var(z)))
             }
-            (Pi(x, t1, body1), Pi(y, t2, body2)) => {
+            (Pi(x, t1, body1, _), Pi(y, t2, body2, _)) => {
                 let z = x.refresh();
                 self.equal(t1, t2)
                     && self.equal(&body1.subst1(*x, &Var(z)), &body2.subst1(*y, &Var(z)))

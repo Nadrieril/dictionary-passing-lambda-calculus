@@ -165,7 +165,7 @@ fn wrap_pi(params: &[(Variable, Expr)], ret: Expr) -> Expr {
     params
         .iter()
         .rev()
-        .fold(ret, |acc, (x, t)| Pi(*x, __(t.clone()), __(acc)))
+        .fold(ret, |acc, (x, t)| Pi(*x, __(t.clone()), __(acc), None))
 }
 
 /// Wrap a body in nested lambdas for each parameter.
@@ -214,7 +214,7 @@ fn parse_pi(input: &str) -> IResult<'_, Expr> {
                 delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
                 preceded(ws(tag("->")), parse_expr),
             )
-                .map(|(t, e)| Pi(Variable::anon(), __(t), __(e))),
+                .map(|(t, e)| Pi(Variable::anon(), __(t), __(e), None)),
         )),
     )
     .parse(input)
@@ -346,7 +346,7 @@ fn parse_transport(input: &str) -> IResult<'_, Expr> {
 fn parse_arrow(input: &str) -> IResult<'_, Expr> {
     (parse_eq, opt(preceded(ws(tag("->")), cut(parse_arrow))))
         .map(|(lhs, rhs)| match rhs {
-            Some(rhs) => Pi(Variable::anon(), __(lhs), __(rhs)),
+            Some(rhs) => Pi(Variable::anon(), __(lhs), __(rhs), None),
             None => lhs,
         })
         .parse(input)

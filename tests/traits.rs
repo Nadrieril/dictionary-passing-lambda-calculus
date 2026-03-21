@@ -308,10 +308,32 @@ fn magic_good2() {
             also_magic: Magic t,
         } in
 
-        // impl<T: Magic> Magic for T {}
+        // impl<T> Magic for T {}
         let rec MagicImpl(t: Type) -> Magic t = make (Magic t) {
             also_magic = (MagicImpl t),
         } in
+
+        {=}
+    "));
+}
+
+#[test]
+fn magic_good2_external_knot() {
+    let mut ctx = EvalContext::default();
+    ctx.normalize(&p(r"
+        // trait Magic: Magic {}
+        let rec Magic(t: Type) -> Type = {
+            also_magic: Magic t,
+        } in
+
+        // impl<T: Magic> Magic for T {}
+        let MagicImpl(t: Type, magic_t: Magic t) -> Magic t = make (Magic t) {
+            also_magic = magic_t,
+        } in
+
+        let rec MagicImplRec(t: Type) -> Magic t =
+            MagicImpl(t, MagicImplRec(t))
+        in
 
         {=}
     "));

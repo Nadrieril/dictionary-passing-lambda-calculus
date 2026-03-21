@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 enum-as-inner = "0.7.0"
+fallible-iterator = "0.3.0"
 indexmap = "2.13.0"
 internment = "0.8.6"
 itertools = "0.14.0"

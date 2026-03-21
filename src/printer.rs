@@ -21,7 +21,7 @@ impl Expr {
             Var(x) => write!(f, "{x}"),
             Type(0) => write!(f, "Type"),
             Type(k) => write!(f, "Type({k})"),
-            Pi(x, t, e) if *x == Variable::anon() => {
+            Pi(x, t, e, _) if *x == Variable::anon() => {
                 // Anonymous Pi: print as `A -> B`
                 if prec > 1 {
                     write!(f, "(")?;
@@ -34,14 +34,14 @@ impl Expr {
                 }
                 Ok(())
             }
-            Pi(x, t, e) => {
+            Pi(x, t, e, _) => {
                 if prec > 0 {
                     write!(f, "(")?;
                 }
                 write!(f, "fn({x}: ")?;
                 t.fmt_prec(f, 0)?;
                 let mut inner: &Expr = e;
-                while let Pi(x2, t2, e2) = inner
+                while let Pi(x2, t2, e2, _) = inner
                     && *x2 != Variable::anon()
                 {
                     write!(f, ", {x2}: ")?;
@@ -180,7 +180,7 @@ fn peel_fun_sugar<'a>(
     let mut params = Vec::new();
     loop {
         match (ty, body) {
-            (Pi(tx, tt, te), Lambda(bx, _bt, be)) if *tx == *bx => {
+            (Pi(tx, tt, te, _), Lambda(bx, _bt, be)) if *tx == *bx => {
                 params.push((*tx, &**tt));
                 ty = te;
                 body = be;
@@ -281,6 +281,7 @@ fn test_print() {
             Variable::anon(),
             __(Var(Variable::user("N"))),
             __(Var(Variable::user("N"))),
+            None,
         )),
         __(Lambda(
             Variable::user("x"),

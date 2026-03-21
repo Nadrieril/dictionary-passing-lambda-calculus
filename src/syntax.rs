@@ -6,6 +6,8 @@ use ustr::Ustr;
 
 use Expr::*;
 
+use crate::semantics::MentionPath;
+
 pub type __<A> = Arc<A>;
 pub(crate) fn __<A>(a: A) -> Arc<A> {
     Arc::new(a)
@@ -49,7 +51,9 @@ pub enum Expr {
     /// `let rec x: T = e1 in e2`. Recursive and nominal binding.
     LetRec(Variable, __<Expr>, __<Expr>, __<Expr>),
 
-    Pi(Variable, __<Expr>, __<Expr>),
+    /// Function type. The last argument records the exhaustive set of locations where the variable
+    /// is used in the function body, if known.
+    Pi(Variable, __<Expr>, __<Expr>, Option<__<[MentionPath]>>),
     Lambda(Variable, __<Expr>, __<Expr>),
     App(__<Expr>, __<Expr>),
 
@@ -102,11 +106,11 @@ impl Expr {
             Var(x) => Var(*x),
             Type(k) => Type(*k),
             App(e1, e2) => App(__(v.map_expr(e1)), __(v.map_expr(e2))),
-            Pi(x, t, e) => {
+            Pi(x, t, e, mentions) => {
                 let mut x = *x;
                 let t = v.map_expr(t);
                 let e = v.under_abstraction(&mut x, Some(&t), |v| v.map_expr(e));
-                Pi(x, __(t), __(e))
+                Pi(x, __(t), __(e), mentions.clone())
             }
             Lambda(x, t, e) => {
                 let mut x = *x;
