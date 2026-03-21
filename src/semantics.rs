@@ -631,7 +631,7 @@ impl EvalContext {
     fn infer_universe(&mut self, loc: PathElem, t: &Expr) -> usize {
         match self.infer_type_inner(loc, t) {
             Type(k) => k,
-            t => panic!("Type expected, got {t:?}."),
+            t => panic!("Type expected, got {t}."),
         }
     }
 

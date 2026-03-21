@@ -362,3 +362,57 @@ fn magic_bad2() {
         {=}
     "));
 }
+
+#[test]
+#[should_panic(expected = "failed to prove progress")]
+fn funky() {
+    // Courtesy @theemathas (https://rust-lang.zulipchat.com/#narrow/channel/144729-t-types/topic/Progress.20in.20coinduction/near/580806615)
+    let mut ctx = EvalContext::default();
+    ctx.add_uninterpreted("i32", Type(0));
+    // struct Identity;
+    ctx.add_uninterpreted("Identity", Type(0));
+    // struct Dummy<A>(A);
+    ctx.add_uninterpreted("Dummy", p("Type -> Type"));
+    ctx.normalize(&p(r"
+        // trait HasAssoc {
+        //     type Assoc;
+        // }
+        let HasAssoc(t: Type) = {
+            assoc: Type,
+        } in
+
+        // trait Apply {
+        //     type Output<T: HasAssoc<Assoc = i32>>: HasAssoc<Assoc = i32>;
+        // }
+        let OutputDict(t: Type, t_assoc: HasAssoc t, t_assoc_i32: t_assoc.assoc == i32) = {
+            ty: Type,
+            ty_assoc: HasAssoc self.ty,
+            is_i32: self.ty_assoc.assoc == i32
+        } in
+        let Apply(t: Type) = {
+            output: fn(t: Type, t_assoc: HasAssoc t, t_assoc_i32: t_assoc.assoc == i32) -> OutputDict(t, t_assoc, t_assoc_i32),
+        } in
+
+        // impl Apply for Identity {
+        //     type Output<T: HasAssoc<Assoc = i32>> = T;
+        // }
+        let ImplApply: Apply Identity = make (Apply Identity) {
+            output = |t: Type, t_assoc: HasAssoc t, t_assoc_i32: t_assoc.assoc == i32| make (OutputDict(t, t_assoc, t_assoc_i32)) {
+                ty = t,
+                ty_assoc = t_assoc,
+                is_i32 = t_assoc_i32,
+            },
+        } in
+
+        // impl<A: Apply> HasAssoc for Dummy<A> {
+        //     type Assoc = <<A as Apply>::Output<Dummy<A>> as HasAssoc>::Assoc;
+        // }
+        let rec ImplAssoc(a: Type, a_apply: Apply a) -> HasAssoc (Dummy a) = make (HasAssoc (Dummy a)) {
+            assoc =
+                let rec output: Type = (a_apply.output(Dummy a, ImplAssoc(a, a_apply), output.is_i32)).assoc
+                in output,
+        } in
+
+        {=}
+    "));
+}
