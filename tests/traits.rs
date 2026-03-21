@@ -110,6 +110,7 @@ fn test_sound_traits2() {
 }
 
 #[test]
+#[should_panic(expected = "recursive mention under")]
 fn test_unsound_traits() {
     // Reproduce https://github.com/rust-lang/rust/issues/135246#issuecomment-4066328421
     let mut ctx = EvalContext::default();
@@ -186,6 +187,7 @@ fn test_unsound_traits() {
 }
 
 #[test]
+#[should_panic(expected = "recursive mention under")]
 fn test_unsound_traits2() {
     // Reproduce https://github.com/rust-lang/rust/issues/135246
     let mut ctx = EvalContext::default();
@@ -255,7 +257,29 @@ fn test_unsound_traits2() {
 }
 
 #[test]
-fn test_unsound_traits3() {
+fn magic_good() {
+    let mut ctx = EvalContext::default();
+    ctx.normalize(&p(r"
+        let rec Copy(t: Type) -> Type = {} in
+
+        let rec Magic(t: Type) -> Type = {
+            supertrait1: Copy t,
+            supertrait2: Copy t,
+        } in
+
+        // impl<T: Magic> Magic for T {}
+        let rec MagicImpl(t: Type, t_copy: Copy t) -> Magic t = make (Magic t) {
+            supertrait1 = t_copy,
+            supertrait2 = (MagicImpl t t_copy).supertrait1, // that's productive!
+        } in
+
+        {=}
+    "));
+}
+
+#[test]
+#[should_panic(expected = "recursive uses are not productive")]
+fn magic_bad1() {
     let mut ctx = EvalContext::default();
     ctx.normalize(&p(r"
         // trait Copy {}
@@ -276,20 +300,41 @@ fn test_unsound_traits3() {
 }
 
 #[test]
-fn test_sound_traits3() {
+fn magic_good2() {
     let mut ctx = EvalContext::default();
     ctx.normalize(&p(r"
-        let rec Copy(t: Type) -> Type = {} in
-
+        // trait Magic: Magic {}
         let rec Magic(t: Type) -> Type = {
-            supertrait1: Copy t,
-            supertrait2: Copy t,
+            also_magic: Magic t,
         } in
 
         // impl<T: Magic> Magic for T {}
-        let rec MagicImpl(t: Type, t_copy: Copy t) -> Magic t = make (Magic t) {
-            supertrait1 = t_copy,
-            supertrait2 = (MagicImpl t t_copy).supertrait1, // that's productive!
+        let rec MagicImpl(t: Type) -> Magic t = make (Magic t) {
+            also_magic = (MagicImpl t),
+        } in
+
+        {=}
+    "));
+}
+
+#[test]
+#[should_panic(expected = "recursive uses are not productive")]
+fn magic_bad2() {
+    let mut ctx = EvalContext::default();
+    ctx.normalize(&p(r"
+        // trait Copy {}
+        let rec Copy(t: Type) -> Type = {} in
+
+        // trait Magic: Copy + Magic {}
+        let rec Magic(t: Type) -> Type = {
+            supertrait: Copy t,
+            also_magic: Magic t,
+        } in
+
+        // impl<T: Magic> Magic for T {}
+        let rec MagicImpl(t: Type) -> Magic t = make (Magic t) {
+            also_magic = (MagicImpl t),
+            supertrait = (MagicImpl t).also_magic.supertrait,
         } in
 
         {=}

@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+enum-as-inner = "0.7.0"
 indexmap = "2.13.0"
+internment = "0.8.6"
 itertools = "0.14.0"
 nom = "8.0.0"
+petgraph = "0.8.3"
 ustr = "1.1.0"

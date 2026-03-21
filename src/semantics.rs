@@ -1,6 +1,15 @@
-use crate::*;
+use std::{
+    collections::{HashMap, VecDeque},
+    fmt::{Display, Write},
+};
+
+use enum_as_inner::EnumAsInner;
+use internment::Intern;
+use itertools::Itertools;
+use petgraph::{algo::toposort, prelude::DiGraphMap};
 use ustr::Ustr;
 
+use crate::*;
 use Expr::*;
 
 impl Expr {
@@ -92,10 +101,89 @@ impl Binding {
     }
 }
 
+/// Term constructors. Some of these have a corresponding destructor (e.g. field access destructs
+/// field construction), but not all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Constructor {
+    Pi,
+    Lambda,
+    StructTyField(Ustr),
+    StructField(Ustr),
+    EqLeft,
+    EqRight,
+    Refl,
+    TypeOf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, EnumAsInner)]
+enum ConstructorPath {
+    Empty,
+    Cons(Intern<(ConstructorPath, Constructor)>),
+}
+
+impl ConstructorPath {
+    fn new(ctors: impl IntoIterator<Item = Constructor>) -> Self {
+        ctors
+            .into_iter()
+            .fold(Self::Empty, |acc, c| Self::Cons(Intern::new((acc, c))))
+    }
+
+    fn concat(self, other: Self) -> Self {
+        other
+            .iter()
+            .fold(self, |acc, c| Self::Cons(Intern::new((acc, c))))
+    }
+
+    fn iter(&self) -> impl Iterator<Item = Constructor> {
+        self.iter_prefixes().map(|(_, c)| c)
+    }
+    fn iter_prefixes(&self) -> impl Iterator<Item = (Self, Constructor)> {
+        let mut elems = VecDeque::new();
+        let mut cur = *self;
+        while let Self::Cons(pair) = cur {
+            elems.push_front(*pair);
+            cur = pair.0;
+        }
+        elems.into_iter()
+    }
+    /// Iterates over all ways to split `self` into `(prefix, suffix)` such that
+    /// `prefix.concat(suffix) == self`. Yields `len + 1` pairs.
+    fn splits(&self) -> impl Iterator<Item = (Self, Self)> {
+        let mut splits = vec![(*self, Self::new([]))];
+        let mut ctors = VecDeque::new();
+        let mut cur = *self;
+        while let Self::Cons(pair) = cur {
+            let (prefix, ctor) = *pair;
+            ctors.push_front(ctor);
+            splits.push((prefix, Self::new(ctors.iter().copied())));
+            cur = prefix;
+        }
+        splits.into_iter()
+    }
+
+    fn display_on(&self, var: Variable) -> impl Display {
+        [var.to_string()]
+            .into_iter()
+            .chain(self.iter().map(|ctor| match ctor {
+                Constructor::Lambda | Constructor::Pi => "(_)".to_string(),
+                Constructor::StructField(f) | Constructor::StructTyField(f) => format!(".{f}"),
+                Constructor::TypeOf => format!(".value_of"),
+                Constructor::EqLeft => format!(".eq_left"),
+                Constructor::EqRight => format!(".eq_right"),
+                Constructor::Refl => format!(".refl_arg"),
+            }))
+            .format("")
+    }
+}
+
 /// Describes which sub-expression position we are in within the expression tree.
 /// One variant per nested `Expr` location inside an `Expr`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumAsInner)]
 pub enum PathElem {
+    /// We're inside the given destructor.
+    Construct(Constructor),
+    /// We applied a destructor corresponding to this constructor.
+    Destruct(Constructor),
     // Let / LetRec
     LetVal,
     LetTy,
@@ -105,27 +193,15 @@ pub enum PathElem {
     LetRecBody,
     // Pi / Lambda
     PiType,
-    PiBody,
     LambdaType,
-    LambdaBody,
     // App
-    AppFn,
     AppArg,
     // Struct / StructTy
     StructAnnot,
-    StructField(Ustr),
-    StructTyField(Ustr),
-    // Field
-    FieldBase,
     // Eq / Refl / Transport
-    EqArg,
-    ReflArg,
-    TransportEq,
     TransportFn,
     // Todo
     TodoArg,
-    // Whenever we traverse the type of a subexpression.
-    HigherTy,
 }
 
 #[derive(Debug, Default)]
@@ -135,6 +211,11 @@ pub struct EvalContext {
     /// The path through the initial expression to the subexpression we're in the process of
     /// typechecking.
     path: Vec<PathElem>,
+    /// For each `let rec val` we're inside of, compute a map of which constructor paths depend on
+    /// each other. If this has no cycles, progress is guaranteed.
+    /// A `x -> y` path in the graph means that we know the value of `val.x` to be `val.y`. At the
+    /// end, the lhs of edges will be all the subplaces of `val` that recursively depend on `val`.
+    progress_graphs: HashMap<Variable, DiGraphMap<ConstructorPath, ()>>,
 }
 
 impl EvalContext {
@@ -184,29 +265,73 @@ impl EvalContext {
     pub fn infer_type(&mut self, e: &Expr) -> Expr {
         let ty = match e {
             Var(x) => {
-                return self
+                let binding = self
                     .lookup_binding(*x)
-                    .expect(&format!("Failed to find variable {x}!"))
-                    .ty
-                    .clone();
+                    .expect(&format!("Failed to find variable {x}!"));
+                let binding_ty = binding.ty.clone();
+                if matches!(binding.kind, BindingKind::Nominal(..))
+                    && let mut subpath = self
+                        .path
+                        .iter()
+                        .copied()
+                        .skip_while(|e| !matches!(e, PathElem::LetRecVal(v) if v == x))
+                        .peekable()
+                    && subpath.next().is_some()
+                {
+                    // We're inside a `let rec` definition, and we found a recursive reference.
+                    let mut ctor_path = vec![];
+                    while let Some(ctor) = subpath.next_if_map(|e| e.into_construct()) {
+                        ctor_path.push(ctor);
+                    }
+
+                    let mut dtor_path = vec![];
+                    while let Some(ctor) = subpath.next_if_map(|e| e.into_destruct()) {
+                        dtor_path.push(ctor);
+                    }
+                    dtor_path.reverse();
+
+                    if let Some(pe) = subpath.next() {
+                        let path = self
+                            .path
+                            .iter()
+                            .skip_while(|e| !matches!(e, PathElem::LetRecVal(v) if v == x))
+                            .skip(1)
+                            .collect_vec();
+                        panic!(
+                            "failed to prove progress of {x}: \
+                            recursive mention under a {pe:?}\n  \
+                            full path: {path:?}"
+                        );
+                    } else {
+                        // Here, the path was a series of constructors followed by a series of
+                        // destructors. Iow, we're accessing the `dtor_path` projection of the
+                        // current value and putting the result inside `ctor_path`. We record that
+                        // dependency in the graph.
+                        let ctor_path = ConstructorPath::new(ctor_path);
+                        let dtor_path = ConstructorPath::new(dtor_path);
+                        let graph = self.progress_graphs.entry(*x).or_default();
+                        graph.add_edge(ctor_path, dtor_path, ());
+                    }
+                }
+                return binding_ty;
             }
             Type(k) => return Type(k + 1),
             Pi(x, t1, t2) => {
                 let k1 = self.infer_universe(PathElem::PiType, t1);
                 let k2 = self.with_binding_in_scope(*x, Binding::abstrakt(t1), |ctx| {
-                    ctx.infer_universe(PathElem::PiBody, t2)
+                    ctx.infer_universe(PathElem::Construct(Constructor::Pi), t2)
                 });
                 Type(k1.max(k2))
             }
             Lambda(x, t, e) => {
                 let _ = self.infer_universe(PathElem::LambdaType, t);
                 let te = self.with_binding_in_scope(*x, Binding::abstrakt(t), |ctx| {
-                    ctx.infer_type_inner(PathElem::LambdaBody, e)
+                    ctx.infer_type_inner(PathElem::Construct(Constructor::Lambda), e)
                 });
                 Pi(*x, t.clone(), __(te))
             }
             App(f, arg) => {
-                let f_ty = self.infer_type_inner(PathElem::AppFn, f);
+                let f_ty = self.infer_type_inner(PathElem::Destruct(Constructor::Lambda), f);
                 let Pi(x, s, t) = self.whnf_unfold(&f_ty) else {
                     panic!("Function expected.")
                 };
@@ -218,7 +343,10 @@ impl EvalContext {
                 let k = self.with_binding_in_scope(*x, Binding::abstrakt(e), |ctx| {
                     fields
                         .iter()
-                        .map(|(&f, t)| ctx.infer_universe(PathElem::StructTyField(f), t))
+                        .map(|(&f, t)| {
+                            let loc = PathElem::Construct(Constructor::StructTyField(f));
+                            ctx.infer_universe(loc, t)
+                        })
                         .max()
                         .unwrap_or(0)
                 });
@@ -227,7 +355,10 @@ impl EvalContext {
             Struct(None, fields) => {
                 let ty_fields = fields
                     .iter()
-                    .map(|(&n, e)| (n, self.infer_type_inner(PathElem::StructField(n), e)))
+                    .map(|(&n, e)| {
+                        let loc = PathElem::Construct(Constructor::StructField(n));
+                        (n, self.infer_type_inner(loc, e))
+                    })
                     .collect();
                 StructTy(Variable::user("self"), __(ty_fields))
             }
@@ -243,7 +374,8 @@ impl EvalContext {
                         .unwrap_or_else(|| panic!("Field {name} not found in type"))
                         .clone();
                     let expected = expected.subst1(self_var, e);
-                    let actual = self.infer_type_inner(PathElem::StructField(name), val);
+                    let loc = PathElem::Construct(Constructor::StructField(name));
+                    let actual = self.infer_type_inner(loc, val);
                     self.assert_equal(&expected, &actual);
                 }
                 (**ty).clone()
@@ -267,11 +399,46 @@ impl EvalContext {
                 return self.with_binding_in_scope(*x, binding, |ctx| {
                     let t1 = ctx.infer_type_inner(PathElem::LetRecVal(*x), e1);
                     ctx.assert_equal(ty, &t1);
+                    // Progress means that all the subplaces of our coinductive value can be
+                    // reduced to whnf. In the graph we have exactly which subplaces depend on
+                    // which other one, which is enough information to virtually check all possible
+                    // subplaces by looking for loops in a graph.
+                    let mut graph = ctx.progress_graphs.remove(x).unwrap_or_default();
+                    // If val.a = val.b and val.c = val.a.x, then we add val.c = val.b.x to the
+                    // graph.
+                    for (_, val) in graph.all_edges().map(|(p, v, ())| (p, v)).collect_vec() {
+                        for (prefix, suffix) in val.splits() {
+                            for prefix_val in graph.neighbors(prefix).collect_vec() {
+                                graph.add_edge(val, prefix_val.concat(suffix), ());
+                            }
+                        }
+                    }
+                    let mut s = String::new();
+                    for node in graph.nodes().sorted() {
+                        for neighbor in graph.neighbors(node).sorted() {
+                            let _ = writeln!(
+                                &mut s,
+                                "- {} <- {}",
+                                node.display_on(*x),
+                                neighbor.display_on(*x)
+                            );
+                        }
+                    }
+                    if toposort(&graph, None).is_err() {
+                        panic!(
+                            "failed to prove progress of {x}: \
+                            recursive uses are not productive.\n\
+                            dependency graph:\n{s}"
+                        );
+                    } else {
+                        eprintln!("dependency graph for {x}:\n{s}");
+                    }
                     ctx.infer_type_inner(PathElem::LetRecBody, e2)
                 });
             }
             Field(e, name) => {
-                let te = self.infer_type_inner(PathElem::FieldBase, e);
+                let loc = PathElem::Destruct(Constructor::StructField(*name));
+                let te = self.infer_type_inner(loc, e);
                 let te = self.whnf_unfold(&te);
                 let StructTy(self_var, fields) = te else {
                     panic!("Struct type expected for field access, got `{te}`")
@@ -283,18 +450,18 @@ impl EvalContext {
                 field_ty.subst1(self_var, e)
             }
             Eq(a, b) => {
-                let ta = self.infer_type_inner(PathElem::EqArg, a);
-                let tb = self.infer_type_inner(PathElem::EqArg, b);
+                let ta = self.infer_type_inner(PathElem::Construct(Constructor::EqLeft), a);
+                let tb = self.infer_type_inner(PathElem::Construct(Constructor::EqRight), b);
                 self.assert_equal(&ta, &tb);
-                let k = self.infer_universe(PathElem::HigherTy, &ta);
+                let k = self.infer_universe(PathElem::Destruct(Constructor::TypeOf), &ta);
                 Type(k)
             }
             Refl(a) => {
-                let _ = self.infer_type_inner(PathElem::ReflArg, a);
+                let _ = self.infer_type_inner(PathElem::Construct(Constructor::Refl), a);
                 Eq(a.clone(), a.clone())
             }
             Transport(eq, f) => {
-                let eq_ty = self.infer_type_inner(PathElem::TransportEq, eq);
+                let eq_ty = self.infer_type_inner(PathElem::Destruct(Constructor::Refl), eq);
                 let Eq(a, b) = self.whnf_unfold(&eq_ty) else {
                     panic!("Equality type expected for transport")
                 };
@@ -314,7 +481,7 @@ impl EvalContext {
             }
         };
         // Recursively check the type is well-formed.
-        let _ = self.infer_type_inner(PathElem::HigherTy, &ty);
+        let _ = self.infer_type_inner(PathElem::Destruct(Constructor::TypeOf), &ty);
         self.whnf(&ty)
     }
     fn infer_universe(&mut self, loc: PathElem, t: &Expr) -> usize {
