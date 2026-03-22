@@ -133,6 +133,12 @@ impl ConstructorPath {
             .into_iter()
             .fold(Self::Empty, |acc, c| Self::Cons(Intern::new((acc, c))))
     }
+    fn cons(self, c: Constructor) -> Self {
+        Self::Cons(Intern::new((self, c)))
+    }
+    fn push(&mut self, c: Constructor) {
+        *self = self.cons(c)
+    }
 
     fn concat(self, other: Self) -> Self {
         other
@@ -222,6 +228,10 @@ pub struct MentionPath {
     dtor_path: ConstructorPath,
 }
 
+/// The shape of a function: the exhaustive set of locations where the input variable is used in
+/// the function body. Used for progress checking.
+pub type FunctionShape = __<[MentionPath]>;
+
 impl MentionPath {
     /// The shape of the identity function: the variable is mentioned directly, with no
     /// projections nor constructors.
@@ -274,28 +284,29 @@ impl MentionPath {
     fn from_single_path<'a>(
         path: impl IntoIterator<Item = &'a PathElem> + Clone,
     ) -> Result<Self, (ConstructorPath, PathElem)> {
-        let mut path = path.into_iter().cloned().peekable();
-
-        let mut ctor_path = vec![];
-        while let Some(ctor) = path.next_if_map(|e| e.into_construct()) {
-            ctor_path.push(ctor);
-        }
+        let mut ctor_path = ConstructorPath::Empty;
         let mut dtor_path = vec![];
-        while let Some(ctor) = path.next_if_map(|e| e.into_destruct()) {
-            dtor_path.push(ctor);
+        for pe in path.into_iter().cloned() {
+            match pe {
+                PathElem::Construct(ctor) if dtor_path.is_empty() => {
+                    ctor_path.push(ctor);
+                }
+                PathElem::Construct(ctor) if dtor_path.last() == Some(&ctor) => {
+                    dtor_path.pop();
+                }
+                PathElem::Destruct(ctor) => {
+                    dtor_path.push(ctor);
+                }
+                _ => return Err((ctor_path, pe)),
+            }
         }
-        dtor_path.reverse();
 
-        let ctor_path = ConstructorPath::new(ctor_path);
+        dtor_path.reverse();
         let dtor_path = ConstructorPath::new(dtor_path);
-        if let Some(pe) = path.next() {
-            Err((ctor_path, pe))
-        } else {
-            Ok(Self {
-                ctor_path,
-                dtor_path,
-            })
-        }
+        Ok(Self {
+            ctor_path,
+            dtor_path,
+        })
     }
     fn to_path(self) -> impl Iterator<Item = PathElem> {
         let ctors = self.ctor_path.iter().map(PathElem::Construct);
@@ -333,7 +344,7 @@ pub enum PathElem {
     PiType,
     LambdaType,
     // Argument of a function application. If known, stores the shape of the function.
-    AppArg(Option<__<[MentionPath]>>),
+    AppArg(Option<FunctionShape>),
     // Struct / StructTy
     StructAnnot,
     // Eq / Refl / Transport
@@ -424,7 +435,8 @@ impl EvalContext {
                             .iter()
                             .any(|e| matches!(e, PathElem::LetRecVal(..)))
                         {
-                            // A let-binding may contain recursive mentions of a recursive variable.
+                            // A let-binding may contain recursive mentions of a recursive
+                            // variable, so we re-typecheck it here.
                             let _ = self.infer_type(&v);
                         }
                     }

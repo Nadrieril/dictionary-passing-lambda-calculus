@@ -6,7 +6,7 @@ use ustr::Ustr;
 
 use Expr::*;
 
-use crate::semantics::MentionPath;
+use crate::semantics::FunctionShape;
 
 pub type __<A> = Arc<A>;
 pub(crate) fn __<A>(a: A) -> Arc<A> {
@@ -53,7 +53,7 @@ pub enum Expr {
 
     /// Function type. The last argument records the exhaustive set of locations where the variable
     /// is used in the function body, if known.
-    Pi(Variable, __<Expr>, __<Expr>, Option<__<[MentionPath]>>),
+    Pi(Variable, __<Expr>, __<Expr>, Option<FunctionShape>),
     Lambda(Variable, __<Expr>, __<Expr>),
     App(__<Expr>, __<Expr>),
 

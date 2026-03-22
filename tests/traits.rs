@@ -364,6 +364,26 @@ fn magic_good2_external_knot() {
 }
 
 #[test]
+fn magic_good3() {
+    let mut ctx = EvalContext::default();
+    ctx.normalize(&p(r"
+        // trait Magic: Magic {}
+        let rec Magic(t: Type) -> Type = {
+            also_magic: Magic t,
+        } in
+
+        // impl<T> Magic for T {}
+        let rec MagicImpl(t: Type) -> Magic t = make (Magic t) {
+            also_magic =
+                let f(x: Magic t) -> { x: Magic t } = { x = x } in
+                f(MagicImpl t).x,
+        } in
+
+        {=}
+    "));
+}
+
+#[test]
 #[should_panic(expected = "recursive uses are not productive")]
 fn magic_bad2() {
     let mut ctx = EvalContext::default();
