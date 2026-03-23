@@ -48,7 +48,8 @@ pub enum Expr {
 
     /// `let x [: T] = e1 in e2`. Non-recursive.
     Let(Variable, Option<__<Expr>>, __<Expr>, __<Expr>),
-    /// `let rec x: T = e1 in e2`. Recursive and nominal binding.
+    /// `let rec x: T = e1 in e2`. A coinductive value, checked for productivity at type-checking
+    /// time.
     LetRec(Variable, __<Expr>, __<Expr>, __<Expr>),
 
     /// Function type. The last argument records the exhaustive set of locations where the variable

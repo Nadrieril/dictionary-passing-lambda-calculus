@@ -8,7 +8,7 @@ use enum_as_inner::EnumAsInner;
 use fallible_iterator::{FallibleIterator, IteratorExt};
 use internment::Intern;
 use itertools::{Either, Itertools};
-use petgraph::{algo::toposort, prelude::DiGraphMap};
+use petgraph::prelude::DiGraphMap;
 use ustr::Ustr;
 
 use crate::*;
@@ -580,20 +580,49 @@ impl EvalContext {
                 return self.with_binding_in_scope(*x, binding, |ctx| {
                     let t1 = ctx.infer_type_inner(PathElem::LetRecVal(*x), e1);
                     ctx.assert_equal(ty, &t1);
-                    // Progress means that all the subplaces of our coinductive value can be
-                    // reduced to whnf. In the graph we have exactly which subplaces depend on
-                    // which other one, which is enough information to virtually check all possible
-                    // subplaces by looking for loops in a graph.
-                    let mut graph = ctx.progress_graphs.remove(x).unwrap_or_default();
-                    // If val.a = val.b and val.c = val.a.x, then we add val.c = val.b.x to the
-                    // graph.
-                    for (_, val) in graph.all_edges().map(|(p, v, ())| (p, v)).collect_vec() {
-                        for (prefix, suffix) in val.splits() {
-                            for prefix_val in graph.neighbors(prefix).collect_vec() {
-                                graph.add_edge(val, prefix_val.concat(suffix), ());
-                            }
-                        }
-                    }
+                    // Progress means that all the subplaces (i.e. repeated destructor
+                    // applications) of our coinductive value can be reduced to whnf. In the graph
+                    // we computed which subplaces depend on which other ones.
+                    //
+                    // To be precise, we have that all the self-references of `val` on itself are
+                    // of the form val.path1.suffix = val.path2.suffix, where `path1 -> path2` is
+                    // in the graph. Call "suffix-extended graph" the graph where we added all the
+                    // `path1.suffix -> path2.suffix` edges. Note that a node has at more one
+                    // successor in either of these graphs.
+                    //
+                    // Claim: the expression is productive iff the suffix-extended graph has no
+                    // infinite paths.
+                    //
+                    // Proof: The only recursion in our language is this coinduction (well, except
+                    // dependent records, gotta fix that), and every binding in scope has been
+                    // checked to be productive. Hence if the current expression does not involve
+                    // `val`, it reduces to whnf. So wlog assume the current expression is of the
+                    // form `val.path` (`path` isn't just field accesses, see `ConstructorPath`).
+                    // Evaluating `val.path` involves evaluating all the `val.subpath` prefixes to
+                    // whnf, then evaluating the final projection. Wlog assume that the prefixes
+                    // reduced to whnf. Consider the expression we're left with. If it contains no
+                    // mention of `val`, per previous argument it evaluates; hence wlog it mentions
+                    // `val`. Per the property of our graph, `path` can be written `prefix.suffix`,
+                    // with `prefix -> next` in the graph. Per the property of the graph again,
+                    // evaluating `val.prefix` yields `val.next` (which may not be whnf yet), so
+                    // evaluating our initial `val.path` yields `val.next.suffix`, which must then
+                    // be tried for whnf again. In summary, we have: if `path` is in the
+                    // suffix-extended graph, evaluating `val.path` takes an edge in that graph. If
+                    // there is no edge, then we can reach whnf. So if `path` doesn't lead to an
+                    // infinite path, `val.path` has a whnf.
+                    let graph = ctx.progress_graphs.remove(x).unwrap_or_default();
+                    // Call `g` our graph and `G` the suffix-extended version of `g`. Now remains
+                    // the question of how to detect infinite paths in `G`. `g` has two important
+                    // properties: each node has at most one successor, and if a -> b then a.x is
+                    // not the source of an edge.
+                    //
+                    // Assume there's an infinite path in `G`. If none of the nodes on the path are
+                    // in `g`, it must be possible to shave a common suffix until one of them is.
+                    // From this wlog we can assume that the infinite path starts from a node in
+                    // `g`. We can therefore try all paths in `G` that start from a node in `g` and
+                    // detect infinite paths by looking at reused `g`-edges.
+
+                    // Print the graph for debugging.
                     let mut s = String::new();
                     for node in graph.nodes().sorted() {
                         for neighbor in graph.neighbors(node).sorted() {
@@ -605,14 +634,50 @@ impl EvalContext {
                             );
                         }
                     }
-                    if let Err(_cycle) = toposort(&graph, None) {
-                        panic!(
-                            "failed to prove progress of {x}: \
-                            recursive uses are not productive.\n\
-                            dependency graph:\n{s}"
-                        );
-                    } else {
-                        eprintln!("dependency graph for {x}:\n{s}");
+                    eprintln!("dependency graph for {x}:\n{s}");
+
+                    // Algorithm: start with a node of `g`, and take steps in `G` recording which
+                    // `g`-edges are used and with what suffix. If this reaches a node without
+                    // outgoing edges, all good. Otherwise we will eventually reuse the same
+                    // `g`-edge. Compare the suffixes used: if we're using a longer or equal suffix
+                    // than before that's an infinite path; if we're using a shorter one, all good.
+                    // Do this for every node of `g`. Total complexity: N*E.
+                    // Note: this "suffix shrinking" kinda assumes a single possible constructor.
+                    // Unsure if this might be forbidding legal finite paths but I think not.
+                    for start in graph.nodes().collect_vec() {
+                        let mut current = start;
+                        // For each g-edge (identified by its source) we've traversed, record the
+                        // suffix length we used.
+                        let mut used_edges: HashMap<ConstructorPath, usize> = HashMap::new();
+                        loop {
+                            // Find the unique split of `current` where the prefix is the source
+                            // of an edge in `g`. By the property "if a -> b then a.x is not a
+                            // source", at most one split matches.
+                            let step = current.splits().find_map(|(prefix, suffix)| {
+                                graph
+                                    .neighbors(prefix)
+                                    .next()
+                                    .map(|next| (prefix, suffix, next))
+                            });
+                            let Some((edge_src, suffix, next)) = step else {
+                                break; // No outgoing edge in G, all good.
+                            };
+                            let suffix_len = suffix.iter().count();
+                            if let Some(&prev_suffix_len) = used_edges.get(&edge_src) {
+                                if suffix_len >= prev_suffix_len {
+                                    // Suffix didn't shrink, infinite path detected.
+                                    panic!(
+                                        "failed to prove progress of {x}: \
+                                        recursive uses are not productive.\n\
+                                        dependency graph:\n{s}"
+                                    );
+                                } else {
+                                    break; // Suffix shrunk, will terminate.
+                                }
+                            }
+                            used_edges.insert(edge_src, suffix_len);
+                            current = next.concat(suffix);
+                        }
                     }
                     ctx.infer_type_inner(PathElem::LetRecBody, e2)
                 });
