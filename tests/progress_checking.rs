@@ -1,7 +1,5 @@
 use dictionary_passing_lambda_calculus::*;
 
-use Expr::*;
-
 fn p(s: &str) -> Expr {
     parse(s).unwrap()
 }
@@ -28,7 +26,7 @@ fn magic_good() {
 }
 
 #[test]
-#[should_panic(expected = "recursive uses are not productive")]
+#[should_panic(expected = "depends on itself")]
 fn cycle() {
     let mut ctx = EvalContext::default();
     ctx.normalize(&p(r"
@@ -50,7 +48,7 @@ fn cycle() {
 }
 
 #[test]
-#[should_panic(expected = "recursive uses are not productive")]
+#[should_panic(expected = "depends on itself")]
 fn cycle_through_let() {
     let mut ctx = EvalContext::default();
     ctx.normalize(&p(r"
@@ -72,7 +70,7 @@ fn cycle_through_let() {
 }
 
 #[test]
-#[should_panic(expected = "recursive uses are not productive")]
+#[should_panic(expected = "depends on itself")]
 fn cycle_more_complicated() {
     let mut ctx = EvalContext::default();
     ctx.normalize(&p(r"
@@ -96,7 +94,7 @@ fn cycle_more_complicated() {
 }
 
 #[test]
-#[should_panic(expected = "recursive uses are not productive")]
+#[should_panic(expected = "depends on itself")]
 fn cycle_mutual_recursion() {
     let mut ctx = EvalContext::default();
     ctx.normalize(&p(r"
@@ -192,7 +190,7 @@ fn decreasing_chain_through_function_call() {
 }
 
 #[test]
-#[should_panic(expected = "recursive uses are not productive")]
+#[should_panic(expected = "leads to a diverging cycle")]
 fn infinite_chain() {
     let mut ctx = EvalContext::default();
     ctx.normalize(&p(r"
@@ -229,7 +227,7 @@ fn finite_chain_reuses_edge() {
 }
 
 #[test]
-#[should_panic(expected = "recursive uses are not productive")]
+#[should_panic(expected = "depends on itself")]
 fn cycle_alternate_suffixes() {
     let mut ctx = EvalContext::default();
     ctx.normalize(&p(r"
@@ -251,7 +249,7 @@ fn cycle_alternate_suffixes() {
 }
 
 #[test]
-#[should_panic(expected = "recursive uses are not productive")]
+#[should_panic(expected = "depends on itself")]
 fn cycle_proves_cant_truncate() {
     // Proves we can't just truncate the graph to the size of the largest node.
     let mut ctx = EvalContext::default();
@@ -275,7 +273,7 @@ fn cycle_proves_cant_truncate() {
 }
 
 #[test]
-#[should_panic(expected = "recursive uses are not productive")]
+#[should_panic(expected = "leads to a diverging cycle")]
 fn infinite_chain_alternate_suffixes() {
     let mut ctx = EvalContext::default();
     ctx.normalize(&p(r"
@@ -299,7 +297,7 @@ fn infinite_chain_alternate_suffixes() {
 }
 
 #[test]
-#[should_panic(expected = "recursive uses are not productive")]
+#[should_panic(expected = "leads to a diverging cycle")]
 fn infinite_chain_no_increasing_suffix() {
     let mut ctx = EvalContext::default();
     ctx.normalize(&p(r"

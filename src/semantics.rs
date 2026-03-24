@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
     fmt::{Debug, Display, Write},
 };
@@ -124,26 +124,45 @@ pub enum Constructor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, EnumAsInner)]
 enum ConstructorPath {
     Empty,
-    Cons(Intern<(ConstructorPath, Constructor)>),
+    // The `usize` is the length of this path.
+    Cons(Intern<(ConstructorPath, Constructor, usize)>),
 }
 
 impl ConstructorPath {
     fn new(ctors: impl IntoIterator<Item = Constructor>) -> Self {
-        ctors
-            .into_iter()
-            .fold(Self::Empty, |acc, c| Self::Cons(Intern::new((acc, c))))
+        ctors.into_iter().fold(Self::Empty, |acc, c| acc.cons(c))
     }
     fn cons(self, c: Constructor) -> Self {
-        Self::Cons(Intern::new((self, c)))
+        Self::Cons(Intern::new((self, c, self.len() + 1)))
     }
     fn push(&mut self, c: Constructor) {
         *self = self.cons(c)
     }
 
     fn concat(self, other: Self) -> Self {
-        other
-            .iter()
-            .fold(self, |acc, c| Self::Cons(Intern::new((acc, c))))
+        other.iter().fold(self, |acc, c| acc.cons(c))
+    }
+
+    fn len(self) -> usize {
+        match self {
+            ConstructorPath::Empty => 0,
+            ConstructorPath::Cons(intern) => intern.2,
+        }
+    }
+    /// Return the prefix of size `n` of `self`, or `None` if `self` is too small.
+    fn truncate(self, n: usize) -> Option<Self> {
+        if self.len() >= n {
+            Some(if self.len() > n {
+                self.iter_prefixes()
+                    .map(|(p, _)| p)
+                    .find(|p| p.len() == n)
+                    .unwrap()
+            } else {
+                self
+            })
+        } else {
+            None
+        }
     }
 
     fn iter(self) -> impl Iterator<Item = Constructor> {
@@ -152,21 +171,17 @@ impl ConstructorPath {
     fn iter_prefixes(self) -> impl Iterator<Item = (Self, Constructor)> {
         let mut elems = VecDeque::new();
         let mut cur = self;
-        while let Self::Cons(pair) = cur {
-            elems.push_front(*pair);
-            cur = pair.0;
+        while let Self::Cons(intern) = cur {
+            let (prefix, ctor, _) = *intern;
+            elems.push_front((prefix, ctor));
+            cur = prefix;
         }
         elems.into_iter()
     }
-    /// Whether `self` starts with `prefix`, i.e. `self == prefix.concat(something)`.
-    fn starts_with(self, prefix: Self) -> bool {
-        self == prefix || self.iter_prefixes().any(|(p, _)| p == prefix)
-    }
-
     fn rev_iter(self) -> impl Iterator<Item = Constructor> {
         let mut cur = self;
         std::iter::from_fn(move || {
-            let (prefix, ctor) = **cur.as_cons()?;
+            let (prefix, ctor, _) = **cur.as_cons()?;
             cur = prefix;
             Some(ctor)
         })
@@ -177,8 +192,8 @@ impl ConstructorPath {
         let mut splits = vec![(*self, Self::new([]))];
         let mut ctors = VecDeque::new();
         let mut cur = *self;
-        while let Self::Cons(pair) = cur {
-            let (prefix, ctor) = *pair;
+        while let Self::Cons(intern) = cur {
+            let (prefix, ctor, _) = *intern;
             ctors.push_front(ctor);
             splits.push((prefix, Self::new(ctors.iter().copied())));
             cur = prefix;
@@ -576,14 +591,14 @@ impl EvalContext {
                     ctx.infer_type(e2)
                 });
             }
-            LetRec(x, ty, e1, e2) => {
+            LetRec(var, ty, e1, e2) => {
                 let _ = self.infer_universe(PathElem::LetRecTy, ty);
-                // Push x with value immediately so it can reduce during its own typechecking
+                // Push `var` with value immediately so it can reduce during its own typechecking
                 // (needed for self-referential types like `Trait` whose fields reference `Trait`
                 // applied to args). Marked nominal so whnf doesn't unfold it.
                 let binding = Binding::nominal(e1, ty);
-                return self.with_binding_in_scope(*x, binding, |ctx| {
-                    let t1 = ctx.infer_type_inner(PathElem::LetRecVal(*x), e1);
+                return self.with_binding_in_scope(*var, binding, |ctx| {
+                    let t1 = ctx.infer_type_inner(PathElem::LetRecVal(*var), e1);
                     ctx.assert_equal(ty, &t1);
                     // Progress means that all the subplaces (i.e. repeated destructor
                     // applications) of our coinductive value can be reduced to whnf. In the graph
@@ -630,51 +645,40 @@ impl EvalContext {
                     // evaluating `val.path` takes an edge in that graph. If there is no edge, then
                     // we can reach whnf. So if `path` doesn't lead to an infinite path, `val.path`
                     // has a whnf.
-                    let graph = ctx.progress_graphs.remove(x).unwrap_or_default();
-                    // Let `W(n)` denote the walk starting from node `n`. Let `W(n).s` denote that
-                    // same walk but with suffix `s` added to every node.
+                    let graph = ctx.progress_graphs.remove(var).unwrap_or_default();
+                    // We'll use the results from "Object-Oriented Data as Prefix Rewriting Systems"
+                    // (http://old.math.nsc.ru/LBRT/g2/files/OOD_as_PRS.pdf) .
+                    //
+                    // The walk in `G` is a deterministic longest-prefix rewriting system: each
+                    // g-edge `src -> tgt` is a rewrite rule that replaces prefix `src` with `tgt`,
+                    // carrying the suffix unchanged. By the anti-chain property longest-prefix =
+                    // unique-prefix matching. Hence we can use the results from the paper.
                     //
                     // Lemma: `W(n.s)` starts with `W(n).s`.
-                    // Proof: By construction of `G`, all the edges taken in `W(n).s` are valid for
-                    // `W(n.s)`. We conclude by determinism of walks in `G`.
+                    // Proof: All edges taken in `W(n).s` are valid for `W(n.s)` by construction
+                    // of `G`. We conclude by determinism.
                     //
-                    // Lemma: If the last node of `W(n)` is not the prefix of a node in `g`, then
-                    // `W(n.s) = W(n).s` for any `s`.
-                    // Proof: The only way for `W(n.s)` to progress further than `W(n).s` is if the
-                    // last node of `W(n).s` can take an edge that `W(n)` couldn't, hence there's
-                    // some `s'` such that the last node of `W(n).s'` is in `g`.
+                    // Corollary: If there is an infinite path, then there is one starting from a
+                    // node of `g`.
+                    // Proof sketch: Any walk can be decomposed as `W(m).s` where `W(m)` contains
+                    // a g-node. An infinite walk implies `W(m)` is infinite (or extends to one).
+                    // See Gutman, "OOD as PRS", Theorem 7.
                     //
-                    // Lemma: Let `W(n)` be a walk in `G`. `n` can be written `m.s` such that `W(n)
-                    // = W(m).s` and at least one node of `W(m)` is in `g`.
-                    // Proof: We inductively construct `s`: if `W(n)` contains a node in `g`, we're
-                    // done. Otherwise write `n = m.s` where `s` has length 1. By the previous
-                    // lemmas, `W(m).s` is a prefix of `W(n)`. The last node `p` of `W(m)` is a
-                    // prefix of a node in `g` iff `p.s` is in `g` or the prefix of a node in `g`.
-                    // `p.s` is in `W(n)` hence not in `g`. If it's the prefix of a node in `g`
-                    // then it must also be the last node of `W(n)`. Either way `W(m.s) = W(m).s`
-                    // and we continue the induction with `W(m)`.
+                    // Theorem (Gutman, Theorem 22): Let `μ = max |src|` over all g-edges. A word
+                    // `X` is infinitely rewritable iff one of:
+                    // (a) Pure cycle: `X(n) = X(n+r)` for some `n ≥ 0`, `r > 0`.
+                    // (b) Growing cycle: there exist `n ≥ 0`, `r > 0` such that
+                    //     `μ ≤ |X(n)| ≤ ... ≤ |X(n+r)|`, and
+                    //     `X(n)↾μ = X(n+r)↾μ` (the μ-length prefix repeats).
+                    //     In this case `X(n+kr) = Y.R^k.S` for fixed `Y`, `R`, `S`.
                     //
-                    // Corollary: If there is an infinite path, then there is an infinite path that
-                    // starts with a node of `g`.
-                    // Proof: Assume there's an infinite path. By previous lemma we can wlog
-                    // assume it contains a node `n` of `g`. By determinism, `W(n)` is infinite
-                    // too and concludes the proof.
+                    // By the corollary and Theorem 7 of Gutman, it suffices to check only the
+                    // paths starting from nodes in `g`.
                     //
-                    // Let `n` be a node in `g`. Define `f(n, s)` to be, if it exists, the first
-                    // `t` such that `n.t` is in `W(n.s)`.
-                    //
-                    // Lemma: If `f(n, s)` is defined and `W(n.s)` is infinite, `f(n, s.x) = f(n,
-                    // s).x` for any `x`.
-                    // Proof: `W(n.s.x)` starts with `W(n.s).x` by the lemma, and the latter is
-                    // infinite, so they're equal.
-                    //
-                    // What I know: every infinite path has at least one `(n, s)` such that `f(n,
-                    // s)` is defined. If ever `f(n, s) >= s` then we have an infinite path. Is
-                    // that a sufficient condition?
-                    //
-                    // Conjecture: A path is infinite iff it has a node `n.s` with `f(n, s) >= s`.
-                    //
-                    // Conjecture: An infinite path eventually repeats modulo suffixes.
+                    // Algorithm (Gutman, Algorithm 24): Compute the rewriting sequence from each
+                    // g-node. At each step, check for conditions (a) and (b). Guaranteed to
+                    // terminate: pure cycles are detected within C^μ short-word states; growing
+                    // cycles are detected when the μ-prefix repeats with non-decreasing lengths.
 
                     // Print the graph for debugging.
                     let mut s = String::new();
@@ -683,55 +687,64 @@ impl EvalContext {
                             let _ = writeln!(
                                 &mut s,
                                 "- {} <- {}",
-                                node.display_on(*x),
-                                neighbor.display_on(*x)
+                                node.display_on(*var),
+                                neighbor.display_on(*var)
                             );
                         }
                     }
-                    eprintln!("dependency graph for {x}:\n{s}");
+                    eprintln!("dependency graph for {var}:\n{s}");
 
-                    // Algorithm: start with a node of `g`, and take steps in `G` recording which
-                    // `g`-edges are used and with what suffix. If this reaches a node without
-                    // outgoing edges, all good. Otherwise we will eventually reuse the same
-                    // `g`-edge. Compare the suffixes used: if an old suffix is a prefix of (or
-                    // equal to) the new suffix, that's an infinite path. Otherwise keep going;
-                    // since there are finitely many constructors, this cannot go on infinitely
-                    // without hitting our infinite path detection case.
-                    // Do this for every node of `g`. Total complexity: N*E² probably.
-                    for start in graph.nodes().collect_vec() {
+                    // μ = max length of any g-source.
+                    let mu = graph
+                        .nodes()
+                        .filter(|n| graph.neighbors(*n).next().is_some())
+                        .map(|n| n.len())
+                        .max()
+                        .unwrap_or(0);
+
+                    for start in graph.nodes() {
+                        // The nodes we've seen.
+                        let mut seen: HashSet<ConstructorPath> = [start].into();
+                        // For the last section of the path that is increasing in length and longer
+                        // than μ, keep the truncated-to-length-μ version of each node.
+                        let mut increasing_path: HashSet<ConstructorPath> =
+                            start.truncate(mu).into_iter().collect();
                         let mut current = start;
-                        // For each g-edge (identified by its source) we've traversed, record the
-                        // last suffix we used.
-                        let mut used_edges: HashMap<ConstructorPath, ConstructorPath> =
-                            HashMap::new();
                         loop {
-                            // Find the unique split of `current` where the prefix is the source
-                            // of an edge in `g`. By the property "if a -> b then a.x is not a
-                            // source", at most one split matches.
+                            // One rewriting step: find the unique source that's a prefix of
+                            // `current` and replace it with the target.
                             let step = current.splits().find_map(|(prefix, suffix)| {
                                 graph
                                     .neighbors(prefix)
                                     .next()
-                                    .map(|next| (prefix, suffix, next))
+                                    .map(|next| next.concat(suffix))
                             });
-                            let Some((edge_src, suffix, next)) = step else {
-                                break; // No outgoing edge in G, all good.
+                            let Some(next) = step else {
+                                break; // Not rewritable, walk terminates.
                             };
-                            if let Some(&prev_suffix) = used_edges.get(&edge_src) {
-                                if suffix.starts_with(prev_suffix) {
-                                    // The old suffix is a prefix of the new one — infinite path.
+
+                            if !seen.insert(next) {
+                                panic!(
+                                    "failed to prove progress of {var}: \
+                                    `{}` depends on itself",
+                                    next.display_on(*var)
+                                );
+                            }
+
+                            if let Some(next_trunc) = next.truncate(mu)
+                                && current.len() <= next.len()
+                            {
+                                if !increasing_path.insert(next_trunc) {
                                     panic!(
-                                        "failed to prove progress of {x}: \
-                                        recursive uses are not productive.\n\
-                                        dependency graph:\n{s}"
+                                        "failed to prove progress of {var}: \
+                                        {} leads to a diverging cycle",
+                                        current.display_on(*var)
                                     );
                                 }
-                                // Otherwise keep going; finitely many constructors means we'll
-                                // eventually hit the detection case or terminate.
                             } else {
-                                used_edges.insert(edge_src, suffix);
+                                increasing_path.clear();
                             }
-                            current = next.concat(suffix);
+                            current = next;
                         }
                     }
                     ctx.infer_type_inner(PathElem::LetRecBody, e2)
