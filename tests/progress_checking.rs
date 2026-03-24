@@ -1,5 +1,7 @@
 use dictionary_passing_lambda_calculus::*;
 
+use Expr::*;
+
 fn p(s: &str) -> Expr {
     parse(s).unwrap()
 }
@@ -200,6 +202,116 @@ fn infinite_chain() {
 
         let rec MagicImpl(t: Type) -> Magic t = make (Magic t) {
             also_magic = (MagicImpl t).also_magic.also_magic,
+        } in
+
+        {=}
+    "));
+}
+
+#[test]
+fn finite_chain_reuses_edge() {
+    let mut ctx = EvalContext::default();
+    ctx.normalize(&p(r"
+        let N = {} in
+        let ty = {
+            a: N,
+            b: { x: N, y: N },
+            c: { x: N, y: N },
+        } in
+        let rec val: ty = {
+            a = val.b.x,
+            b = val.c, // this edge gets used twice
+            c = { x = val.b.y, y = {=} },
+        } in
+
+        {=}
+    "));
+}
+
+#[test]
+#[should_panic(expected = "recursive uses are not productive")]
+fn cycle_alternate_suffixes() {
+    let mut ctx = EvalContext::default();
+    ctx.normalize(&p(r"
+        let N = {} in
+        let ty = {
+            a: { x: N, y: N },
+            b: { x: N, y: N },
+        } in
+        let rec val: ty = {
+            a = val.b,
+            b = {
+                x = val.a.y,
+                y = val.a.x,
+            },
+        } in
+
+        {=}
+    "));
+}
+
+#[test]
+#[should_panic(expected = "recursive uses are not productive")]
+fn cycle_proves_cant_truncate() {
+    // Proves we can't just truncate the graph to the size of the largest node.
+    let mut ctx = EvalContext::default();
+    ctx.normalize(&p(r"
+        let N = {} in
+        let ty = {
+            a: N,
+            b: { y: N },
+            c: { x: { y: N } },
+            d: { y: N },
+        } in
+        let rec val: ty = {
+            a = val.b.y,
+            b = val.c.x,
+            c = { x = val.d },
+            d = { y = val.a },
+        } in
+
+        {=}
+    "));
+}
+
+#[test]
+#[should_panic(expected = "recursive uses are not productive")]
+fn infinite_chain_alternate_suffixes() {
+    let mut ctx = EvalContext::default();
+    ctx.normalize(&p(r"
+        let N = {} in
+        let rec b_ty: Type(0) = { x: b_ty, y: b_ty, c: b_ty } in
+        let ty = {
+            a: b_ty,
+            b: b_ty,
+        } in
+        let rec val: ty = {
+            a = val.b,
+            b = make (b_ty) {
+                x = val.a.y,
+                y = val.a.x.c,
+                c = val.a.x,
+            },
+        } in
+
+        {=}
+    "));
+}
+
+#[test]
+#[should_panic(expected = "recursive uses are not productive")]
+fn infinite_chain_no_increasing_suffix() {
+    let mut ctx = EvalContext::default();
+    ctx.normalize(&p(r"
+        let N = {} in
+        let rec b_ty: Type(0) = { x: N, c: b_ty } in
+        let ty = {
+            a: N,
+            b: b_ty,
+        } in
+        let rec val: ty = {
+            a = val.b.x,
+            b = val.b.c,
         } in
 
         {=}

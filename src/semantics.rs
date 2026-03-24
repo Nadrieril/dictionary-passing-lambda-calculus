@@ -158,6 +158,11 @@ impl ConstructorPath {
         }
         elems.into_iter()
     }
+    /// Whether `self` starts with `prefix`, i.e. `self == prefix.concat(something)`.
+    fn starts_with(self, prefix: Self) -> bool {
+        self == prefix || self.iter_prefixes().any(|(p, _)| p == prefix)
+    }
+
     fn rev_iter(self) -> impl Iterator<Item = Constructor> {
         let mut cur = self;
         std::iter::from_fn(move || {
@@ -584,14 +589,31 @@ impl EvalContext {
                     // applications) of our coinductive value can be reduced to whnf. In the graph
                     // we computed which subplaces depend on which other ones.
                     //
-                    // To be precise, we have that all the self-references of `val` on itself are
-                    // of the form val.path1.suffix = val.path2.suffix, where `path1 -> path2` is
-                    // in the graph. Call "suffix-extended graph" the graph where we added all the
-                    // `path1.suffix -> path2.suffix` edges. Note that a node has at more one
-                    // successor in either of these graphs.
+                    // Call `g` our graph. Its nodes are constructor paths (that's not just field
+                    // accesses, see `ConstructorPath`), and there's an edge `n -> m` if we could
+                    // determine that `val.n` evaluates to `val.m` in finite steps.
                     //
-                    // Claim: the expression is productive iff the suffix-extended graph has no
-                    // infinite paths.
+                    // Build an infinite graph `G` as follows:
+                    // for every `n` in `g` and suffix `s`, `n.s` is a node in `G`; `G` has an edge
+                    // `n -> m` whenever `n = n'.s`, `m = m'.s`, and `n' -> m'` in `g`.
+                    //
+                    // The core property of our graph is that all the self-references of `val` on
+                    // itself are of the form `val.path1 = val.path2`, where `path1 -> path2` is an
+                    // edge in `G`.
+                    //
+                    // `g` has one more important property: if a -> b in `g` then a.x is not the
+                    // source of another edge for any `x` even empty (iow, sources form an
+                    // anti-chain under prefix ordering). This is equivalent to the statement that
+                    // walking through `G` is deterministic, and that evaluation is deterministic.
+                    //
+                    // Lemma: If `n -> m` in `G`, then `val.n` evaluates to `val.m` in a finite
+                    // number of steps.
+                    // Proof: By construction, let `n = n'.s`, `m = m'.s` such that `n' -> m'` is
+                    // an edge in `g`. From how we built `g`, evaluating `val.n'` gives `val.m'` in
+                    // finite steps; adding extra projections on top doesn't change anything since
+                    // we evaluate the subexpressions first.
+                    //
+                    // Claim: the expression is productive iff `G` has no infinite paths.
                     //
                     // Proof: The only recursion in our language is this coinduction (well, except
                     // dependent records, gotta fix that), and every binding in scope has been
@@ -602,25 +624,57 @@ impl EvalContext {
                     // whnf, then evaluating the final projection. Wlog assume that the prefixes
                     // reduced to whnf. Consider the expression we're left with. If it contains no
                     // mention of `val`, per previous argument it evaluates; hence wlog it mentions
-                    // `val`. Per the property of our graph, `path` can be written `prefix.suffix`,
-                    // with `prefix -> next` in the graph. Per the property of the graph again,
-                    // evaluating `val.prefix` yields `val.next` (which may not be whnf yet), so
-                    // evaluating our initial `val.path` yields `val.next.suffix`, which must then
-                    // be tried for whnf again. In summary, we have: if `path` is in the
-                    // suffix-extended graph, evaluating `val.path` takes an edge in that graph. If
-                    // there is no edge, then we can reach whnf. So if `path` doesn't lead to an
-                    // infinite path, `val.path` has a whnf.
+                    // `val`. Per the property of our graph, `G` has an edge `path -> next`, and
+                    // per the lemma evaluating `val.path` gives `val.next`, which must then be
+                    // tried for whnf again. In summary, we have: if `path` is in the `G`,
+                    // evaluating `val.path` takes an edge in that graph. If there is no edge, then
+                    // we can reach whnf. So if `path` doesn't lead to an infinite path, `val.path`
+                    // has a whnf.
                     let graph = ctx.progress_graphs.remove(x).unwrap_or_default();
-                    // Call `g` our graph and `G` the suffix-extended version of `g`. Now remains
-                    // the question of how to detect infinite paths in `G`. `g` has two important
-                    // properties: each node has at most one successor, and if a -> b then a.x is
-                    // not the source of an edge.
+                    // Let `W(n)` denote the walk starting from node `n`. Let `W(n).s` denote that
+                    // same walk but with suffix `s` added to every node.
                     //
-                    // Assume there's an infinite path in `G`. If none of the nodes on the path are
-                    // in `g`, it must be possible to shave a common suffix until one of them is.
-                    // From this wlog we can assume that the infinite path starts from a node in
-                    // `g`. We can therefore try all paths in `G` that start from a node in `g` and
-                    // detect infinite paths by looking at reused `g`-edges.
+                    // Lemma: `W(n.s)` starts with `W(n).s`.
+                    // Proof: By construction of `G`, all the edges taken in `W(n).s` are valid for
+                    // `W(n.s)`. We conclude by determinism of walks in `G`.
+                    //
+                    // Lemma: If the last node of `W(n)` is not the prefix of a node in `g`, then
+                    // `W(n.s) = W(n).s` for any `s`.
+                    // Proof: The only way for `W(n.s)` to progress further than `W(n).s` is if the
+                    // last node of `W(n).s` can take an edge that `W(n)` couldn't, hence there's
+                    // some `s'` such that the last node of `W(n).s'` is in `g`.
+                    //
+                    // Lemma: Let `W(n)` be a walk in `G`. `n` can be written `m.s` such that `W(n)
+                    // = W(m).s` and at least one node of `W(m)` is in `g`.
+                    // Proof: We inductively construct `s`: if `W(n)` contains a node in `g`, we're
+                    // done. Otherwise write `n = m.s` where `s` has length 1. By the previous
+                    // lemmas, `W(m).s` is a prefix of `W(n)`. The last node `p` of `W(m)` is a
+                    // prefix of a node in `g` iff `p.s` is in `g` or the prefix of a node in `g`.
+                    // `p.s` is in `W(n)` hence not in `g`. If it's the prefix of a node in `g`
+                    // then it must also be the last node of `W(n)`. Either way `W(m.s) = W(m).s`
+                    // and we continue the induction with `W(m)`.
+                    //
+                    // Corollary: If there is an infinite path, then there is an infinite path that
+                    // starts with a node of `g`.
+                    // Proof: Assume there's an infinite path. By previous lemma we can wlog
+                    // assume it contains a node `n` of `g`. By determinism, `W(n)` is infinite
+                    // too and concludes the proof.
+                    //
+                    // Let `n` be a node in `g`. Define `f(n, s)` to be, if it exists, the first
+                    // `t` such that `n.t` is in `W(n.s)`.
+                    //
+                    // Lemma: If `f(n, s)` is defined and `W(n.s)` is infinite, `f(n, s.x) = f(n,
+                    // s).x` for any `x`.
+                    // Proof: `W(n.s.x)` starts with `W(n.s).x` by the lemma, and the latter is
+                    // infinite, so they're equal.
+                    //
+                    // What I know: every infinite path has at least one `(n, s)` such that `f(n,
+                    // s)` is defined. If ever `f(n, s) >= s` then we have an infinite path. Is
+                    // that a sufficient condition?
+                    //
+                    // Conjecture: A path is infinite iff it has a node `n.s` with `f(n, s) >= s`.
+                    //
+                    // Conjecture: An infinite path eventually repeats modulo suffixes.
 
                     // Print the graph for debugging.
                     let mut s = String::new();
@@ -639,16 +693,17 @@ impl EvalContext {
                     // Algorithm: start with a node of `g`, and take steps in `G` recording which
                     // `g`-edges are used and with what suffix. If this reaches a node without
                     // outgoing edges, all good. Otherwise we will eventually reuse the same
-                    // `g`-edge. Compare the suffixes used: if we're using a longer or equal suffix
-                    // than before that's an infinite path; if we're using a shorter one, all good.
-                    // Do this for every node of `g`. Total complexity: N*E.
-                    // Note: this "suffix shrinking" kinda assumes a single possible constructor.
-                    // Unsure if this might be forbidding legal finite paths but I think not.
+                    // `g`-edge. Compare the suffixes used: if an old suffix is a prefix of (or
+                    // equal to) the new suffix, that's an infinite path. Otherwise keep going;
+                    // since there are finitely many constructors, this cannot go on infinitely
+                    // without hitting our infinite path detection case.
+                    // Do this for every node of `g`. Total complexity: N*E² probably.
                     for start in graph.nodes().collect_vec() {
                         let mut current = start;
                         // For each g-edge (identified by its source) we've traversed, record the
-                        // suffix length we used.
-                        let mut used_edges: HashMap<ConstructorPath, usize> = HashMap::new();
+                        // last suffix we used.
+                        let mut used_edges: HashMap<ConstructorPath, ConstructorPath> =
+                            HashMap::new();
                         loop {
                             // Find the unique split of `current` where the prefix is the source
                             // of an edge in `g`. By the property "if a -> b then a.x is not a
@@ -662,20 +717,20 @@ impl EvalContext {
                             let Some((edge_src, suffix, next)) = step else {
                                 break; // No outgoing edge in G, all good.
                             };
-                            let suffix_len = suffix.iter().count();
-                            if let Some(&prev_suffix_len) = used_edges.get(&edge_src) {
-                                if suffix_len >= prev_suffix_len {
-                                    // Suffix didn't shrink, infinite path detected.
+                            if let Some(&prev_suffix) = used_edges.get(&edge_src) {
+                                if suffix.starts_with(prev_suffix) {
+                                    // The old suffix is a prefix of the new one — infinite path.
                                     panic!(
                                         "failed to prove progress of {x}: \
                                         recursive uses are not productive.\n\
                                         dependency graph:\n{s}"
                                     );
-                                } else {
-                                    break; // Suffix shrunk, will terminate.
                                 }
+                                // Otherwise keep going; finitely many constructors means we'll
+                                // eventually hit the detection case or terminate.
+                            } else {
+                                used_edges.insert(edge_src, suffix);
                             }
-                            used_edges.insert(edge_src, suffix_len);
                             current = next.concat(suffix);
                         }
                     }
