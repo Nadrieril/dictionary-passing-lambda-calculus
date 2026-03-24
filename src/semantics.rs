@@ -1,14 +1,13 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
-    fmt::{Debug, Display, Write},
+    fmt::{Debug, Display},
 };
 
 use enum_as_inner::EnumAsInner;
 use fallible_iterator::{FallibleIterator, IteratorExt};
 use internment::Intern;
 use itertools::{Either, Itertools};
-use petgraph::prelude::DiGraphMap;
 use ustr::Ustr;
 
 use crate::*;
@@ -346,6 +345,172 @@ impl Debug for MentionPath {
     }
 }
 
+/// Records the dependency map of constructor paths of a given coinductive value.
+/// A `x -> y` path in the graph means that we know the value of `val.x` to be `val.y`. At the
+/// end, the lhs of edges will be all the subplaces of `val` that recursively depend on `val`.
+#[derive(Debug)]
+struct ProgressGraph {
+    variable: Variable,
+    nodes: HashSet<ConstructorPath>,
+    next: HashMap<ConstructorPath, ConstructorPath>,
+}
+
+impl ProgressGraph {
+    fn new(variable: Variable) -> Self {
+        Self {
+            variable,
+            nodes: Default::default(),
+            next: Default::default(),
+        }
+    }
+
+    fn insert(&mut self, mention: MentionPath) {
+        self.nodes.insert(mention.ctor_path);
+        self.nodes.insert(mention.dtor_path);
+        self.next.insert(mention.ctor_path, mention.dtor_path);
+    }
+
+    fn check_progress(&self) {
+        // Progress means that all the subplaces (i.e. repeated destructor applications) of our
+        // coinductive value can be reduced to whnf. In the graph we computed which subplaces
+        // depend on which other ones.
+        //
+        // Call `g` our graph. Its nodes are constructor paths (that's not just field accesses, see
+        // `ConstructorPath`), and there's an edge `n -> m` if we could determine that `val.n`
+        // evaluates to `val.m` in finite steps.
+        //
+        // Build an infinite graph `G` as follows: for every `n` in `g` and suffix `s`, `n.s` is a
+        // node in `G`; `G` has an edge `n -> m` whenever `n = n'.s`, `m = m'.s`, and `n' -> m'` in
+        // `g`.
+        //
+        // The core property of our graph is that all the self-references of `val` on itself are of
+        // the form `val.path1 = val.path2`, where `path1 -> path2` is an edge in `G`.
+        //
+        // `g` has one more important property: if a -> b in `g` then a.x is not the source of
+        // another edge for any `x` even empty (iow, sources form an anti-chain under prefix
+        // ordering). This is equivalent to the statement that walking through `G` is
+        // deterministic, and that evaluation is deterministic.
+        //
+        // Lemma: If `n -> m` in `G`, then `val.n` evaluates to `val.m` in a finite number of
+        // steps.
+        // Proof: By construction, let `n = n'.s`, `m = m'.s` such that `n' -> m'` is an edge in
+        // `g`. From how we built `g`, evaluating `val.n'` gives `val.m'` in finite steps; adding
+        // extra projections on top doesn't change anything since we evaluate the subexpressions
+        // first.
+        //
+        // Claim: the expression is productive iff `G` has no infinite paths.
+        //
+        // Proof: The only recursion in our language is this coinduction (well, except dependent
+        // records, gotta fix that), and every binding in scope has been checked to be productive.
+        // Hence if the current expression does not involve `val`, it reduces to whnf. So wlog
+        // assume the current expression is of the form `val.path` (`path` isn't just field
+        // accesses, see `ConstructorPath`). Evaluating `val.path` involves evaluating all the
+        // `val.subpath` prefixes to whnf, then evaluating the final projection. Wlog assume that
+        // the prefixes reduced to whnf. Consider the expression we're left with. If it contains no
+        // mention of `val`, per previous argument it evaluates; hence wlog it mentions `val`. Per
+        // the property of our graph, `G` has an edge `path -> next`, and per the lemma evaluating
+        // `val.path` gives `val.next`, which must then be tried for whnf again. In summary, we
+        // have: if `path` is in the `G`, evaluating `val.path` takes an edge in that graph. If
+        // there is no edge, then we can reach whnf. So if `path` doesn't lead to an infinite path,
+        // `val.path` has a whnf.
+        //
+        // We'll use the results from "Object-Oriented Data as Prefix Rewriting Systems"
+        // (http://old.math.nsc.ru/LBRT/g2/files/OOD_as_PRS.pdf) .
+        //
+        // The walk in `G` is a deterministic longest-prefix rewriting system: each g-edge `src ->
+        // tgt` is a rewrite rule that replaces prefix `src` with `tgt`, carrying the suffix
+        // unchanged. By the anti-chain property longest-prefix = unique-prefix matching. Hence we
+        // can use the results from the paper.
+        //
+        // Lemma: `W(n.s)` starts with `W(n).s`.
+        // Proof: All edges taken in `W(n).s` are valid for `W(n.s)` by construction of `G`. We
+        // conclude by determinism.
+        //
+        // Corollary: If there is an infinite path, then there is one starting from a node of `g`.
+        // Proof sketch: Any walk can be decomposed as `W(m).s` where `W(m)` contains a g-node. An
+        // infinite walk implies `W(m)` is infinite (or extends to one).
+        // See Gutman, "OOD as PRS", Theorem 7.
+        //
+        // Theorem (Gutman, Theorem 22): Let `μ = max |src|` over all g-edges. A word
+        // `X` is infinitely rewritable iff one of:
+        // (a) Pure cycle: `X(n) = X(n+r)` for some `n ≥ 0`, `r > 0`.
+        // (b) Growing cycle: there exist `n ≥ 0`, `r > 0` such that
+        //     `μ ≤ |X(n)| ≤ ... ≤ |X(n+r)|`, and
+        //     `X(n)↾μ = X(n+r)↾μ` (the μ-length prefix repeats).
+        //     In this case `X(n+kr) = Y.R^k.S` for fixed `Y`, `R`, `S`.
+        //
+        // By the corollary and Theorem 7 of Gutman, it suffices to check only the paths starting
+        // from nodes in `g`.
+        //
+        // Algorithm (Gutman, Algorithm 24): Compute the rewriting sequence from each g-node. At
+        // each step, check for conditions (a) and (b). Guaranteed to terminate: pure cycles are
+        // detected within C^μ short-word states; growing cycles are detected when the μ-prefix
+        // repeats with non-decreasing lengths.
+        let var = self.variable;
+        // μ = max length of any g-source.
+        let mu = self.next.keys().map(|n| n.len()).max().unwrap_or(0);
+
+        for &start in &self.nodes {
+            // The nodes we've seen.
+            let mut seen: HashSet<ConstructorPath> = [start].into();
+            // For the last section of the path that is increasing in length and longer
+            // than μ, keep the truncated-to-length-μ version of each node.
+            let mut increasing_path: HashSet<ConstructorPath> =
+                start.truncate(mu).into_iter().collect();
+            let mut current = start;
+            loop {
+                // One rewriting step: find the unique source that's a prefix of
+                // `current` and replace it with the target.
+                let step = current.splits().find_map(|(prefix, suffix)| {
+                    self.next.get(&prefix).map(|next| next.concat(suffix))
+                });
+                let Some(next) = step else {
+                    break; // Not rewritable, walk terminates.
+                };
+
+                if !seen.insert(next) {
+                    panic!(
+                        "failed to prove progress of {var}: \
+                        `{}` depends on itself",
+                        next.display_on(var)
+                    );
+                }
+
+                if let Some(next_trunc) = next.truncate(mu)
+                    && current.len() <= next.len()
+                {
+                    if !increasing_path.insert(next_trunc) {
+                        panic!(
+                            "failed to prove progress of {var}: \
+                            {} leads to a diverging cycle",
+                            current.display_on(var)
+                        );
+                    }
+                } else {
+                    increasing_path.clear();
+                }
+                current = next;
+            }
+        }
+    }
+}
+
+impl Display for ProgressGraph {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for node in self.nodes.iter().sorted() {
+            for neighbor in self.next.get(node).iter().sorted() {
+                writeln!(
+                    f,
+                    "- {} <- {}",
+                    node.display_on(self.variable),
+                    neighbor.display_on(self.variable)
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Describes which sub-expression position we are in within the expression tree.
 /// One variant per nested `Expr` location inside an `Expr`.
 #[derive(Debug, Clone, PartialEq, Eq, EnumAsInner)]
@@ -381,10 +546,8 @@ pub struct EvalContext {
     /// typechecking.
     path: Vec<PathElem>,
     /// For each `let rec val` we're inside of, compute a map of which constructor paths depend on
-    /// each other. If this has no cycles, progress is guaranteed.
-    /// A `x -> y` path in the graph means that we know the value of `val.x` to be `val.y`. At the
-    /// end, the lhs of edges will be all the subplaces of `val` that recursively depend on `val`.
-    progress_graphs: HashMap<Variable, DiGraphMap<ConstructorPath, ()>>,
+    /// each other. We use this to compute progress.
+    progress_graphs: HashMap<Variable, ProgressGraph>,
 }
 
 impl EvalContext {
@@ -473,16 +636,13 @@ impl EvalContext {
                                 Ok(mention_paths) => {
                                     // We can handle all the paths from the start of the `let rec` to here;
                                     // add them to the graph.
+                                    let graph = self.progress_graphs.get_mut(x).unwrap();
                                     for mention_path in mention_paths {
-                                        let graph = self.progress_graphs.entry(*x).or_default();
-                                        graph.add_edge(
-                                            mention_path.ctor_path,
-                                            mention_path.dtor_path,
-                                            (),
-                                        );
+                                        graph.insert(mention_path);
                                     }
                                 }
                                 Err((ctor_path, pe)) => {
+                                    // Some paths are of a shape we can't handle; error.
                                     panic!(
                                         "failed to prove progress of {x}: \
                                         recursive mention found under a {pe:?}\n  \
@@ -598,155 +758,14 @@ impl EvalContext {
                 // applied to args). Marked nominal so whnf doesn't unfold it.
                 let binding = Binding::nominal(e1, ty);
                 return self.with_binding_in_scope(*var, binding, |ctx| {
+                    ctx.progress_graphs.insert(*var, ProgressGraph::new(*var));
                     let t1 = ctx.infer_type_inner(PathElem::LetRecVal(*var), e1);
                     ctx.assert_equal(ty, &t1);
-                    // Progress means that all the subplaces (i.e. repeated destructor
-                    // applications) of our coinductive value can be reduced to whnf. In the graph
-                    // we computed which subplaces depend on which other ones.
-                    //
-                    // Call `g` our graph. Its nodes are constructor paths (that's not just field
-                    // accesses, see `ConstructorPath`), and there's an edge `n -> m` if we could
-                    // determine that `val.n` evaluates to `val.m` in finite steps.
-                    //
-                    // Build an infinite graph `G` as follows:
-                    // for every `n` in `g` and suffix `s`, `n.s` is a node in `G`; `G` has an edge
-                    // `n -> m` whenever `n = n'.s`, `m = m'.s`, and `n' -> m'` in `g`.
-                    //
-                    // The core property of our graph is that all the self-references of `val` on
-                    // itself are of the form `val.path1 = val.path2`, where `path1 -> path2` is an
-                    // edge in `G`.
-                    //
-                    // `g` has one more important property: if a -> b in `g` then a.x is not the
-                    // source of another edge for any `x` even empty (iow, sources form an
-                    // anti-chain under prefix ordering). This is equivalent to the statement that
-                    // walking through `G` is deterministic, and that evaluation is deterministic.
-                    //
-                    // Lemma: If `n -> m` in `G`, then `val.n` evaluates to `val.m` in a finite
-                    // number of steps.
-                    // Proof: By construction, let `n = n'.s`, `m = m'.s` such that `n' -> m'` is
-                    // an edge in `g`. From how we built `g`, evaluating `val.n'` gives `val.m'` in
-                    // finite steps; adding extra projections on top doesn't change anything since
-                    // we evaluate the subexpressions first.
-                    //
-                    // Claim: the expression is productive iff `G` has no infinite paths.
-                    //
-                    // Proof: The only recursion in our language is this coinduction (well, except
-                    // dependent records, gotta fix that), and every binding in scope has been
-                    // checked to be productive. Hence if the current expression does not involve
-                    // `val`, it reduces to whnf. So wlog assume the current expression is of the
-                    // form `val.path` (`path` isn't just field accesses, see `ConstructorPath`).
-                    // Evaluating `val.path` involves evaluating all the `val.subpath` prefixes to
-                    // whnf, then evaluating the final projection. Wlog assume that the prefixes
-                    // reduced to whnf. Consider the expression we're left with. If it contains no
-                    // mention of `val`, per previous argument it evaluates; hence wlog it mentions
-                    // `val`. Per the property of our graph, `G` has an edge `path -> next`, and
-                    // per the lemma evaluating `val.path` gives `val.next`, which must then be
-                    // tried for whnf again. In summary, we have: if `path` is in the `G`,
-                    // evaluating `val.path` takes an edge in that graph. If there is no edge, then
-                    // we can reach whnf. So if `path` doesn't lead to an infinite path, `val.path`
-                    // has a whnf.
-                    let graph = ctx.progress_graphs.remove(var).unwrap_or_default();
-                    // We'll use the results from "Object-Oriented Data as Prefix Rewriting Systems"
-                    // (http://old.math.nsc.ru/LBRT/g2/files/OOD_as_PRS.pdf) .
-                    //
-                    // The walk in `G` is a deterministic longest-prefix rewriting system: each
-                    // g-edge `src -> tgt` is a rewrite rule that replaces prefix `src` with `tgt`,
-                    // carrying the suffix unchanged. By the anti-chain property longest-prefix =
-                    // unique-prefix matching. Hence we can use the results from the paper.
-                    //
-                    // Lemma: `W(n.s)` starts with `W(n).s`.
-                    // Proof: All edges taken in `W(n).s` are valid for `W(n.s)` by construction
-                    // of `G`. We conclude by determinism.
-                    //
-                    // Corollary: If there is an infinite path, then there is one starting from a
-                    // node of `g`.
-                    // Proof sketch: Any walk can be decomposed as `W(m).s` where `W(m)` contains
-                    // a g-node. An infinite walk implies `W(m)` is infinite (or extends to one).
-                    // See Gutman, "OOD as PRS", Theorem 7.
-                    //
-                    // Theorem (Gutman, Theorem 22): Let `μ = max |src|` over all g-edges. A word
-                    // `X` is infinitely rewritable iff one of:
-                    // (a) Pure cycle: `X(n) = X(n+r)` for some `n ≥ 0`, `r > 0`.
-                    // (b) Growing cycle: there exist `n ≥ 0`, `r > 0` such that
-                    //     `μ ≤ |X(n)| ≤ ... ≤ |X(n+r)|`, and
-                    //     `X(n)↾μ = X(n+r)↾μ` (the μ-length prefix repeats).
-                    //     In this case `X(n+kr) = Y.R^k.S` for fixed `Y`, `R`, `S`.
-                    //
-                    // By the corollary and Theorem 7 of Gutman, it suffices to check only the
-                    // paths starting from nodes in `g`.
-                    //
-                    // Algorithm (Gutman, Algorithm 24): Compute the rewriting sequence from each
-                    // g-node. At each step, check for conditions (a) and (b). Guaranteed to
-                    // terminate: pure cycles are detected within C^μ short-word states; growing
-                    // cycles are detected when the μ-prefix repeats with non-decreasing lengths.
 
-                    // Print the graph for debugging.
-                    let mut s = String::new();
-                    for node in graph.nodes().sorted() {
-                        for neighbor in graph.neighbors(node).sorted() {
-                            let _ = writeln!(
-                                &mut s,
-                                "- {} <- {}",
-                                node.display_on(*var),
-                                neighbor.display_on(*var)
-                            );
-                        }
-                    }
-                    eprintln!("dependency graph for {var}:\n{s}");
+                    let graph = ctx.progress_graphs.remove(var).unwrap();
+                    eprintln!("dependency graph for {var}:\n{graph}");
+                    graph.check_progress();
 
-                    // μ = max length of any g-source.
-                    let mu = graph
-                        .nodes()
-                        .filter(|n| graph.neighbors(*n).next().is_some())
-                        .map(|n| n.len())
-                        .max()
-                        .unwrap_or(0);
-
-                    for start in graph.nodes() {
-                        // The nodes we've seen.
-                        let mut seen: HashSet<ConstructorPath> = [start].into();
-                        // For the last section of the path that is increasing in length and longer
-                        // than μ, keep the truncated-to-length-μ version of each node.
-                        let mut increasing_path: HashSet<ConstructorPath> =
-                            start.truncate(mu).into_iter().collect();
-                        let mut current = start;
-                        loop {
-                            // One rewriting step: find the unique source that's a prefix of
-                            // `current` and replace it with the target.
-                            let step = current.splits().find_map(|(prefix, suffix)| {
-                                graph
-                                    .neighbors(prefix)
-                                    .next()
-                                    .map(|next| next.concat(suffix))
-                            });
-                            let Some(next) = step else {
-                                break; // Not rewritable, walk terminates.
-                            };
-
-                            if !seen.insert(next) {
-                                panic!(
-                                    "failed to prove progress of {var}: \
-                                    `{}` depends on itself",
-                                    next.display_on(*var)
-                                );
-                            }
-
-                            if let Some(next_trunc) = next.truncate(mu)
-                                && current.len() <= next.len()
-                            {
-                                if !increasing_path.insert(next_trunc) {
-                                    panic!(
-                                        "failed to prove progress of {var}: \
-                                        {} leads to a diverging cycle",
-                                        current.display_on(*var)
-                                    );
-                                }
-                            } else {
-                                increasing_path.clear();
-                            }
-                            current = next;
-                        }
-                    }
                     ctx.infer_type_inner(PathElem::LetRecBody, e2)
                 });
             }
