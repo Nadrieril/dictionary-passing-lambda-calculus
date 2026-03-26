@@ -597,7 +597,10 @@ impl EvalContext {
     /// Returns the expression with type annotation added.
     fn typecheck_inner(&mut self, loc: SubExprLocation, e: &Expr) -> Expr {
         self.path.push(loc);
-        let e = self.typecheck(e);
+        if self.path.len() > 500 {
+            panic!("overflow encountered while typechecking")
+        }
+        let e = ensure_sufficient_stack(|| self.typecheck(e));
         self.path.pop();
         e
     }
@@ -1017,4 +1020,20 @@ impl EvalContext {
             _ => false,
         }
     }
+}
+
+/// Grows the stack on demand to prevent stack overflow. Call this in strategic locations to "break
+/// up" recursive calls.
+#[inline]
+fn ensure_sufficient_stack<R>(f: impl FnOnce() -> R) -> R {
+    // This is the amount of bytes that need to be left on the stack before increasing the size. It
+    // must be at least as large as the stack required by any code that does not call
+    // `ensure_sufficient_stack`.
+    const RED_ZONE: usize = 100 * 1024; // 100k
+
+    // Only the first stack that is pushed, grows exponentially (2^n * STACK_PER_RECURSION) from then
+    // on. Values taken from rustc.
+    const STACK_PER_RECURSION: usize = 1024 * 1024; // 1MB
+
+    stacker::maybe_grow(RED_ZONE, STACK_PER_RECURSION, f)
 }

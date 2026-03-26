@@ -311,3 +311,23 @@ fn funky() {
         {=}
     "));
 }
+
+#[test]
+#[should_panic(expected = "overflow")]
+fn non_orderable_gats() {
+    let mut ctx = EvalContext::default();
+    ctx.typecheck(&p(r"
+        let Bound(t: Type) = {} in
+
+        // trait Trait {
+        //   type Foo<T: Bound<Self::Bar<T>>>;
+        //   type Bar<T: Bound<Self::Foo<T>>>;
+        // }
+        let Trait(s: Type) = {
+            foo: fn(t: Type, t_bound: Bound(self.bar(t))) -> Type,
+            bar: fn(t: Type, t_bound: Bound(self.foo(t))) -> Type,
+        } in
+
+        {=}
+    "));
+}
