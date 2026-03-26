@@ -1,5 +1,5 @@
-use crate::Expr::{self, *};
-use crate::{__, Fields, Variable};
+use crate::ExprKind::*;
+use crate::{__, Expr, Fields, Variable};
 use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_while};
@@ -162,18 +162,16 @@ fn parse_params(input: &str) -> IResult<'_, Vec<(Variable, Expr)>> {
 
 /// Wrap a return type in nested Pi types for each parameter.
 fn wrap_pi(params: &[(Variable, Expr)], ret: Expr) -> Expr {
-    params
-        .iter()
-        .rev()
-        .fold(ret, |acc, (x, t)| Pi(*x, __(t.clone()), __(acc), None))
+    params.iter().rev().fold(ret, |acc, (x, t)| {
+        Pi(*x, __(t.clone()), __(acc), None).into_expr()
+    })
 }
 
 /// Wrap a body in nested lambdas for each parameter.
 fn wrap_lambda(params: &[(Variable, Expr)], body: Expr) -> Expr {
-    params
-        .iter()
-        .rev()
-        .fold(body, |acc, (x, t)| Lambda(*x, __(t.clone()), __(acc)))
+    params.iter().rev().fold(body, |acc, (x, t)| {
+        Lambda(*x, __(t.clone()), __(acc)).into_expr()
+    })
 }
 
 /// `Type(n)` or `Type` (shorthand for `Type(0)`)
@@ -182,7 +180,7 @@ fn parse_type(input: &str) -> IResult<'_, Expr> {
         keyword("Type"),
         opt(delimited(ws(nom_char('(')), ws(digit1), ws(nom_char(')')))),
     )
-    .map(|digits: Option<&str>| Type(digits.map_or(0, |d| d.parse::<usize>().unwrap())))
+    .map(|digits: Option<&str>| Type(digits.map_or(0, |d| d.parse::<usize>().unwrap())).into_expr())
     .parse(input)
 }
 
@@ -214,7 +212,7 @@ fn parse_pi(input: &str) -> IResult<'_, Expr> {
                 delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
                 preceded(ws(tag("->")), parse_expr),
             )
-                .map(|(t, e)| Pi(Variable::anon(), __(t), __(e), None)),
+                .map(|(t, e)| Pi(Variable::anon(), __(t), __(e), None).into_expr()),
         )),
     )
     .parse(input)
@@ -229,16 +227,17 @@ fn parse_struct(input: &str) -> IResult<'_, Expr> {
     alt((
         // {=} — empty struct value
         (ws(nom_char('{')), ws(nom_char('=')), ws(nom_char('}')))
-            .map(|_| Struct(None, Fields::default())),
+            .map(|_| Struct(None, Fields::default()).into_expr()),
         // { a = e, ... } — struct value
-        comma_list('{', '}', field_val).map(|fields| Struct(None, fields_from_vec(fields))),
+        comma_list('{', '}', field_val)
+            .map(|fields| Struct(None, fields_from_vec(fields)).into_expr()),
         // { a: T, ... } or {} — struct type
         delimited(
             ws(nom_char('{')),
             separated_list0(ws(nom_char(',')), field_ty),
             (opt(ws(nom_char(','))), ws(nom_char('}'))),
         )
-        .map(|fields| StructTy(Variable::user("self"), fields_from_vec(fields))),
+        .map(|fields| StructTy(Variable::user("self"), fields_from_vec(fields)).into_expr()),
     ))
     .parse(input)
 }
@@ -249,7 +248,7 @@ fn parse_atom(input: &str) -> IResult<'_, Expr> {
         parse_type,
         parse_make,
         parse_struct,
-        variable.map(Var),
+        variable.map(|v| Var(v).into_expr()),
         delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
     ))
     .parse(input)
@@ -281,10 +280,10 @@ fn parse_postfix(input: &str) -> IResult<'_, Expr> {
     (parse_atom, many0(parse_postfix_op))
         .map(|(init, ops)| {
             ops.into_iter().fold(init, |acc, op| match op {
-                PostfixOp::Field(name) => Field(__(acc), name),
-                PostfixOp::Call(args) => {
-                    args.into_iter().fold(acc, |acc, arg| App(__(acc), __(arg)))
-                }
+                PostfixOp::Field(name) => Field(__(acc), name).into_expr(),
+                PostfixOp::Call(args) => args
+                    .into_iter()
+                    .fold(acc, |acc, arg| App(__(acc), __(arg)).into_expr()),
             })
         })
         .parse(input)
@@ -298,7 +297,7 @@ fn parse_app(input: &str) -> IResult<'_, Expr> {
     (head, many0(parse_postfix))
         .map(|(first, rest)| {
             rest.into_iter()
-                .fold(first, |acc, arg| App(__(acc), __(arg)))
+                .fold(first, |acc, arg| App(__(acc), __(arg)).into_expr())
         })
         .parse(input)
 }
@@ -316,28 +315,28 @@ fn parse_make(input: &str) -> IResult<'_, Expr> {
             comma_list('{', '}', field_val).map(fields_from_vec),
         )),
     )
-        .map(|(ty, fields)| Struct(Some(__(ty)), fields))
+        .map(|(ty, fields)| Struct(Some(__(ty)), fields).into_expr())
         .parse(input)
 }
 
 /// `refl e`
 fn parse_refl(input: &str) -> IResult<'_, Expr> {
     preceded(keyword("refl"), parse_postfix)
-        .map(|e| Refl(__(e)))
+        .map(|e| Refl(__(e)).into_expr())
         .parse(input)
 }
 
 /// `todo ty`
 fn parse_todo(input: &str) -> IResult<'_, Expr> {
     preceded(keyword("todo"), parse_postfix)
-        .map(|t| Todo(__(t)))
+        .map(|t| Todo(__(t)).into_expr())
         .parse(input)
 }
 
 /// `transport eq f`
 fn parse_transport(input: &str) -> IResult<'_, Expr> {
     preceded(keyword("transport"), (parse_postfix, parse_postfix))
-        .map(|(eq, f)| Transport(__(eq), __(f)))
+        .map(|(eq, f)| Transport(__(eq), __(f)).into_expr())
         .parse(input)
 }
 
@@ -346,7 +345,7 @@ fn parse_transport(input: &str) -> IResult<'_, Expr> {
 fn parse_arrow(input: &str) -> IResult<'_, Expr> {
     (parse_eq, opt(preceded(ws(tag("->")), cut(parse_arrow))))
         .map(|(lhs, rhs)| match rhs {
-            Some(rhs) => Pi(Variable::anon(), __(lhs), __(rhs), None),
+            Some(rhs) => Pi(Variable::anon(), __(lhs), __(rhs), None).into_expr(),
             None => lhs,
         })
         .parse(input)
@@ -356,7 +355,7 @@ fn parse_arrow(input: &str) -> IResult<'_, Expr> {
 fn parse_eq(input: &str) -> IResult<'_, Expr> {
     (parse_app, opt(preceded(ws(tag("==")), cut(parse_app))))
         .map(|(lhs, rhs)| match rhs {
-            Some(rhs) => Eq(__(lhs), __(rhs)),
+            Some(rhs) => Eq(__(lhs), __(rhs)).into_expr(),
             None => lhs,
         })
         .parse(input)
@@ -391,15 +390,17 @@ fn parse_let(input: &str) -> IResult<'_, Expr> {
                     let ty = __(wrap_pi(&params, ret));
                     let body = __(wrap_lambda(&params, body));
                     if is_rec {
-                        LetRec(name, ty, body, __(rest))
+                        LetRec(name, ty, body, __(rest)).into_expr()
                     } else {
-                        Let(name, Some(ty), body, __(rest))
+                        Let(name, Some(ty), body, __(rest)).into_expr()
                     }
                 })
                 .parse(input)
         } else if !is_rec {
             parse_eq_body_in
-                .map(|(body, rest)| Let(name, None, __(wrap_lambda(&params, body)), __(rest)))
+                .map(|(body, rest)| {
+                    Let(name, None, __(wrap_lambda(&params, body)), __(rest)).into_expr()
+                })
                 .parse(input)
         } else {
             // No return type: let f(params) = body in rest
@@ -413,9 +414,9 @@ fn parse_let(input: &str) -> IResult<'_, Expr> {
         cut((parse_expr, parse_eq_body_in))
             .map(|(ty, (e1, e2))| {
                 if is_rec {
-                    LetRec(name, __(ty), __(e1), __(e2))
+                    LetRec(name, __(ty), __(e1), __(e2)).into_expr()
                 } else {
-                    Let(name, Some(__(ty)), __(e1), __(e2))
+                    Let(name, Some(__(ty)), __(e1), __(e2)).into_expr()
                 }
             })
             .parse(input)
@@ -428,7 +429,7 @@ fn parse_let(input: &str) -> IResult<'_, Expr> {
             )))
         } else {
             parse_eq_body_in
-                .map(|(e1, e2)| Let(name, None, __(e1), __(e2)))
+                .map(|(e1, e2)| Let(name, None, __(e1), __(e2)).into_expr())
                 .parse(input)
         }
     }

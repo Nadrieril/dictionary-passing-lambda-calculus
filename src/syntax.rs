@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use indexmap::IndexMap;
 use ustr::Ustr;
 
-use Expr::*;
+use ExprKind::*;
 
 use crate::semantics::FunctionShape;
 
@@ -42,7 +42,7 @@ impl Variable {
 }
 
 #[derive(Clone, Debug)]
-pub enum Expr {
+pub enum ExprKind {
     Var(Variable),
     Type(usize),
 
@@ -73,6 +73,13 @@ pub enum Expr {
     Todo(__<Expr>),
 }
 
+/// An expression, optionally annotated with its inferred type.
+#[derive(Clone, Debug)]
+pub struct Expr {
+    pub kind: ExprKind,
+    pub ty: Option<__<Expr>>,
+}
+
 pub trait ExprMapper {
     fn map_expr(&mut self, e: &Expr) -> Expr;
 
@@ -101,9 +108,13 @@ pub trait ExprMapper {
 }
 
 impl Expr {
+    pub fn kind(&self) -> &ExprKind {
+        &self.kind
+    }
+
     /// Apply a transformation to all direct subexpressions of this expression.
     pub fn map(&self, v: &mut impl ExprMapper) -> Self {
-        match self {
+        let new_kind = match self.kind() {
             Var(x) => Var(*x),
             Type(k) => Type(*k),
             App(e1, e2) => App(__(v.map_expr(e1)), __(v.map_expr(e2))),
@@ -142,8 +153,9 @@ impl Expr {
             ),
             StructTy(x, fields) => {
                 let mut x = *x;
-                let fields =
-                    v.under_recursive_abstraction(&mut x, self, |ctx| ctx.map_fields(&fields));
+                let self_expr = self.clone();
+                let fields = v
+                    .under_recursive_abstraction(&mut x, &self_expr, |ctx| ctx.map_fields(&fields));
                 StructTy(x, fields)
             }
             Field(e, name) => Field(__(v.map_expr(e)), *name),
@@ -151,6 +163,20 @@ impl Expr {
             Refl(a) => Refl(__(v.map_expr(a))),
             Transport(eq, f) => Transport(__(v.map_expr(eq)), __(v.map_expr(f))),
             Todo(t) => Todo(__(v.map_expr(t))),
+        };
+        let new_ty = self.ty.as_ref().map(|ty| __(v.map_expr(ty)));
+        Expr {
+            kind: new_kind,
+            ty: new_ty,
+        }
+    }
+}
+
+impl ExprKind {
+    pub fn into_expr(self) -> Expr {
+        Expr {
+            kind: self,
+            ty: None,
         }
     }
 }

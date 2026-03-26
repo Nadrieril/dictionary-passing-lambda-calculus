@@ -3,8 +3,8 @@ use std::fmt;
 use indexmap::IndexMap;
 use ustr::Ustr;
 
-use crate::Expr::{self, *};
-use crate::Variable;
+use crate::ExprKind::*;
+use crate::{Expr, Variable};
 
 impl fmt::Display for Variable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -17,7 +17,7 @@ impl fmt::Display for Variable {
 
 impl Expr {
     fn fmt_prec(&self, f: &mut fmt::Formatter<'_>, prec: usize) -> fmt::Result {
-        match self {
+        match self.kind() {
             Var(x) => write!(f, "{x}"),
             Type(0) => write!(f, "Type"),
             Type(k) => write!(f, "Type({k})"),
@@ -41,7 +41,7 @@ impl Expr {
                 write!(f, "fn({x}: ")?;
                 t.fmt_prec(f, 0)?;
                 let mut inner: &Expr = e;
-                while let Pi(x2, t2, e2, _) = inner
+                while let Pi(x2, t2, e2, _) = inner.kind()
                     && *x2 != Variable::anon()
                 {
                     write!(f, ", {x2}: ")?;
@@ -62,7 +62,7 @@ impl Expr {
                 write!(f, "|{x}: ")?;
                 t.fmt_prec(f, 0)?;
                 let mut inner: &Expr = e;
-                while let Lambda(x2, t2, e2) = inner {
+                while let Lambda(x2, t2, e2) = inner.kind() {
                     write!(f, ", {x2}: ")?;
                     t2.fmt_prec(f, 0)?;
                     inner = e2;
@@ -164,7 +164,7 @@ impl Expr {
 /// Returns (params, inner_body).
 fn peel_lambda(mut e: &Expr) -> (Vec<(Variable, &Expr)>, &Expr) {
     let mut params = Vec::new();
-    while let Lambda(x, t, body) = e {
+    while let Lambda(x, t, body) = e.kind() {
         params.push((*x, &**t));
         e = body;
     }
@@ -179,7 +179,7 @@ fn peel_fun_sugar<'a>(
 ) -> (Vec<(Variable, &'a Expr)>, &'a Expr, &'a Expr) {
     let mut params = Vec::new();
     loop {
-        match (ty, body) {
+        match (ty.kind(), body.kind()) {
             (Pi(tx, tt, te, _), Lambda(bx, _bt, be)) if *tx == *bx => {
                 params.push((*tx, &**tt));
                 ty = te;
@@ -275,28 +275,35 @@ impl fmt::Display for Expr {
 #[test]
 fn test_print() {
     use crate::*;
-    let expr = Lambda(
+    use ExprKind::*;
+    let expr: Expr = Lambda(
         Variable::user("f"),
         __(Pi(
             Variable::anon(),
-            __(Var(Variable::user("N"))),
-            __(Var(Variable::user("N"))),
+            __(Var(Variable::user("N")).into_expr()),
+            __(Var(Variable::user("N")).into_expr()),
             None,
-        )),
+        )
+        .into_expr()),
         __(Lambda(
             Variable::user("x"),
-            __(Var(Variable::user("N"))),
+            __(Var(Variable::user("N")).into_expr()),
             __(App(
-                __(Var(Variable::user("f"))),
+                __(Var(Variable::user("f")).into_expr()),
                 __(App(
-                    __(Var(Variable::user("f"))),
+                    __(Var(Variable::user("f")).into_expr()),
                     __(App(
-                        __(Var(Variable::user("f"))),
-                        __(Var(Variable::user("x"))),
-                    )),
-                )),
-            )),
-        )),
-    );
+                        __(Var(Variable::user("f")).into_expr()),
+                        __(Var(Variable::user("x")).into_expr()),
+                    )
+                    .into_expr()),
+                )
+                .into_expr()),
+            )
+            .into_expr()),
+        )
+        .into_expr()),
+    )
+    .into_expr();
     assert_eq!(expr.to_string(), "|f: N -> N, x: N| f (f (f x))");
 }
