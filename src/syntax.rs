@@ -6,7 +6,7 @@ use ustr::Ustr;
 
 use ExprKind::*;
 
-use crate::semantics::FunctionShape;
+use crate::semantics::{Constructor, FunctionShape, SubExprLocation};
 
 pub type Fields = Arc<IndexMap<Ustr, Expr>>;
 
@@ -79,7 +79,7 @@ pub struct ExprContents {
 pub struct Expr(Arc<ExprContents>);
 
 pub trait ExprMapper {
-    fn map_expr(&mut self, e: &Expr) -> Expr;
+    fn map_expr(&mut self, l: SubExprLocation, e: &Expr) -> Expr;
 
     type SelfWithNewLifetime<'a>: ExprMapper;
     fn under_abstraction<T>(
@@ -97,11 +97,6 @@ pub trait ExprMapper {
         f: impl for<'a> FnOnce(&mut Self::SelfWithNewLifetime<'a>) -> T,
     ) -> T {
         self.under_abstraction(var, Some(ty), f)
-    }
-
-    // Helper
-    fn map_fields(&mut self, fields: &IndexMap<Ustr, Expr>) -> Fields {
-        Arc::new(fields.iter().map(|(n, e)| (*n, self.map_expr(e))).collect())
     }
 }
 
@@ -123,53 +118,100 @@ impl Expr {
         let new_kind = match self.kind() {
             Var(x) => Var(*x),
             Type(k) => Type(*k),
-            App(e1, e2) => App(v.map_expr(e1), v.map_expr(e2)),
+            App(e1, e2) => App(
+                v.map_expr(SubExprLocation::Destruct(Constructor::Lambda), e1),
+                v.map_expr(SubExprLocation::AppArg(None), e2),
+            ),
             Pi(x, t, e, mentions) => {
                 let mut x = *x;
-                let t = v.map_expr(t);
-                let e = v.under_abstraction(&mut x, Some(&t), |v| v.map_expr(e));
+                let t = v.map_expr(SubExprLocation::PiType, t);
+                let e = v.under_abstraction(&mut x, Some(&t), |v| {
+                    v.map_expr(SubExprLocation::Construct(Constructor::Pi), e)
+                });
                 Pi(x, t, e, mentions.clone())
             }
             Lambda(x, t, e) => {
                 let mut x = *x;
-                let t = v.map_expr(t);
-                let e = v.under_abstraction(&mut x, Some(&t), |v| v.map_expr(e));
+                let t = v.map_expr(SubExprLocation::LambdaType, t);
+                let e = v.under_abstraction(&mut x, Some(&t), |v| {
+                    v.map_expr(SubExprLocation::Construct(Constructor::Lambda), e)
+                });
                 Lambda(x, t, e)
             }
             Let(x, ty, e1, e2) => {
+                let ty = ty.as_ref().map(|ty| v.map_expr(SubExprLocation::LetTy, ty));
+                let e1 = v.map_expr(SubExprLocation::LetVal, e1);
                 let mut x = *x;
-                let ty = ty.as_ref().map(|ty| v.map_expr(ty));
-                let e1 = v.map_expr(e1);
-                let e2 = v.under_abstraction(&mut x, ty.as_ref(), |ctx| ctx.map_expr(e2));
+                let e2 = v.under_abstraction(&mut x, ty.as_ref(), |ctx| {
+                    ctx.map_expr(SubExprLocation::LetBody, e2)
+                });
                 Let(x, ty, e1, e2)
             }
             LetRec(x, ty, e1, e2) => {
+                let orig_x = *x;
                 let mut x = *x;
                 let ty = ty.clone();
                 let e1 = e1.clone();
                 let e2 = e2.clone();
                 let (ty, e1, e2) = v.under_recursive_abstraction(&mut x, &ty, |ctx| {
-                    (ctx.map_expr(&ty), ctx.map_expr(&e1), ctx.map_expr(&e2))
+                    (
+                        ctx.map_expr(SubExprLocation::LetRecTy, &ty),
+                        ctx.map_expr(SubExprLocation::LetRecVal(orig_x), &e1),
+                        ctx.map_expr(SubExprLocation::LetRecBody, &e2),
+                    )
                 });
                 LetRec(x, ty, e1, e2)
             }
-            Struct(ty, fields) => {
-                Struct(ty.as_ref().map(|ty| v.map_expr(ty)), v.map_fields(&fields))
-            }
+            Struct(ty, fields) => Struct(
+                ty.as_ref()
+                    .map(|ty| v.map_expr(SubExprLocation::StructAnnot, ty)),
+                Arc::new(
+                    fields
+                        .iter()
+                        .map(|(n, e)| {
+                            let loc = SubExprLocation::Construct(Constructor::StructField(*n));
+                            (*n, v.map_expr(loc, e))
+                        })
+                        .collect(),
+                ),
+            ),
             StructTy(x, fields) => {
                 let mut x = *x;
                 let self_expr = self.clone();
-                let fields = v
-                    .under_recursive_abstraction(&mut x, &self_expr, |ctx| ctx.map_fields(&fields));
+                let fields = v.under_recursive_abstraction(&mut x, &self_expr, |ctx| {
+                    Arc::new(
+                        fields
+                            .iter()
+                            .map(|(n, e)| {
+                                let loc =
+                                    SubExprLocation::Construct(Constructor::StructTyField(*n));
+                                (*n, ctx.map_expr(loc, e))
+                            })
+                            .collect(),
+                    )
+                });
                 StructTy(x, fields)
             }
-            Field(e, name) => Field(v.map_expr(e), *name),
-            Eq(a, b) => Eq(v.map_expr(a), v.map_expr(b)),
-            Refl(a) => Refl(v.map_expr(a)),
-            Transport(eq, f) => Transport(v.map_expr(eq), v.map_expr(f)),
-            Todo(t) => Todo(v.map_expr(t)),
+            Field(e, name) => {
+                let loc = SubExprLocation::Destruct(Constructor::StructField(*name));
+                Field(v.map_expr(loc, e), *name)
+            }
+            Eq(a, b) => Eq(
+                v.map_expr(SubExprLocation::Construct(Constructor::EqLeft), a),
+                v.map_expr(SubExprLocation::Construct(Constructor::EqRight), b),
+            ),
+            Refl(a) => Refl(v.map_expr(SubExprLocation::Construct(Constructor::Refl), a)),
+            Transport(eq, f) => Transport(
+                v.map_expr(SubExprLocation::Destruct(Constructor::Refl), eq),
+                v.map_expr(SubExprLocation::TransportFn, f),
+            ),
+            Todo(t) => Todo(v.map_expr(SubExprLocation::TodoArg, t)),
         };
-        let new_ty = self.0.ty.as_ref().map(|ty| v.map_expr(ty));
+        let new_ty = self
+            .0
+            .ty
+            .as_ref()
+            .map(|ty| v.map_expr(SubExprLocation::Destruct(Constructor::TypeOf), ty));
         Expr::new(new_kind, new_ty)
     }
 }

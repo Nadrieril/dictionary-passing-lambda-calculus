@@ -33,7 +33,7 @@ impl Expr {
             }
         }
         impl ExprMapper for Substituter {
-            fn map_expr(&mut self, e: &Expr) -> Expr {
+            fn map_expr(&mut self, _: SubExprLocation, e: &Expr) -> Expr {
                 self.subst(e)
             }
 
@@ -521,8 +521,9 @@ pub enum SubExprLocation {
     /// We applied a destructor corresponding to this constructor.
     Destruct(Constructor),
     // Let / LetRec
-    LetVal,
     LetTy,
+    LetVal,
+    LetBody,
     LetRecTy,
     LetRecVal(Variable),
     LetRecBody,
@@ -537,6 +538,8 @@ pub enum SubExprLocation {
     TransportFn,
     // Todo
     TodoArg,
+    // Occasionally useful: represents the outermost expression, as opposed to a subexpression.
+    Root,
 }
 
 #[derive(Debug, Default)]
@@ -933,7 +936,7 @@ impl EvalContext {
         struct Normalizer<'a>(&'a mut EvalContext);
 
         impl<'a> ExprMapper for Normalizer<'a> {
-            fn map_expr(&mut self, e: &Expr) -> Expr {
+            fn map_expr(&mut self, _: SubExprLocation, e: &Expr) -> Expr {
                 self.0.whnf(e).map(self)
             }
 
@@ -952,7 +955,7 @@ impl EvalContext {
             }
         }
 
-        Normalizer(self).map_expr(e)
+        Normalizer(self).map_expr(SubExprLocation::Root, e)
     }
 
     pub fn assert_equal(&mut self, e1: &Expr, e2: &Expr) {
