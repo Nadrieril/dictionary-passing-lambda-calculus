@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     convert::Infallible,
     fmt::{Debug, Display},
+    sync::Arc,
 };
 
 use enum_as_inner::EnumAsInner;
@@ -249,7 +250,7 @@ pub struct MentionPath {
 
 /// The shape of a function: the exhaustive set of locations where the input variable is used in
 /// the function body. Used for progress checking.
-pub type FunctionShape = __<[MentionPath]>;
+pub type FunctionShape = Arc<[MentionPath]>;
 
 impl MentionPath {
     /// The shape of the identity function: the variable is mentioned directly, with no
@@ -667,7 +668,7 @@ impl EvalContext {
                     ctx.typecheck_universe(PathElem::Construct(Constructor::Pi), t2)
                 });
                 (
-                    Pi(*x, __(t1), __(t2), mentions.clone()),
+                    Pi(*x, t1, t2, mentions.clone()),
                     Type(k1.max(k2)).into_expr(),
                 )
             }
@@ -703,19 +704,19 @@ impl EvalContext {
                 };
                 let body_ty = body.ty().clone();
                 (
-                    Lambda(*x, __(t.clone()), __(body)),
-                    Pi(*x, __(t), __(body_ty), mentions).into_expr(),
+                    Lambda(*x, t.clone(), body),
+                    Pi(*x, t, body_ty, mentions).into_expr(),
                 )
             }
             App(f, arg) => {
                 let f = self.typecheck_inner(PathElem::Destruct(Constructor::Lambda), f);
-                let Pi(x, s, t, mentions) = self.whnf_unfold(f.ty()).kind else {
+                let Pi(x, s, t, mentions) = self.whnf_unfold(f.ty()).kind().clone() else {
                     panic!("Function expected.")
                 };
                 let arg = self.typecheck_inner(PathElem::AppArg(mentions), arg);
                 self.assert_equal(&s, arg.ty());
                 let app_ty = t.subst1(x, &arg);
-                (App(__(f), __(arg)), app_ty)
+                (App(f, arg), app_ty)
             }
             StructTy(x, fields) => {
                 let (fields, k) = self.with_binding_in_scope(*x, Binding::abstrakt(e), |ctx| {
@@ -729,7 +730,7 @@ impl EvalContext {
                             (f, t)
                         })
                         .collect();
-                    (__(fields), max_k)
+                    (Arc::new(fields), max_k)
                 });
                 (StructTy(*x, fields), Type(k).into_expr())
             }
@@ -742,29 +743,31 @@ impl EvalContext {
                         ((n, e.ty().clone()), (n, e))
                     })
                     .collect();
-                let actual = StructTy(Variable::user("self"), __(field_tys)).into_expr();
+                let actual = StructTy(Variable::user("self"), Arc::new(field_tys)).into_expr();
                 let (ty_ann, ty) = if let Some(ty_ann) = ty_ann {
                     let (ty_ann, _) = self.typecheck_universe(PathElem::StructAnnot, ty_ann);
                     {
-                        let StructTy(self_var, field_tys) = self.whnf_unfold(&ty_ann).kind else {
+                        let StructTy(self_var, field_tys) =
+                            self.whnf_unfold(&ty_ann).kind().clone()
+                        else {
                             panic!("Struct type expected for `make`")
                         };
                         let expected = StructTy(self_var.refresh(), field_tys).into_expr();
                         let expected = expected.subst1(self_var, e);
                         self.assert_equal(&expected, &actual);
                     }
-                    (Some(__(ty_ann.clone())), ty_ann)
+                    (Some(ty_ann.clone()), ty_ann)
                 } else {
                     (None, actual)
                 };
-                (Struct(ty_ann, __(fields)), ty)
+                (Struct(ty_ann, Arc::new(fields)), ty)
             }
             Let(x, ty_ann, e1, e2) => {
                 let e1 = self.typecheck_inner(PathElem::LetVal, e1);
                 let ty_ann = if let Some(ty) = ty_ann {
                     let (ty, _) = self.typecheck_universe(PathElem::LetTy, ty);
                     self.assert_equal(&ty, e1.ty());
-                    Some(__(ty))
+                    Some(ty)
                 } else {
                     None
                 };
@@ -773,7 +776,7 @@ impl EvalContext {
                     ctx.typecheck(e2)
                 });
                 let e2_ty = e2.ty().clone();
-                return Let(*x, ty_ann, __(e1), __(e2)).with_ty(e2_ty);
+                return Let(*x, ty_ann, e1, e2).with_ty(e2_ty);
             }
             LetRec(var, ty, e1, e2) => {
                 let (ty, _) = self.typecheck_universe(PathElem::LetRecTy, ty);
@@ -794,13 +797,13 @@ impl EvalContext {
                     (e1, e2)
                 });
                 let e2_ty = e2.ty().clone();
-                return LetRec(*var, __(ty), __(e1), __(e2)).with_ty(e2_ty);
+                return LetRec(*var, ty, e1, e2).with_ty(e2_ty);
             }
             Field(e, name) => {
                 let loc = PathElem::Destruct(Constructor::StructField(*name));
                 let e = self.typecheck_inner(loc, e);
                 let te = self.whnf_unfold(e.ty());
-                let StructTy(self_var, fields) = te.kind else {
+                let StructTy(self_var, fields) = te.kind().clone() else {
                     panic!("Struct type expected for field access, got `{te}`")
                 };
                 let field_ty = fields
@@ -808,40 +811,40 @@ impl EvalContext {
                     .unwrap_or_else(|| panic!("Field {name} not found"))
                     .clone();
                 let field_ty = field_ty.subst1(self_var, &e);
-                (Field(__(e), *name), field_ty)
+                (Field(e, *name), field_ty)
             }
             Eq(a, b) => {
                 let a = self.typecheck_inner(PathElem::Construct(Constructor::EqLeft), a);
                 let b = self.typecheck_inner(PathElem::Construct(Constructor::EqRight), b);
                 self.assert_equal(a.ty(), b.ty());
                 let k = self.infer_universe(PathElem::Destruct(Constructor::TypeOf), a.ty());
-                (Eq(__(a), __(b)), Type(k).into_expr())
+                (Eq(a, b), Type(k).into_expr())
             }
             Refl(a) => {
                 let a = self.typecheck_inner(PathElem::Construct(Constructor::Refl), a);
-                (Refl(__(a.clone())), Eq(__(a.clone()), __(a)).into_expr())
+                (Refl(a.clone()), Eq(a.clone(), a).into_expr())
             }
             Transport(eq, f) => {
                 let eq = self.typecheck_inner(PathElem::Destruct(Constructor::Refl), eq);
-                let Eq(a, b) = self.whnf_unfold(eq.ty()).kind else {
+                let Eq(a, b) = self.whnf_unfold(eq.ty()).kind().clone() else {
                     panic!("Equality type expected for transport")
                 };
                 let f = self.typecheck_inner(PathElem::TransportFn, f);
-                let Pi(..) = self.whnf_unfold(f.ty()).kind else {
+                let Pi(..) = self.whnf_unfold(f.ty()).kind() else {
                     panic!("Function expected for transport's second argument")
                 };
                 let transport_ty = Pi(
                     Variable::anon(),
-                    __(App(__(f.clone()), a).into_expr()),
-                    __(App(__(f.clone()), b).into_expr()),
-                    Some(__([MentionPath::identity()])), // it's an identity function
+                    App(f.clone(), a).into_expr(),
+                    App(f.clone(), b).into_expr(),
+                    Some(Arc::new([MentionPath::identity()])), // it's an identity function
                 )
                 .into_expr();
-                (Transport(__(eq), __(f)), transport_ty)
+                (Transport(eq, f), transport_ty)
             }
             Todo(t) => {
                 let t = self.typecheck_inner(PathElem::TodoArg, t);
-                return Todo(__(t.clone())).with_ty(t);
+                return Todo(t.clone()).with_ty(t);
             }
         };
         // Recursively check the type is well-formed.
@@ -886,7 +889,7 @@ impl EvalContext {
                     let body = body.clone();
                     self.whnf_inner(&body.subst1(*x, e2), unfold_nominal)
                 }
-                _ => App(__(self.whnf_inner(e1, unfold_nominal)), e2.clone()).into_expr(),
+                _ => App(self.whnf_inner(e1, unfold_nominal), e2.clone()).into_expr(),
             },
             Field(e, name) => match self.whnf_inner(e, true).kind() {
                 Struct(_, fields) => {
@@ -896,12 +899,11 @@ impl EvalContext {
                         .clone();
                     self.whnf_inner(&val, unfold_nominal)
                 }
-                _ => Field(__(self.whnf_inner(e, true)), *name).into_expr(),
+                _ => Field(self.whnf_inner(e, true), *name).into_expr(),
             },
             Let(x, _, e1, e2) => self.whnf_inner(&e2.subst1(*x, e1), unfold_nominal),
             LetRec(x, ty, e1, e2) => {
-                let fixpoint =
-                    LetRec(*x, ty.clone(), e1.clone(), __(Var(*x).into_expr())).into_expr();
+                let fixpoint = LetRec(*x, ty.clone(), e1.clone(), Var(*x).into_expr()).into_expr();
                 let e1_unrolled = e1.subst1(*x, &fixpoint);
                 self.whnf_inner(&e2.subst1(*x, &e1_unrolled), unfold_nominal)
             }
@@ -911,10 +913,9 @@ impl EvalContext {
                     Refl(x) => {
                         let x = x.clone();
                         let y = Variable::anon().refresh();
-                        Lambda(y, __(App(f.clone(), x).into_expr()), __(Var(y).into_expr()))
-                            .into_expr()
+                        Lambda(y, App(f.clone(), x).into_expr(), Var(y).into_expr()).into_expr()
                     }
-                    _ => Transport(__(self.whnf_inner(eq, unfold_nominal)), f.clone()).into_expr(),
+                    _ => Transport(self.whnf_inner(eq, unfold_nominal), f.clone()).into_expr(),
                 }
             }
             Todo(t) => panic!("tried to normalize `todo {t}`"),

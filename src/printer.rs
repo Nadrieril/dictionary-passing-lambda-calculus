@@ -100,10 +100,7 @@ impl Expr {
                 fmt_fields(f, fields, " = ")
             }
             StructTy(_, fields) => fmt_fields(f, fields, ": "),
-            Let(x, ty, e1, e2) => {
-                let ty = ty.as_ref().map(|t| &**t);
-                fmt_let(f, prec, false, *x, ty, e1, e2)
-            }
+            Let(x, ty, e1, e2) => fmt_let(f, prec, false, *x, ty.as_ref(), e1, e2),
             LetRec(x, ty, e1, e2) => fmt_let(f, prec, true, *x, Some(ty), e1, e2),
             Field(e, name) => {
                 e.fmt_prec(f, 4)?;
@@ -165,7 +162,7 @@ impl Expr {
 fn peel_lambda(mut e: &Expr) -> (Vec<(Variable, &Expr)>, &Expr) {
     let mut params = Vec::new();
     while let Lambda(x, t, body) = e.kind() {
-        params.push((*x, &**t));
+        params.push((*x, t));
         e = body;
     }
     (params, e)
@@ -181,7 +178,7 @@ fn peel_fun_sugar<'a>(
     loop {
         match (ty.kind(), body.kind()) {
             (Pi(tx, tt, te, _), Lambda(bx, _bt, be)) if *tx == *bx => {
-                params.push((*tx, &**tt));
+                params.push((*tx, tt));
                 ty = te;
                 body = be;
             }
@@ -278,31 +275,31 @@ fn test_print() {
     use ExprKind::*;
     let expr: Expr = Lambda(
         Variable::user("f"),
-        __(Pi(
+        Pi(
             Variable::anon(),
-            __(Var(Variable::user("N")).into_expr()),
-            __(Var(Variable::user("N")).into_expr()),
+            Var(Variable::user("N")).into_expr(),
+            Var(Variable::user("N")).into_expr(),
             None,
         )
-        .into_expr()),
-        __(Lambda(
+        .into_expr(),
+        Lambda(
             Variable::user("x"),
-            __(Var(Variable::user("N")).into_expr()),
-            __(App(
-                __(Var(Variable::user("f")).into_expr()),
-                __(App(
-                    __(Var(Variable::user("f")).into_expr()),
-                    __(App(
-                        __(Var(Variable::user("f")).into_expr()),
-                        __(Var(Variable::user("x")).into_expr()),
+            Var(Variable::user("N")).into_expr(),
+            App(
+                Var(Variable::user("f")).into_expr(),
+                App(
+                    Var(Variable::user("f")).into_expr(),
+                    App(
+                        Var(Variable::user("f")).into_expr(),
+                        Var(Variable::user("x")).into_expr(),
                     )
-                    .into_expr()),
+                    .into_expr(),
                 )
-                .into_expr()),
+                .into_expr(),
             )
-            .into_expr()),
+            .into_expr(),
         )
-        .into_expr()),
+        .into_expr(),
     )
     .into_expr();
     assert_eq!(expr.to_string(), "|f: N -> N, x: N| f (f (f x))");

@@ -8,11 +8,6 @@ use ExprKind::*;
 
 use crate::semantics::FunctionShape;
 
-pub type __<A> = Arc<A>;
-pub(crate) fn __<A>(a: A) -> Arc<A> {
-    Arc::new(a)
-}
-
 pub type Fields = Arc<IndexMap<Ustr, Expr>>;
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
@@ -47,38 +42,41 @@ pub enum ExprKind {
     Type(usize),
 
     /// `let x [: T] = e1 in e2`. Non-recursive.
-    Let(Variable, Option<__<Expr>>, __<Expr>, __<Expr>),
+    Let(Variable, Option<Expr>, Expr, Expr),
     /// `let rec x: T = e1 in e2`. A coinductive value, checked for productivity at type-checking
     /// time.
-    LetRec(Variable, __<Expr>, __<Expr>, __<Expr>),
+    LetRec(Variable, Expr, Expr, Expr),
 
     /// Function type. The last argument records the exhaustive set of locations where the variable
     /// is used in the function body, if known.
-    Pi(Variable, __<Expr>, __<Expr>, Option<FunctionShape>),
-    Lambda(Variable, __<Expr>, __<Expr>),
-    App(__<Expr>, __<Expr>),
+    Pi(Variable, Expr, Expr, Option<FunctionShape>),
+    Lambda(Variable, Expr, Expr),
+    App(Expr, Expr),
 
     /// Struct type. Binds a variable (typically `self`) that has the type being constructed,
     /// making it an unordered dependent record.
     StructTy(Variable, Fields),
     /// Struct value, optionally with explicit type annotation: `{ a = e }` or `make (ty) { a = e }`.
-    Struct(Option<__<Expr>>, Fields),
-    Field(__<Expr>, Ustr),
+    Struct(Option<Expr>, Fields),
+    Field(Expr, Ustr),
 
-    Eq(__<Expr>, __<Expr>),
-    Refl(__<Expr>),
-    Transport(__<Expr>, __<Expr>),
+    Eq(Expr, Expr),
+    Refl(Expr),
+    Transport(Expr, Expr),
 
     /// `todo ty` has type `ty`, panics on normalization.
-    Todo(__<Expr>),
+    Todo(Expr),
 }
 
 /// An expression, optionally annotated with its inferred type.
 #[derive(Clone, Debug)]
-pub struct Expr {
+pub struct ExprContents {
     pub kind: ExprKind,
-    pub ty: Option<__<Expr>>,
+    pub ty: Option<Expr>,
 }
+
+#[derive(Clone, Debug)]
+pub struct Expr(Arc<ExprContents>);
 
 pub trait ExprMapper {
     fn map_expr(&mut self, e: &Expr) -> Expr;
@@ -108,12 +106,16 @@ pub trait ExprMapper {
 }
 
 impl Expr {
+    fn new(kind: ExprKind, ty: Option<Expr>) -> Expr {
+        Expr(Arc::new(ExprContents { kind, ty }))
+    }
+
     pub fn kind(&self) -> &ExprKind {
-        &self.kind
+        &self.0.kind
     }
 
     pub fn ty(&self) -> &Expr {
-        self.ty.as_deref().expect("type annotation missing")
+        self.0.ty.as_ref().expect("type annotation missing")
     }
 
     /// Apply a transformation to all direct subexpressions of this expression.
@@ -121,25 +123,25 @@ impl Expr {
         let new_kind = match self.kind() {
             Var(x) => Var(*x),
             Type(k) => Type(*k),
-            App(e1, e2) => App(__(v.map_expr(e1)), __(v.map_expr(e2))),
+            App(e1, e2) => App(v.map_expr(e1), v.map_expr(e2)),
             Pi(x, t, e, mentions) => {
                 let mut x = *x;
                 let t = v.map_expr(t);
                 let e = v.under_abstraction(&mut x, Some(&t), |v| v.map_expr(e));
-                Pi(x, __(t), __(e), mentions.clone())
+                Pi(x, t, e, mentions.clone())
             }
             Lambda(x, t, e) => {
                 let mut x = *x;
                 let t = v.map_expr(t);
                 let e = v.under_abstraction(&mut x, Some(&t), |v| v.map_expr(e));
-                Lambda(x, __(t), __(e))
+                Lambda(x, t, e)
             }
             Let(x, ty, e1, e2) => {
                 let mut x = *x;
                 let ty = ty.as_ref().map(|ty| v.map_expr(ty));
                 let e1 = v.map_expr(e1);
                 let e2 = v.under_abstraction(&mut x, ty.as_ref(), |ctx| ctx.map_expr(e2));
-                Let(x, ty.map(|t| __(t)), __(e1), __(e2))
+                Let(x, ty, e1, e2)
             }
             LetRec(x, ty, e1, e2) => {
                 let mut x = *x;
@@ -149,12 +151,11 @@ impl Expr {
                 let (ty, e1, e2) = v.under_recursive_abstraction(&mut x, &ty, |ctx| {
                     (ctx.map_expr(&ty), ctx.map_expr(&e1), ctx.map_expr(&e2))
                 });
-                LetRec(x, __(ty), __(e1), __(e2))
+                LetRec(x, ty, e1, e2)
             }
-            Struct(ty, fields) => Struct(
-                ty.as_ref().map(|ty| __(v.map_expr(ty))),
-                v.map_fields(&fields),
-            ),
+            Struct(ty, fields) => {
+                Struct(ty.as_ref().map(|ty| v.map_expr(ty)), v.map_fields(&fields))
+            }
             StructTy(x, fields) => {
                 let mut x = *x;
                 let self_expr = self.clone();
@@ -162,32 +163,23 @@ impl Expr {
                     .under_recursive_abstraction(&mut x, &self_expr, |ctx| ctx.map_fields(&fields));
                 StructTy(x, fields)
             }
-            Field(e, name) => Field(__(v.map_expr(e)), *name),
-            Eq(a, b) => Eq(__(v.map_expr(a)), __(v.map_expr(b))),
-            Refl(a) => Refl(__(v.map_expr(a))),
-            Transport(eq, f) => Transport(__(v.map_expr(eq)), __(v.map_expr(f))),
-            Todo(t) => Todo(__(v.map_expr(t))),
+            Field(e, name) => Field(v.map_expr(e), *name),
+            Eq(a, b) => Eq(v.map_expr(a), v.map_expr(b)),
+            Refl(a) => Refl(v.map_expr(a)),
+            Transport(eq, f) => Transport(v.map_expr(eq), v.map_expr(f)),
+            Todo(t) => Todo(v.map_expr(t)),
         };
-        let new_ty = self.ty.as_ref().map(|ty| __(v.map_expr(ty)));
-        Expr {
-            kind: new_kind,
-            ty: new_ty,
-        }
+        let new_ty = self.0.ty.as_ref().map(|ty| v.map_expr(ty));
+        Expr::new(new_kind, new_ty)
     }
 }
 
 impl ExprKind {
     pub fn into_expr(self) -> Expr {
-        Expr {
-            kind: self,
-            ty: None,
-        }
+        Expr::new(self, None)
     }
 
     pub fn with_ty(self, ty: Expr) -> Expr {
-        Expr {
-            kind: self,
-            ty: Some(__(ty)),
-        }
+        Expr::new(self, Some(ty))
     }
 }

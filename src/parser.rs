@@ -1,5 +1,7 @@
+use std::sync::Arc;
+
 use crate::ExprKind::*;
-use crate::{__, Expr, Fields, Variable};
+use crate::{Expr, Fields, Variable};
 use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_while};
@@ -162,16 +164,18 @@ fn parse_params(input: &str) -> IResult<'_, Vec<(Variable, Expr)>> {
 
 /// Wrap a return type in nested Pi types for each parameter.
 fn wrap_pi(params: &[(Variable, Expr)], ret: Expr) -> Expr {
-    params.iter().rev().fold(ret, |acc, (x, t)| {
-        Pi(*x, __(t.clone()), __(acc), None).into_expr()
-    })
+    params
+        .iter()
+        .rev()
+        .fold(ret, |acc, (x, t)| Pi(*x, t.clone(), acc, None).into_expr())
 }
 
 /// Wrap a body in nested lambdas for each parameter.
 fn wrap_lambda(params: &[(Variable, Expr)], body: Expr) -> Expr {
-    params.iter().rev().fold(body, |acc, (x, t)| {
-        Lambda(*x, __(t.clone()), __(acc)).into_expr()
-    })
+    params
+        .iter()
+        .rev()
+        .fold(body, |acc, (x, t)| Lambda(*x, t.clone(), acc).into_expr())
 }
 
 /// `Type(n)` or `Type` (shorthand for `Type(0)`)
@@ -212,14 +216,14 @@ fn parse_pi(input: &str) -> IResult<'_, Expr> {
                 delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
                 preceded(ws(tag("->")), parse_expr),
             )
-                .map(|(t, e)| Pi(Variable::anon(), __(t), __(e), None).into_expr()),
+                .map(|(t, e)| Pi(Variable::anon(), t, e, None).into_expr()),
         )),
     )
     .parse(input)
 }
 
 fn fields_from_vec(v: Vec<(Ustr, Expr)>) -> crate::Fields {
-    __(v.into_iter().collect())
+    Arc::new(v.into_iter().collect())
 }
 
 /// `{ a = e, b = e }` or `{ a: T, b: T }` or `{}` or `{=}`
@@ -280,10 +284,10 @@ fn parse_postfix(input: &str) -> IResult<'_, Expr> {
     (parse_atom, many0(parse_postfix_op))
         .map(|(init, ops)| {
             ops.into_iter().fold(init, |acc, op| match op {
-                PostfixOp::Field(name) => Field(__(acc), name).into_expr(),
+                PostfixOp::Field(name) => Field(acc, name).into_expr(),
                 PostfixOp::Call(args) => args
                     .into_iter()
-                    .fold(acc, |acc, arg| App(__(acc), __(arg)).into_expr()),
+                    .fold(acc, |acc, arg| App(acc, arg).into_expr()),
             })
         })
         .parse(input)
@@ -297,7 +301,7 @@ fn parse_app(input: &str) -> IResult<'_, Expr> {
     (head, many0(parse_postfix))
         .map(|(first, rest)| {
             rest.into_iter()
-                .fold(first, |acc, arg| App(__(acc), __(arg)).into_expr())
+                .fold(first, |acc, arg| App(acc, arg).into_expr())
         })
         .parse(input)
 }
@@ -310,33 +314,32 @@ fn parse_make(input: &str) -> IResult<'_, Expr> {
             delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
         ),
         alt((
-            (ws(nom_char('{')), ws(nom_char('=')), ws(nom_char('}')))
-                .map(|_| __(Default::default())),
+            (ws(nom_char('{')), ws(nom_char('=')), ws(nom_char('}'))).map(|_| Default::default()),
             comma_list('{', '}', field_val).map(fields_from_vec),
         )),
     )
-        .map(|(ty, fields)| Struct(Some(__(ty)), fields).into_expr())
+        .map(|(ty, fields)| Struct(Some(ty), fields).into_expr())
         .parse(input)
 }
 
 /// `refl e`
 fn parse_refl(input: &str) -> IResult<'_, Expr> {
     preceded(keyword("refl"), parse_postfix)
-        .map(|e| Refl(__(e)).into_expr())
+        .map(|e| Refl(e).into_expr())
         .parse(input)
 }
 
 /// `todo ty`
 fn parse_todo(input: &str) -> IResult<'_, Expr> {
     preceded(keyword("todo"), parse_postfix)
-        .map(|t| Todo(__(t)).into_expr())
+        .map(|t| Todo(t).into_expr())
         .parse(input)
 }
 
 /// `transport eq f`
 fn parse_transport(input: &str) -> IResult<'_, Expr> {
     preceded(keyword("transport"), (parse_postfix, parse_postfix))
-        .map(|(eq, f)| Transport(__(eq), __(f)).into_expr())
+        .map(|(eq, f)| Transport(eq, f).into_expr())
         .parse(input)
 }
 
@@ -345,7 +348,7 @@ fn parse_transport(input: &str) -> IResult<'_, Expr> {
 fn parse_arrow(input: &str) -> IResult<'_, Expr> {
     (parse_eq, opt(preceded(ws(tag("->")), cut(parse_arrow))))
         .map(|(lhs, rhs)| match rhs {
-            Some(rhs) => Pi(Variable::anon(), __(lhs), __(rhs), None).into_expr(),
+            Some(rhs) => Pi(Variable::anon(), lhs, rhs, None).into_expr(),
             None => lhs,
         })
         .parse(input)
@@ -355,7 +358,7 @@ fn parse_arrow(input: &str) -> IResult<'_, Expr> {
 fn parse_eq(input: &str) -> IResult<'_, Expr> {
     (parse_app, opt(preceded(ws(tag("==")), cut(parse_app))))
         .map(|(lhs, rhs)| match rhs {
-            Some(rhs) => Eq(__(lhs), __(rhs)).into_expr(),
+            Some(rhs) => Eq(lhs, rhs).into_expr(),
             None => lhs,
         })
         .parse(input)
@@ -387,20 +390,18 @@ fn parse_let(input: &str) -> IResult<'_, Expr> {
             // Committed to annotated function: let [rec] f(params) -> ret = body in rest
             cut((parse_expr, parse_eq_body_in))
                 .map(|(ret, (body, rest))| {
-                    let ty = __(wrap_pi(&params, ret));
-                    let body = __(wrap_lambda(&params, body));
+                    let ty = wrap_pi(&params, ret);
+                    let body = wrap_lambda(&params, body);
                     if is_rec {
-                        LetRec(name, ty, body, __(rest)).into_expr()
+                        LetRec(name, ty, body, rest).into_expr()
                     } else {
-                        Let(name, Some(ty), body, __(rest)).into_expr()
+                        Let(name, Some(ty), body, rest).into_expr()
                     }
                 })
                 .parse(input)
         } else if !is_rec {
             parse_eq_body_in
-                .map(|(body, rest)| {
-                    Let(name, None, __(wrap_lambda(&params, body)), __(rest)).into_expr()
-                })
+                .map(|(body, rest)| Let(name, None, wrap_lambda(&params, body), rest).into_expr())
                 .parse(input)
         } else {
             // No return type: let f(params) = body in rest
@@ -414,9 +415,9 @@ fn parse_let(input: &str) -> IResult<'_, Expr> {
         cut((parse_expr, parse_eq_body_in))
             .map(|(ty, (e1, e2))| {
                 if is_rec {
-                    LetRec(name, __(ty), __(e1), __(e2)).into_expr()
+                    LetRec(name, ty, e1, e2).into_expr()
                 } else {
-                    Let(name, Some(__(ty)), __(e1), __(e2)).into_expr()
+                    Let(name, Some(ty), e1, e2).into_expr()
                 }
             })
             .parse(input)
@@ -429,7 +430,7 @@ fn parse_let(input: &str) -> IResult<'_, Expr> {
             )))
         } else {
             parse_eq_body_in
-                .map(|(e1, e2)| Let(name, None, __(e1), __(e2)).into_expr())
+                .map(|(e1, e2)| Let(name, None, e1, e2).into_expr())
                 .parse(input)
         }
     }
