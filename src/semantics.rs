@@ -66,7 +66,7 @@ pub enum BindingKind {
     /// The value is never inspected, only its type is known.
     Abstract {
         /// Paths leading to uses of that variable.
-        paths: Vec<Vec<PathElem>>,
+        paths: Vec<Vec<SubExprLocation>>,
     },
 }
 
@@ -265,28 +265,28 @@ impl MentionPath {
     /// Convert a location to a number of `MentionPath`s. There can be several if we encounter a
     /// function application that uses its argument several times.
     fn from_path<'a>(
-        path: impl IntoIterator<Item = &'a PathElem> + Clone,
-    ) -> Result<Vec<Self>, (ConstructorPath, PathElem)> {
+        path: impl IntoIterator<Item = &'a SubExprLocation> + Clone,
+    ) -> Result<Vec<Self>, (ConstructorPath, SubExprLocation)> {
         if path
             .clone()
             .into_iter()
-            .any(|pe| matches!(pe, PathElem::AppArg(..) | PathElem::LetVal))
+            .any(|pe| matches!(pe, SubExprLocation::AppArg(..) | SubExprLocation::LetVal))
         {
             // Compute all the possible combinations of paths.
             path.into_iter()
                 .map(|pe| match pe {
-                    PathElem::AppArg(Some(mentions)) => {
+                    SubExprLocation::AppArg(Some(mentions)) => {
                         // Each item here is a possible path we can take.
                         mentions.iter().map(|m| Either::Left(*m)).collect_vec()
                     }
                     // We skip paths bound to a `let` because we'll explore them when we encounter
                     // the binding instead.
-                    PathElem::LetVal => vec![],
+                    SubExprLocation::LetVal => vec![],
                     pe => vec![Either::Right(pe.clone())],
                 })
                 .multi_cartesian_product()
-                .map(|vv: Vec<Either<MentionPath, PathElem>>| {
-                    let path: Vec<PathElem> = vv
+                .map(|vv: Vec<Either<MentionPath, SubExprLocation>>| {
+                    let path: Vec<SubExprLocation> = vv
                         .into_iter()
                         .flat_map(|either| match either {
                             Either::Left(m) => Either::Left(m.to_path()),
@@ -302,19 +302,19 @@ impl MentionPath {
     }
     /// `from_path` but without support for function application.
     fn from_single_path<'a>(
-        path: impl IntoIterator<Item = &'a PathElem> + Clone,
-    ) -> Result<Self, (ConstructorPath, PathElem)> {
+        path: impl IntoIterator<Item = &'a SubExprLocation> + Clone,
+    ) -> Result<Self, (ConstructorPath, SubExprLocation)> {
         let mut ctor_path = ConstructorPath::Empty;
         let mut dtor_path = vec![];
         for pe in path.into_iter().cloned() {
             match pe {
-                PathElem::Construct(ctor) if dtor_path.is_empty() => {
+                SubExprLocation::Construct(ctor) if dtor_path.is_empty() => {
                     ctor_path.push(ctor);
                 }
-                PathElem::Construct(ctor) if dtor_path.last() == Some(&ctor) => {
+                SubExprLocation::Construct(ctor) if dtor_path.last() == Some(&ctor) => {
                     dtor_path.pop();
                 }
-                PathElem::Destruct(ctor) => {
+                SubExprLocation::Destruct(ctor) => {
                     dtor_path.push(ctor);
                 }
                 _ => return Err((ctor_path, pe)),
@@ -328,9 +328,9 @@ impl MentionPath {
             dtor_path,
         })
     }
-    fn to_path(self) -> impl Iterator<Item = PathElem> {
-        let ctors = self.ctor_path.iter().map(PathElem::Construct);
-        let dtors = self.dtor_path.rev_iter().map(PathElem::Destruct);
+    fn to_path(self) -> impl Iterator<Item = SubExprLocation> {
+        let ctors = self.ctor_path.iter().map(SubExprLocation::Construct);
+        let dtors = self.dtor_path.rev_iter().map(SubExprLocation::Destruct);
         ctors.chain(dtors)
     }
 }
@@ -515,7 +515,7 @@ impl Display for ProgressGraph {
 /// Describes which sub-expression position we are in within the expression tree.
 /// One variant per nested `Expr` location inside an `Expr`.
 #[derive(Debug, Clone, PartialEq, Eq, EnumAsInner)]
-pub enum PathElem {
+pub enum SubExprLocation {
     /// We're inside the given destructor.
     Construct(Constructor),
     /// We applied a destructor corresponding to this constructor.
@@ -545,7 +545,7 @@ pub struct EvalContext {
     bindings: Vec<(Variable, Binding)>,
     /// The path through the initial expression to the subexpression we're in the process of
     /// typechecking.
-    path: Vec<PathElem>,
+    path: Vec<SubExprLocation>,
     /// For each `let rec val` we're inside of, compute a map of which constructor paths depend on
     /// each other. We use this to compute progress.
     progress_graphs: HashMap<Variable, ProgressGraph>,
@@ -571,7 +571,7 @@ impl EvalContext {
     /// Add a value to the environment. Used in tests.
     pub fn add_val(&mut self, x: &str, value: Expr) {
         let x = Variable::user(x);
-        let value = self.typecheck_inner(PathElem::LetVal, &value);
+        let value = self.typecheck_inner(SubExprLocation::LetVal, &value);
         self.push_binding(x, Binding::with_value(&value));
     }
     /// Run `f` with a temporary scope where the given binding is declared.
@@ -598,7 +598,7 @@ impl EvalContext {
 
     /// Typecheck a sub-expression, tracking its position in the expression tree.
     /// Returns the expression with type annotation added.
-    fn typecheck_inner(&mut self, loc: PathElem, e: &Expr) -> Expr {
+    fn typecheck_inner(&mut self, loc: SubExprLocation, e: &Expr) -> Expr {
         self.path.push(loc);
         let e = self.typecheck(e);
         self.path.pop();
@@ -618,7 +618,7 @@ impl EvalContext {
                         if self
                             .path
                             .iter()
-                            .any(|e| matches!(e, PathElem::LetRecVal(..)))
+                            .any(|e| matches!(e, SubExprLocation::LetRecVal(..)))
                         {
                             // A let-binding may contain recursive mentions of a recursive
                             // variable, so we re-typecheck it here.
@@ -629,7 +629,7 @@ impl EvalContext {
                         if let mut subpath = self.path.iter()
                             && subpath
                                 .by_ref()
-                                .find(|e| matches!(e, PathElem::LetRecVal(v) if v == x))
+                                .find(|e| matches!(e, SubExprLocation::LetRecVal(v) if v == x))
                                 .is_some()
                         {
                             // We're inside a `let rec val` definition, and we found a recursive reference
@@ -663,9 +663,9 @@ impl EvalContext {
                 return Type(*k).with_ty(Type(k + 1).into_expr());
             }
             Pi(x, t1, t2, mentions) => {
-                let (t1, k1) = self.typecheck_universe(PathElem::PiType, t1);
+                let (t1, k1) = self.typecheck_universe(SubExprLocation::PiType, t1);
                 let (t2, k2) = self.with_binding_in_scope(*x, Binding::abstrakt(&t1), |ctx| {
-                    ctx.typecheck_universe(PathElem::Construct(Constructor::Pi), t2)
+                    ctx.typecheck_universe(SubExprLocation::Construct(Constructor::Pi), t2)
                 });
                 (
                     Pi(*x, t1, t2, mentions.clone()),
@@ -673,10 +673,10 @@ impl EvalContext {
                 )
             }
             Lambda(x, t, body) => {
-                let (t, _) = self.typecheck_universe(PathElem::LambdaType, t);
+                let (t, _) = self.typecheck_universe(SubExprLocation::LambdaType, t);
                 let (body, binding) =
                     self.with_binding_in_scope_keep_binding(*x, Binding::abstrakt(&t), |ctx| {
-                        ctx.typecheck_inner(PathElem::Construct(Constructor::Lambda), body)
+                        ctx.typecheck_inner(SubExprLocation::Construct(Constructor::Lambda), body)
                     });
                 let mentions = {
                     let BindingKind::Abstract { paths } = binding.kind else {
@@ -709,11 +709,11 @@ impl EvalContext {
                 )
             }
             App(f, arg) => {
-                let f = self.typecheck_inner(PathElem::Destruct(Constructor::Lambda), f);
+                let f = self.typecheck_inner(SubExprLocation::Destruct(Constructor::Lambda), f);
                 let Pi(x, s, t, mentions) = self.whnf_unfold(f.ty()).kind().clone() else {
                     panic!("Function expected.")
                 };
-                let arg = self.typecheck_inner(PathElem::AppArg(mentions), arg);
+                let arg = self.typecheck_inner(SubExprLocation::AppArg(mentions), arg);
                 self.assert_equal(&s, arg.ty());
                 let app_ty = t.subst1(x, &arg);
                 (App(f, arg), app_ty)
@@ -724,7 +724,7 @@ impl EvalContext {
                     let fields: indexmap::IndexMap<Ustr, Expr> = fields
                         .iter()
                         .map(|(&f, t)| {
-                            let loc = PathElem::Construct(Constructor::StructTyField(f));
+                            let loc = SubExprLocation::Construct(Constructor::StructTyField(f));
                             let (t, k) = ctx.typecheck_universe(loc, t);
                             max_k = max_k.max(k);
                             (f, t)
@@ -738,14 +738,14 @@ impl EvalContext {
                 let (field_tys, fields) = fields
                     .iter()
                     .map(|(&n, e)| {
-                        let loc = PathElem::Construct(Constructor::StructField(n));
+                        let loc = SubExprLocation::Construct(Constructor::StructField(n));
                         let e = self.typecheck_inner(loc, e);
                         ((n, e.ty().clone()), (n, e))
                     })
                     .collect();
                 let actual = StructTy(Variable::user("self"), Arc::new(field_tys)).into_expr();
                 let (ty_ann, ty) = if let Some(ty_ann) = ty_ann {
-                    let (ty_ann, _) = self.typecheck_universe(PathElem::StructAnnot, ty_ann);
+                    let (ty_ann, _) = self.typecheck_universe(SubExprLocation::StructAnnot, ty_ann);
                     {
                         let StructTy(self_var, field_tys) =
                             self.whnf_unfold(&ty_ann).kind().clone()
@@ -763,9 +763,9 @@ impl EvalContext {
                 (Struct(ty_ann, Arc::new(fields)), ty)
             }
             Let(x, ty_ann, e1, e2) => {
-                let e1 = self.typecheck_inner(PathElem::LetVal, e1);
+                let e1 = self.typecheck_inner(SubExprLocation::LetVal, e1);
                 let ty_ann = if let Some(ty) = ty_ann {
-                    let (ty, _) = self.typecheck_universe(PathElem::LetTy, ty);
+                    let (ty, _) = self.typecheck_universe(SubExprLocation::LetTy, ty);
                     self.assert_equal(&ty, e1.ty());
                     Some(ty)
                 } else {
@@ -779,28 +779,28 @@ impl EvalContext {
                 return Let(*x, ty_ann, e1, e2).with_ty(e2_ty);
             }
             LetRec(var, ty, e1, e2) => {
-                let (ty, _) = self.typecheck_universe(PathElem::LetRecTy, ty);
+                let (ty, _) = self.typecheck_universe(SubExprLocation::LetRecTy, ty);
                 // Push `var` with value immediately so it can reduce during its own typechecking
                 // (needed for self-referential types like `Trait` whose fields reference `Trait`
                 // applied to args). Marked nominal so whnf doesn't unfold it.
                 let binding = Binding::nominal(e1, &ty);
                 let (e1, e2) = self.with_binding_in_scope(*var, binding, |ctx| {
                     ctx.progress_graphs.insert(*var, ProgressGraph::new(*var));
-                    let e1 = ctx.typecheck_inner(PathElem::LetRecVal(*var), e1);
+                    let e1 = ctx.typecheck_inner(SubExprLocation::LetRecVal(*var), e1);
                     ctx.assert_equal(&ty, e1.ty());
 
                     let graph = ctx.progress_graphs.remove(var).unwrap();
                     eprintln!("dependency graph for {var}:\n{graph}");
                     graph.check_progress();
 
-                    let e2 = ctx.typecheck_inner(PathElem::LetRecBody, e2);
+                    let e2 = ctx.typecheck_inner(SubExprLocation::LetRecBody, e2);
                     (e1, e2)
                 });
                 let e2_ty = e2.ty().clone();
                 return LetRec(*var, ty, e1, e2).with_ty(e2_ty);
             }
             Field(e, name) => {
-                let loc = PathElem::Destruct(Constructor::StructField(*name));
+                let loc = SubExprLocation::Destruct(Constructor::StructField(*name));
                 let e = self.typecheck_inner(loc, e);
                 let te = self.whnf_unfold(e.ty());
                 let StructTy(self_var, fields) = te.kind().clone() else {
@@ -814,22 +814,22 @@ impl EvalContext {
                 (Field(e, *name), field_ty)
             }
             Eq(a, b) => {
-                let a = self.typecheck_inner(PathElem::Construct(Constructor::EqLeft), a);
-                let b = self.typecheck_inner(PathElem::Construct(Constructor::EqRight), b);
+                let a = self.typecheck_inner(SubExprLocation::Construct(Constructor::EqLeft), a);
+                let b = self.typecheck_inner(SubExprLocation::Construct(Constructor::EqRight), b);
                 self.assert_equal(a.ty(), b.ty());
-                let k = self.infer_universe(PathElem::Destruct(Constructor::TypeOf), a.ty());
+                let k = self.infer_universe(SubExprLocation::Destruct(Constructor::TypeOf), a.ty());
                 (Eq(a, b), Type(k).into_expr())
             }
             Refl(a) => {
-                let a = self.typecheck_inner(PathElem::Construct(Constructor::Refl), a);
+                let a = self.typecheck_inner(SubExprLocation::Construct(Constructor::Refl), a);
                 (Refl(a.clone()), Eq(a.clone(), a).into_expr())
             }
             Transport(eq, f) => {
-                let eq = self.typecheck_inner(PathElem::Destruct(Constructor::Refl), eq);
+                let eq = self.typecheck_inner(SubExprLocation::Destruct(Constructor::Refl), eq);
                 let Eq(a, b) = self.whnf_unfold(eq.ty()).kind().clone() else {
                     panic!("Equality type expected for transport")
                 };
-                let f = self.typecheck_inner(PathElem::TransportFn, f);
+                let f = self.typecheck_inner(SubExprLocation::TransportFn, f);
                 let Pi(..) = self.whnf_unfold(f.ty()).kind() else {
                     panic!("Function expected for transport's second argument")
                 };
@@ -843,17 +843,17 @@ impl EvalContext {
                 (Transport(eq, f), transport_ty)
             }
             Todo(t) => {
-                let t = self.typecheck_inner(PathElem::TodoArg, t);
+                let t = self.typecheck_inner(SubExprLocation::TodoArg, t);
                 return Todo(t.clone()).with_ty(t);
             }
         };
         // Recursively check the type is well-formed.
-        let _ = self.typecheck_inner(PathElem::Destruct(Constructor::TypeOf), &ty);
+        let _ = self.typecheck_inner(SubExprLocation::Destruct(Constructor::TypeOf), &ty);
         let ty = self.whnf(&ty);
         kind.with_ty(ty)
     }
     /// Like `typecheck_inner` but also checks the result type is a universe and returns its level.
-    fn typecheck_universe(&mut self, loc: PathElem, t: &Expr) -> (Expr, usize) {
+    fn typecheck_universe(&mut self, loc: SubExprLocation, t: &Expr) -> (Expr, usize) {
         let t = self.typecheck_inner(loc, t);
         let k = match t.ty().kind() {
             Type(k) => *k,
@@ -861,7 +861,7 @@ impl EvalContext {
         };
         (t, k)
     }
-    fn infer_universe(&mut self, loc: PathElem, t: &Expr) -> usize {
+    fn infer_universe(&mut self, loc: SubExprLocation, t: &Expr) -> usize {
         self.typecheck_universe(loc, t).1
     }
 
