@@ -679,7 +679,7 @@ impl EvalContext {
                     ctx.typecheck(e2)
                 });
                 let e2_ty = e2.ty().clone();
-                return Let(*x, ty_ann, e1, e2).with_ty(e2_ty);
+                (Let(*x, ty_ann, e1, e2), e2_ty)
             }
             LetRec(var, ty, e1, e2) => {
                 let (ty, _) = self.typecheck_universe(SubExprLocation::LetRecTy, ty);
@@ -700,7 +700,7 @@ impl EvalContext {
                     (e1, e2)
                 });
                 let e2_ty = e2.ty().clone();
-                return LetRec(*var, ty, e1, e2).with_ty(e2_ty);
+                (LetRec(*var, ty, e1, e2), e2_ty)
             }
             Pi(x, t1, t2, mentions) => {
                 let (t1, k1) = self.typecheck_universe(SubExprLocation::PiType, t1);
@@ -847,7 +847,7 @@ impl EvalContext {
             }
             Todo(t) => {
                 let t = self.typecheck_inner(SubExprLocation::TodoArg, t);
-                return Todo(t.clone()).with_ty(t);
+                (Todo(t.clone()), t)
             }
         };
         // Recursively check the type is well-formed.
