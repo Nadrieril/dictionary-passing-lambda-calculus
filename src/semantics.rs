@@ -84,10 +84,10 @@ impl Binding {
             ty: ty.clone(),
         }
     }
-    pub fn with_value(value: &Expr, ty: &Expr) -> Self {
+    pub fn with_value(value: &Expr) -> Self {
         Self {
             kind: BindingKind::Normal(value.clone()),
-            ty: ty.clone(),
+            ty: value.ty().clone(),
         }
     }
     pub fn nominal(value: &Expr, ty: &Expr) -> Self {
@@ -570,8 +570,8 @@ impl EvalContext {
     /// Add a value to the environment. Used in tests.
     pub fn add_val(&mut self, x: &str, value: Expr) {
         let x = Variable::user(x);
-        let t = self.infer_type_inner(PathElem::LetVal, &value);
-        self.push_binding(x, Binding::with_value(&value, &t));
+        let value = self.typecheck_inner(PathElem::LetVal, &value);
+        self.push_binding(x, Binding::with_value(&value));
     }
     /// Run `f` with a temporary scope where the given binding is declared.
     fn with_binding_in_scope<T>(
@@ -596,15 +596,16 @@ impl EvalContext {
     }
 
     /// Typecheck a sub-expression, tracking its position in the expression tree.
-    fn infer_type_inner(&mut self, loc: PathElem, e: &Expr) -> Expr {
+    /// Returns the expression with type annotation added.
+    fn typecheck_inner(&mut self, loc: PathElem, e: &Expr) -> Expr {
         self.path.push(loc);
-        let ty = self.infer_type(e);
+        let e = self.typecheck(e);
         self.path.pop();
-        ty
+        e
     }
-    /// Infers the type of an expression. Also typechecks that expression.
-    pub fn infer_type(&mut self, e: &Expr) -> Expr {
-        let ty = match e.kind() {
+    /// Typechecks an expression and returns the expression with type annotations added.
+    pub fn typecheck(&mut self, e: &Expr) -> Expr {
+        let (kind, ty): (ExprKind, Expr) = match e.kind() {
             Var(x) => {
                 let binding = self
                     .lookup_binding(*x)
@@ -620,7 +621,7 @@ impl EvalContext {
                         {
                             // A let-binding may contain recursive mentions of a recursive
                             // variable, so we re-typecheck it here.
-                            let _ = self.infer_type(&v);
+                            let _ = self.typecheck(&v);
                         }
                     }
                     BindingKind::Nominal(..) => {
@@ -655,24 +656,29 @@ impl EvalContext {
                     }
                     _ => (),
                 }
-                return binding_ty;
+                return Var(*x).with_ty(binding_ty);
             }
-            Type(k) => return Type(k + 1).into_expr(),
-            Pi(x, t1, t2, _) => {
-                let k1 = self.infer_universe(PathElem::PiType, t1);
-                let k2 = self.with_binding_in_scope(*x, Binding::abstrakt(t1), |ctx| {
-                    ctx.infer_universe(PathElem::Construct(Constructor::Pi), t2)
+            Type(k) => {
+                return Type(*k).with_ty(Type(k + 1).into_expr());
+            }
+            Pi(x, t1, t2, mentions) => {
+                let (t1, k1) = self.typecheck_universe(PathElem::PiType, t1);
+                let (t2, k2) = self.with_binding_in_scope(*x, Binding::abstrakt(&t1), |ctx| {
+                    ctx.typecheck_universe(PathElem::Construct(Constructor::Pi), t2)
                 });
-                Type(k1.max(k2)).into_expr()
+                (
+                    Pi(*x, __(t1), __(t2), mentions.clone()),
+                    Type(k1.max(k2)).into_expr(),
+                )
             }
-            Lambda(x, t, e) => {
-                let _ = self.infer_universe(PathElem::LambdaType, t);
-                let (te, b) =
-                    self.with_binding_in_scope_keep_binding(*x, Binding::abstrakt(t), |ctx| {
-                        ctx.infer_type_inner(PathElem::Construct(Constructor::Lambda), e)
+            Lambda(x, t, body) => {
+                let (t, _) = self.typecheck_universe(PathElem::LambdaType, t);
+                let (body, binding) =
+                    self.with_binding_in_scope_keep_binding(*x, Binding::abstrakt(&t), |ctx| {
+                        ctx.typecheck_inner(PathElem::Construct(Constructor::Lambda), body)
                     });
                 let mentions = {
-                    let BindingKind::Abstract { paths } = b.kind else {
+                    let BindingKind::Abstract { paths } = binding.kind else {
                         unreachable!()
                     };
                     let cur_path_len = self.path.len() + 1;
@@ -680,7 +686,7 @@ impl EvalContext {
                     // Each such location may give rise to several `MentionPath`s because of other
                     // function calls. We flatten everything here. If any of the locations could
                     // not be transformed to a `MentionPath`, we get `None` to ensure that the set
-                    // of paths is always exhaustive..
+                    // of paths is always exhaustive.
                     paths
                         .into_iter()
                         .map(|p| MentionPath::from_path(&p[cur_path_len..]))
@@ -695,138 +701,165 @@ impl EvalContext {
                         .collect()
                         .ok()
                 };
-                Pi(*x, t.clone(), __(te), mentions).into_expr()
+                let body_ty = body.ty().clone();
+                (
+                    Lambda(*x, __(t.clone()), __(body)),
+                    Pi(*x, __(t), __(body_ty), mentions).into_expr(),
+                )
             }
             App(f, arg) => {
-                let f_ty = self.infer_type_inner(PathElem::Destruct(Constructor::Lambda), f);
-                let Pi(x, s, t, mentions) = self.whnf_unfold(&f_ty).kind else {
+                let f = self.typecheck_inner(PathElem::Destruct(Constructor::Lambda), f);
+                let Pi(x, s, t, mentions) = self.whnf_unfold(f.ty()).kind else {
                     panic!("Function expected.")
                 };
-                let arg_ty = self.infer_type_inner(PathElem::AppArg(mentions), arg);
-                self.assert_equal(&s, &arg_ty);
-                t.subst1(x, arg)
+                let arg = self.typecheck_inner(PathElem::AppArg(mentions), arg);
+                self.assert_equal(&s, arg.ty());
+                let app_ty = t.subst1(x, &arg);
+                (App(__(f), __(arg)), app_ty)
             }
             StructTy(x, fields) => {
-                let k = self.with_binding_in_scope(*x, Binding::abstrakt(e), |ctx| {
-                    fields
+                let (fields, k) = self.with_binding_in_scope(*x, Binding::abstrakt(e), |ctx| {
+                    let mut max_k = 0usize;
+                    let fields: indexmap::IndexMap<Ustr, Expr> = fields
                         .iter()
                         .map(|(&f, t)| {
                             let loc = PathElem::Construct(Constructor::StructTyField(f));
-                            ctx.infer_universe(loc, t)
+                            let (t, k) = ctx.typecheck_universe(loc, t);
+                            max_k = max_k.max(k);
+                            (f, t)
                         })
-                        .max()
-                        .unwrap_or(0)
+                        .collect();
+                    (__(fields), max_k)
                 });
-                Type(k).into_expr()
+                (StructTy(*x, fields), Type(k).into_expr())
             }
-            Struct(ty, fields) => {
-                let ty_fields = fields
+            Struct(ty_ann, fields) => {
+                let (field_tys, fields) = fields
                     .iter()
                     .map(|(&n, e)| {
                         let loc = PathElem::Construct(Constructor::StructField(n));
-                        (n, self.infer_type_inner(loc, e))
+                        let e = self.typecheck_inner(loc, e);
+                        ((n, e.ty().clone()), (n, e))
                     })
                     .collect();
-                let actual = StructTy(Variable::user("self"), __(ty_fields)).into_expr();
-                if let Some(ty) = ty {
-                    let _ = self.infer_universe(PathElem::StructAnnot, ty);
-                    let StructTy(self_var, field_tys) = self.whnf_unfold(ty).kind else {
-                        panic!("Struct type expected for rec")
-                    };
-                    let expected: Expr = StructTy(self_var.refresh(), field_tys).into_expr();
-                    let expected = expected.subst1(self_var, e);
-                    self.assert_equal(&expected, &actual);
-                    ty.as_ref().clone()
+                let actual = StructTy(Variable::user("self"), __(field_tys)).into_expr();
+                let (ty_ann, ty) = if let Some(ty_ann) = ty_ann {
+                    let (ty_ann, _) = self.typecheck_universe(PathElem::StructAnnot, ty_ann);
+                    {
+                        let StructTy(self_var, field_tys) = self.whnf_unfold(&ty_ann).kind else {
+                            panic!("Struct type expected for `make`")
+                        };
+                        let expected = StructTy(self_var.refresh(), field_tys).into_expr();
+                        let expected = expected.subst1(self_var, e);
+                        self.assert_equal(&expected, &actual);
+                    }
+                    (Some(__(ty_ann.clone())), ty_ann)
                 } else {
-                    actual
-                }
+                    (None, actual)
+                };
+                (Struct(ty_ann, __(fields)), ty)
             }
-            Let(x, ty, e1, e2) => {
-                let te1 = self.infer_type_inner(PathElem::LetVal, e1);
-                if let Some(ty) = ty {
-                    let _ = self.infer_universe(PathElem::LetTy, ty);
-                    self.assert_equal(ty, &te1);
-                }
-                return self.with_binding_in_scope(*x, Binding::with_value(e1, &te1), |ctx| {
+            Let(x, ty_ann, e1, e2) => {
+                let e1 = self.typecheck_inner(PathElem::LetVal, e1);
+                let ty_ann = if let Some(ty) = ty_ann {
+                    let (ty, _) = self.typecheck_universe(PathElem::LetTy, ty);
+                    self.assert_equal(&ty, e1.ty());
+                    Some(__(ty))
+                } else {
+                    None
+                };
+                let e2 = self.with_binding_in_scope(*x, Binding::with_value(&e1), |ctx| {
                     // No `PathElem` here: a `let` body doesn't count wrt constructors.
-                    ctx.infer_type(e2)
+                    ctx.typecheck(e2)
                 });
+                let e2_ty = e2.ty().clone();
+                return Let(*x, ty_ann, __(e1), __(e2)).with_ty(e2_ty);
             }
             LetRec(var, ty, e1, e2) => {
-                let _ = self.infer_universe(PathElem::LetRecTy, ty);
+                let (ty, _) = self.typecheck_universe(PathElem::LetRecTy, ty);
                 // Push `var` with value immediately so it can reduce during its own typechecking
                 // (needed for self-referential types like `Trait` whose fields reference `Trait`
                 // applied to args). Marked nominal so whnf doesn't unfold it.
-                let binding = Binding::nominal(e1, ty);
-                return self.with_binding_in_scope(*var, binding, |ctx| {
+                let binding = Binding::nominal(e1, &ty);
+                let (e1, e2) = self.with_binding_in_scope(*var, binding, |ctx| {
                     ctx.progress_graphs.insert(*var, ProgressGraph::new(*var));
-                    let t1 = ctx.infer_type_inner(PathElem::LetRecVal(*var), e1);
-                    ctx.assert_equal(ty, &t1);
+                    let e1 = ctx.typecheck_inner(PathElem::LetRecVal(*var), e1);
+                    ctx.assert_equal(&ty, e1.ty());
 
                     let graph = ctx.progress_graphs.remove(var).unwrap();
                     eprintln!("dependency graph for {var}:\n{graph}");
                     graph.check_progress();
 
-                    ctx.infer_type_inner(PathElem::LetRecBody, e2)
+                    let e2 = ctx.typecheck_inner(PathElem::LetRecBody, e2);
+                    (e1, e2)
                 });
+                let e2_ty = e2.ty().clone();
+                return LetRec(*var, __(ty), __(e1), __(e2)).with_ty(e2_ty);
             }
             Field(e, name) => {
                 let loc = PathElem::Destruct(Constructor::StructField(*name));
-                let te = self.infer_type_inner(loc, e);
-                let te = self.whnf_unfold(&te);
-                let te_str = te.to_string();
+                let e = self.typecheck_inner(loc, e);
+                let te = self.whnf_unfold(e.ty());
                 let StructTy(self_var, fields) = te.kind else {
-                    panic!("Struct type expected for field access, got `{te_str}`")
+                    panic!("Struct type expected for field access, got `{te}`")
                 };
                 let field_ty = fields
                     .get(name)
                     .unwrap_or_else(|| panic!("Field {name} not found"))
                     .clone();
-                field_ty.subst1(self_var, e)
+                let field_ty = field_ty.subst1(self_var, &e);
+                (Field(__(e), *name), field_ty)
             }
             Eq(a, b) => {
-                let ta = self.infer_type_inner(PathElem::Construct(Constructor::EqLeft), a);
-                let tb = self.infer_type_inner(PathElem::Construct(Constructor::EqRight), b);
-                self.assert_equal(&ta, &tb);
-                let k = self.infer_universe(PathElem::Destruct(Constructor::TypeOf), &ta);
-                Type(k).into_expr()
+                let a = self.typecheck_inner(PathElem::Construct(Constructor::EqLeft), a);
+                let b = self.typecheck_inner(PathElem::Construct(Constructor::EqRight), b);
+                self.assert_equal(a.ty(), b.ty());
+                let k = self.infer_universe(PathElem::Destruct(Constructor::TypeOf), a.ty());
+                (Eq(__(a), __(b)), Type(k).into_expr())
             }
             Refl(a) => {
-                let _ = self.infer_type_inner(PathElem::Construct(Constructor::Refl), a);
-                Eq(a.clone(), a.clone()).into_expr()
+                let a = self.typecheck_inner(PathElem::Construct(Constructor::Refl), a);
+                (Refl(__(a.clone())), Eq(__(a.clone()), __(a)).into_expr())
             }
             Transport(eq, f) => {
-                let eq_ty = self.infer_type_inner(PathElem::Destruct(Constructor::Refl), eq);
-                let Eq(a, b) = self.whnf_unfold(&eq_ty).kind else {
+                let eq = self.typecheck_inner(PathElem::Destruct(Constructor::Refl), eq);
+                let Eq(a, b) = self.whnf_unfold(eq.ty()).kind else {
                     panic!("Equality type expected for transport")
                 };
-                let f_ty = self.infer_type_inner(PathElem::TransportFn, f);
-                let Pi(..) = self.whnf_unfold(&f_ty).kind else {
+                let f = self.typecheck_inner(PathElem::TransportFn, f);
+                let Pi(..) = self.whnf_unfold(f.ty()).kind else {
                     panic!("Function expected for transport's second argument")
                 };
-                Pi(
+                let transport_ty = Pi(
                     Variable::anon(),
-                    __(App(f.clone(), a).into_expr()),
-                    __(App(f.clone(), b).into_expr()),
+                    __(App(__(f.clone()), a).into_expr()),
+                    __(App(__(f.clone()), b).into_expr()),
                     Some(__([MentionPath::identity()])), // it's an identity function
                 )
-                .into_expr()
+                .into_expr();
+                (Transport(__(eq), __(f)), transport_ty)
             }
             Todo(t) => {
-                let _ = self.infer_universe(PathElem::TodoArg, t);
-                return (**t).clone();
+                let t = self.typecheck_inner(PathElem::TodoArg, t);
+                return Todo(__(t.clone())).with_ty(t);
             }
         };
         // Recursively check the type is well-formed.
-        let _ = self.infer_type_inner(PathElem::Destruct(Constructor::TypeOf), &ty);
-        self.whnf(&ty)
+        let _ = self.typecheck_inner(PathElem::Destruct(Constructor::TypeOf), &ty);
+        let ty = self.whnf(&ty);
+        kind.with_ty(ty)
+    }
+    /// Like `typecheck_inner` but also checks the result type is a universe and returns its level.
+    fn typecheck_universe(&mut self, loc: PathElem, t: &Expr) -> (Expr, usize) {
+        let t = self.typecheck_inner(loc, t);
+        let k = match t.ty().kind() {
+            Type(k) => *k,
+            _ => panic!("Type expected, got {}.", t.ty()),
+        };
+        (t, k)
     }
     fn infer_universe(&mut self, loc: PathElem, t: &Expr) -> usize {
-        let ty = self.infer_type_inner(loc, t);
-        match ty.kind() {
-            Type(k) => *k,
-            _ => panic!("Type expected, got {ty}."),
-        }
+        self.typecheck_universe(loc, t).1
     }
 
     /// Weak head normal form. Does not unfold nominal variables,
@@ -891,8 +924,8 @@ impl EvalContext {
 
     /// Typecheck then fully normalize the value.
     pub fn normalize(&mut self, e: &Expr) -> Expr {
-        let _ = self.infer_type(e);
-        self.normalize_no_typeck(e)
+        let e = self.typecheck(e);
+        self.normalize_no_typeck(&e)
     }
     /// Recursively normalize the value.
     fn normalize_no_typeck(&mut self, e: &Expr) -> Expr {

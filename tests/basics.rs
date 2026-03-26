@@ -15,8 +15,8 @@ fn test_application() {
     ctx.add_val("three", p(r"|f: N -> N, x: N| f(f(f(x)))"));
 
     let expr = p("three(three(s), z)");
-    let ty = ctx.infer_type(&expr);
-    assert_eq!(ty.to_string(), "N");
+    let expr = ctx.typecheck(&expr);
+    assert_eq!(expr.ty().to_string(), "N");
     let normalized = ctx.normalize(&expr);
     assert_eq!(
         normalized.to_string(),
@@ -31,7 +31,7 @@ fn test_types() {
     ctx.add_uninterpreted("z", p("N"));
 
     let sty = p("(N -> N) -> N -> N");
-    assert_eq!(ctx.infer_type(&sty).to_string(), "Type");
+    assert_eq!(ctx.typecheck(&sty).ty().to_string(), "Type");
 }
 
 #[test]
@@ -42,21 +42,21 @@ fn test_structs() {
 
     // Struct type has a type
     let sty = p("{ a: N, b: N }");
-    assert_eq!(ctx.infer_type(&sty).to_string(), "Type");
+    assert_eq!(ctx.typecheck(&sty).ty().to_string(), "Type");
 
     // Struct value has a struct type
     let sval = p("{ a = z, b = z }");
-    assert_eq!(ctx.infer_type(&sval).to_string(), "{ a: N, b: N }");
+    assert_eq!(ctx.typecheck(&sval).ty().to_string(), "{ a: N, b: N }");
 
     // Field access
     let fa = p("{ a = z, b = z }.a");
-    assert_eq!(ctx.infer_type(&fa).to_string(), "N");
+    assert_eq!(ctx.typecheck(&fa).ty().to_string(), "N");
     assert_eq!(ctx.normalize(&fa).to_string(), "z");
 
     // Field access via variable
     ctx.add_val("p", p("{ a = z, b = z }"));
     let fb = p("p.b");
-    assert_eq!(ctx.infer_type(&fb).to_string(), "N");
+    assert_eq!(ctx.typecheck(&fb).ty().to_string(), "N");
     assert_eq!(ctx.normalize(&fb).to_string(), "z");
 }
 
@@ -69,17 +69,17 @@ fn test_equality() {
 
     // Eq type has a type
     let eq_ty = p("N == M");
-    assert_eq!(ctx.infer_type(&eq_ty).to_string(), "Type(1)");
+    assert_eq!(ctx.typecheck(&eq_ty).ty().to_string(), "Type(1)");
 
     // refl has an Eq type
     let r = p("refl N");
-    assert_eq!(ctx.infer_type(&r).to_string(), "N == N");
+    assert_eq!(ctx.typecheck(&r).ty().to_string(), "N == N");
 
     // transport type-checks: transport eq f : fn(f N) -> f M
     ctx.add_uninterpreted("eq", p("N == M"));
     let tr = p("transport eq f");
-    let ty = ctx.infer_type(&tr);
-    let ty = ctx.normalize(&ty);
+    let tr = ctx.typecheck(&tr);
+    let ty = ctx.normalize(tr.ty());
     assert_eq!(ty.to_string(), "N == N -> M == N");
 
     // transport with refl reduces to identity
@@ -98,12 +98,12 @@ fn test_scoping() {
     ctx.add_uninterpreted("x", p("N"));
 
     // Type-checking a lambda that shadows x should not leak x:M
-    ctx.infer_type(&p(r"|x: M| x"));
-    assert_eq!(ctx.infer_type(&p("x")).to_string(), "N");
+    ctx.typecheck(&p(r"|x: M| x"));
+    assert_eq!(ctx.typecheck(&p("x")).ty().to_string(), "N");
 
     // Same for normalization
     ctx.normalize(&p(r"|x: M| x"));
-    assert_eq!(ctx.infer_type(&p("x")).to_string(), "N");
+    assert_eq!(ctx.typecheck(&p("x")).ty().to_string(), "N");
 
     // A defined variable should still reduce after normalizing a shadowing binder
     ctx.add_val("y", p("x"));
@@ -164,7 +164,7 @@ fn test_rec() {
     ctx.add_uninterpreted("z", p("N"));
 
     let r = p("make ({ a: N }) { a = z }");
-    assert_eq!(ctx.infer_type(&r).to_string(), "{ a: N }");
+    assert_eq!(ctx.typecheck(&r).ty().to_string(), "{ a: N }");
     assert_eq!(
         ctx.normalize(&p("make ({ a: N }) { a = z }.a")).to_string(),
         "z"
@@ -173,7 +173,7 @@ fn test_rec() {
     ctx.add_val("MyTy", p("{ val: N, same: self.val == self.val }"));
     let r = p("make (MyTy) { val = z, same = refl z }");
     assert_eq!(
-        ctx.infer_type(&r).to_string(),
+        ctx.typecheck(&r).ty().to_string(),
         "{ val: N, same: self.val == self.val }"
     );
 }
@@ -187,7 +187,7 @@ fn test_let() {
 
     // Basic let
     assert_eq!(ctx.normalize(&p("let x = z in s x")).to_string(), "s z");
-    assert_eq!(ctx.infer_type(&p("let x = z in x")).to_string(), "N");
+    assert_eq!(ctx.typecheck(&p("let x = z in x")).ty().to_string(), "N");
 
     // Nested let
     assert_eq!(
@@ -224,10 +224,10 @@ fn test_todo() {
     ctx.add_uninterpreted("N", Type(0).into_expr());
 
     // todo has the declared type
-    assert_eq!(ctx.infer_type(&p("todo N")).to_string(), "N");
+    assert_eq!(ctx.typecheck(&p("todo N")).ty().to_string(), "N");
     // todo works in larger expressions
     assert_eq!(
-        ctx.infer_type(&p(r"|x: N| todo N")).to_string(),
+        ctx.typecheck(&p(r"|x: N| todo N")).ty().to_string(),
         "fn(x: N) -> N"
     );
 }
@@ -249,7 +249,7 @@ fn test_reject_rec_self_mismatch() {
     ctx.add_uninterpreted("z", p("N"));
     ctx.add_uninterpreted("m", p("M"));
     ctx.add_val("T", p("{ a: Type, b: Type, eq: self.a == self.b }"));
-    ctx.infer_type(&p("make (T) { a = N, b = M, eq = refl N }"));
+    ctx.typecheck(&p("make (T) { a = N, b = M, eq = refl N }"));
 }
 
 #[test]
@@ -258,7 +258,7 @@ fn test_reject_apply_non_function() {
     let mut ctx = EvalContext::default();
     ctx.add_uninterpreted("N", Type(0).into_expr());
     ctx.add_uninterpreted("z", p("N"));
-    ctx.infer_type(&p("z z"));
+    ctx.typecheck(&p("z z"));
 }
 
 #[test]
@@ -270,7 +270,7 @@ fn test_reject_arg_type_mismatch() {
     ctx.add_uninterpreted("f", p("N -> N"));
     ctx.add_uninterpreted("m", p("M"));
     // f expects N but gets M
-    ctx.infer_type(&p("f m"));
+    ctx.typecheck(&p("f m"));
 }
 
 #[test]
@@ -280,7 +280,7 @@ fn test_reject_value_as_type() {
     ctx.add_uninterpreted("N", Type(0).into_expr());
     ctx.add_uninterpreted("z", p("N"));
     // z is a value, not a type — can't use as binder type
-    ctx.infer_type(&p(r"|x: z| x"));
+    ctx.typecheck(&p(r"|x: z| x"));
 }
 
 #[test]
@@ -289,7 +289,7 @@ fn test_reject_field_on_non_struct() {
     let mut ctx = EvalContext::default();
     ctx.add_uninterpreted("N", Type(0).into_expr());
     ctx.add_uninterpreted("z", p("N"));
-    ctx.infer_type(&p("z.a"));
+    ctx.typecheck(&p("z.a"));
 }
 
 #[test]
@@ -298,17 +298,17 @@ fn test_reject_missing_field() {
     let mut ctx = EvalContext::default();
     ctx.add_uninterpreted("N", Type(0).into_expr());
     ctx.add_uninterpreted("z", p("N"));
-    ctx.infer_type(&p("{ a = z }.b"));
+    ctx.typecheck(&p("{ a = z }.b"));
 }
 
 #[test]
-#[should_panic(expected = "Struct type expected for rec")]
+#[should_panic(expected = "Struct type expected")]
 fn test_reject_make_non_struct_type() {
     let mut ctx = EvalContext::default();
     ctx.add_uninterpreted("N", Type(0).into_expr());
     ctx.add_uninterpreted("z", p("N"));
     // Annotation is N, not a struct type
-    ctx.infer_type(&p("make (N) { a = z }"));
+    ctx.typecheck(&p("make (N) { a = z }"));
 }
 
 #[test]
@@ -319,7 +319,7 @@ fn test_reject_make_field_type_mismatch() {
     ctx.add_uninterpreted("M", Type(0).into_expr());
     ctx.add_uninterpreted("z", p("N"));
     // Field a has type N but annotation says M
-    ctx.infer_type(&p("make ({ a: M }) { a = z }"));
+    ctx.typecheck(&p("make ({ a: M }) { a = z }"));
 }
 
 #[test]
@@ -329,7 +329,7 @@ fn test_reject_make_missing_field() {
     ctx.add_uninterpreted("N", Type(0).into_expr());
     ctx.add_uninterpreted("z", p("N"));
     // Annotation expects two fields but value only has one
-    ctx.infer_type(&p("make ({ a: N, b: N }) { a = z }"));
+    ctx.typecheck(&p("make ({ a: N, b: N }) { a = z }"));
 }
 
 #[test]
@@ -339,7 +339,7 @@ fn test_reject_make_extra_field() {
     ctx.add_uninterpreted("N", Type(0).into_expr());
     ctx.add_uninterpreted("z", p("N"));
     // Value has extra field not in annotation
-    ctx.infer_type(&p("make ({ a: N }) { a = z, b = z }"));
+    ctx.typecheck(&p("make ({ a: N }) { a = z, b = z }"));
 }
 
 #[test]
@@ -349,7 +349,7 @@ fn test_reject_eq_different_types() {
     ctx.add_uninterpreted("N", Type(0).into_expr());
     ctx.add_uninterpreted("z", p("N"));
     // z : N and N : Type — different types
-    ctx.infer_type(&p("z == N"));
+    ctx.typecheck(&p("z == N"));
 }
 
 #[test]
@@ -359,7 +359,7 @@ fn test_reject_transport_non_eq() {
     ctx.add_uninterpreted("N", Type(0).into_expr());
     ctx.add_uninterpreted("z", p("N"));
     ctx.add_uninterpreted("f", p("N -> N"));
-    ctx.infer_type(&p("transport z f"));
+    ctx.typecheck(&p("transport z f"));
 }
 
 #[test]
@@ -370,7 +370,7 @@ fn test_reject_transport_non_function() {
     ctx.add_uninterpreted("x", p("N"));
     ctx.add_uninterpreted("eq", p("x == x"));
     // second arg must be a function
-    ctx.infer_type(&p("transport eq x"));
+    ctx.typecheck(&p("transport eq x"));
 }
 
 #[test]
@@ -383,5 +383,5 @@ fn test_reject_transport_domain_mismatch() {
     ctx.add_uninterpreted("eq", p("x == x"));
     ctx.add_uninterpreted("f", p("M -> M"));
     // eq proves x == x where x: N, but f expects M
-    ctx.infer_type(&p("transport eq f"));
+    ctx.typecheck(&p("transport eq f"));
 }

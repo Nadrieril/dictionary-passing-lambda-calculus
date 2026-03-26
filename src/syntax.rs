@@ -112,6 +112,10 @@ impl Expr {
         &self.kind
     }
 
+    pub fn ty(&self) -> &Expr {
+        self.ty.as_deref().expect("type annotation missing")
+    }
+
     /// Apply a transformation to all direct subexpressions of this expression.
     pub fn map(&self, v: &mut impl ExprMapper) -> Self {
         let new_kind = match self.kind() {
@@ -177,6 +181,13 @@ impl ExprKind {
         Expr {
             kind: self,
             ty: None,
+        }
+    }
+
+    pub fn with_ty(self, ty: Expr) -> Expr {
+        Expr {
+            kind: self,
+            ty: Some(__(ty)),
         }
     }
 }
