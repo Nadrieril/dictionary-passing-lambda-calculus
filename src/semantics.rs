@@ -665,6 +665,43 @@ impl EvalContext {
             Type(k) => {
                 return Type(*k).with_ty(Type(k + 1).into_expr());
             }
+            Let(x, ty_ann, e1, e2) => {
+                let e1 = self.typecheck_inner(SubExprLocation::LetVal, e1);
+                let ty_ann = if let Some(ty) = ty_ann {
+                    let (ty, _) = self.typecheck_universe(SubExprLocation::LetTy, ty);
+                    self.assert_equal(&ty, e1.ty());
+                    Some(ty)
+                } else {
+                    None
+                };
+                let e2 = self.with_binding_in_scope(*x, Binding::with_value(&e1), |ctx| {
+                    // No `PathElem` here: a `let` body doesn't count wrt constructors.
+                    ctx.typecheck(e2)
+                });
+                let e2_ty = e2.ty().clone();
+                return Let(*x, ty_ann, e1, e2).with_ty(e2_ty);
+            }
+            LetRec(var, ty, e1, e2) => {
+                let (ty, _) = self.typecheck_universe(SubExprLocation::LetRecTy, ty);
+                // Push `var` with value immediately so it can reduce during its own typechecking
+                // (needed for self-referential types like `Trait` whose fields reference `Trait`
+                // applied to args). Marked nominal so whnf doesn't unfold it.
+                let binding = Binding::nominal(e1, &ty);
+                let (e1, e2) = self.with_binding_in_scope(*var, binding, |ctx| {
+                    ctx.progress_graphs.insert(*var, ProgressGraph::new(*var));
+                    let e1 = ctx.typecheck_inner(SubExprLocation::LetRecVal(*var), e1);
+                    ctx.assert_equal(&ty, e1.ty());
+
+                    let graph = ctx.progress_graphs.remove(var).unwrap();
+                    eprintln!("dependency graph for {var}:\n{graph}");
+                    graph.check_progress();
+
+                    let e2 = ctx.typecheck_inner(SubExprLocation::LetRecBody, e2);
+                    (e1, e2)
+                });
+                let e2_ty = e2.ty().clone();
+                return LetRec(*var, ty, e1, e2).with_ty(e2_ty);
+            }
             Pi(x, t1, t2, mentions) => {
                 let (t1, k1) = self.typecheck_universe(SubExprLocation::PiType, t1);
                 let (t2, k2) = self.with_binding_in_scope(*x, Binding::abstrakt(&t1), |ctx| {
@@ -764,43 +801,6 @@ impl EvalContext {
                     (None, actual)
                 };
                 (Struct(ty_ann, Arc::new(fields)), ty)
-            }
-            Let(x, ty_ann, e1, e2) => {
-                let e1 = self.typecheck_inner(SubExprLocation::LetVal, e1);
-                let ty_ann = if let Some(ty) = ty_ann {
-                    let (ty, _) = self.typecheck_universe(SubExprLocation::LetTy, ty);
-                    self.assert_equal(&ty, e1.ty());
-                    Some(ty)
-                } else {
-                    None
-                };
-                let e2 = self.with_binding_in_scope(*x, Binding::with_value(&e1), |ctx| {
-                    // No `PathElem` here: a `let` body doesn't count wrt constructors.
-                    ctx.typecheck(e2)
-                });
-                let e2_ty = e2.ty().clone();
-                return Let(*x, ty_ann, e1, e2).with_ty(e2_ty);
-            }
-            LetRec(var, ty, e1, e2) => {
-                let (ty, _) = self.typecheck_universe(SubExprLocation::LetRecTy, ty);
-                // Push `var` with value immediately so it can reduce during its own typechecking
-                // (needed for self-referential types like `Trait` whose fields reference `Trait`
-                // applied to args). Marked nominal so whnf doesn't unfold it.
-                let binding = Binding::nominal(e1, &ty);
-                let (e1, e2) = self.with_binding_in_scope(*var, binding, |ctx| {
-                    ctx.progress_graphs.insert(*var, ProgressGraph::new(*var));
-                    let e1 = ctx.typecheck_inner(SubExprLocation::LetRecVal(*var), e1);
-                    ctx.assert_equal(&ty, e1.ty());
-
-                    let graph = ctx.progress_graphs.remove(var).unwrap();
-                    eprintln!("dependency graph for {var}:\n{graph}");
-                    graph.check_progress();
-
-                    let e2 = ctx.typecheck_inner(SubExprLocation::LetRecBody, e2);
-                    (e1, e2)
-                });
-                let e2_ty = e2.ty().clone();
-                return LetRec(*var, ty, e1, e2).with_ty(e2_ty);
             }
             Field(e, name) => {
                 let loc = SubExprLocation::Destruct(Constructor::StructField(*name));
