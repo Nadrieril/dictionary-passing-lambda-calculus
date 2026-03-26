@@ -6,7 +6,7 @@ use ustr::Ustr;
 
 use ExprKind::*;
 
-use crate::semantics::{Constructor, FunctionShape, SubExprLocation};
+use crate::semantics::{Constructor, FunctionShape, SubExprLocation, TypeAnnotLocation};
 
 pub type Fields = Arc<IndexMap<Ustr, Expr>>;
 
@@ -120,10 +120,15 @@ impl Expr {
             .unwrap_or_else(|| panic!("Type expected, got {self}."))
     }
 
-    pub fn opt_ty(&self) -> Option<&Expr> {
-        self.0.ty.as_ref()
+    pub fn opt_ty(&self) -> Option<Expr> {
+        // To avoid infinite recursion, we don't store the type of `Type`s, so we recover that info
+        // here.
+        match self.kind() {
+            Type(k) => Some(Type(k + 1).into_expr()),
+            _ => self.0.ty.clone(),
+        }
     }
-    pub fn ty(&self) -> &Expr {
+    pub fn ty(&self) -> Expr {
         self.opt_ty().expect("type annotation missing")
     }
 
@@ -142,8 +147,8 @@ impl Expr {
             Type(k) => Type(*k),
             App(f, arg) => {
                 let f = v.map_expr(SubExprLocation::Destruct(Constructor::Lambda), f);
-                let mentions = match f.opt_ty().map(|ty| ty.kind()) {
-                    Some(Pi(_, _, _, mentions)) => mentions.clone(),
+                let mentions = match &f.opt_ty() {
+                    Some(ty) if let Pi(_, _, _, mentions) = ty.kind() => mentions.clone(),
                     _ => None,
                 };
                 let arg = v.map_expr(SubExprLocation::AppArg(mentions), arg);
@@ -166,7 +171,10 @@ impl Expr {
                 Lambda(x, t, e)
             }
             Let(x, ty, e1, e2) => {
-                let ty = ty.as_ref().map(|ty| v.map_expr(SubExprLocation::LetTy, ty));
+                let ty = ty.as_ref().map(|ty| {
+                    let loc = SubExprLocation::TypeAnnot(TypeAnnotLocation::Let);
+                    v.map_expr(loc, ty)
+                });
                 let e1 = v.map_expr(SubExprLocation::LetVal, e1);
                 let mut x = *x;
                 let e2 = v.under_abstraction(&mut x, Some(&e1), ty.as_ref(), |ctx| {
@@ -179,7 +187,7 @@ impl Expr {
                 let mut x = *x;
                 let (ty, e1, e2) = v.under_recursive_abstraction(&mut x, Some(&e1), &ty, |ctx| {
                     (
-                        ctx.map_expr(SubExprLocation::LetRecTy, &ty),
+                        ctx.map_expr(SubExprLocation::TypeAnnot(TypeAnnotLocation::LetRec), &ty),
                         ctx.map_expr(SubExprLocation::LetRecVal(orig_x), &e1),
                         ctx.map_expr(SubExprLocation::LetRecBody, &e2),
                     )
@@ -187,8 +195,10 @@ impl Expr {
                 LetRec(x, ty, e1, e2)
             }
             Struct(ty, fields) => Struct(
-                ty.as_ref()
-                    .map(|ty| v.map_expr(SubExprLocation::StructAnnot, ty)),
+                ty.as_ref().map(|ty| {
+                    let loc = SubExprLocation::TypeAnnot(TypeAnnotLocation::StructMake);
+                    v.map_expr(loc, ty)
+                }),
                 Arc::new(
                     fields
                         .iter()
@@ -234,7 +244,7 @@ impl Expr {
             .0
             .ty
             .as_ref()
-            .map(|ty| v.map_expr(SubExprLocation::Destruct(Constructor::TypeOf), ty));
+            .map(|ty| v.map_expr(SubExprLocation::TypeAnnot(TypeAnnotLocation::TypeOf), ty));
         Expr::new(new_kind, new_ty)
     }
 }

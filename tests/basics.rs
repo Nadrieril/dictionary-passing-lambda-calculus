@@ -79,7 +79,7 @@ fn test_equality() {
     ctx.add_uninterpreted("eq", p("N == M"));
     let tr = p("transport eq f");
     let tr = ctx.typecheck(&tr);
-    let ty = ctx.normalize(tr.ty());
+    let ty = ctx.normalize(&tr.ty());
     assert_eq!(ty.to_string(), "N == N -> M == N");
 
     // transport with refl reduces to identity

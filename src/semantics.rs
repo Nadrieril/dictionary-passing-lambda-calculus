@@ -118,7 +118,6 @@ pub enum Constructor {
     EqLeft,
     EqRight,
     Refl,
-    TypeOf,
 }
 
 /// A series of constructors.
@@ -221,7 +220,6 @@ impl ConstructorPath {
                         Constructor::StructField(f) | Constructor::StructTyField(f) => {
                             format!(".{f}")
                         }
-                        Constructor::TypeOf => format!(".value_of"),
                         Constructor::EqLeft => format!(".eq_left"),
                         Constructor::EqRight => format!(".eq_right"),
                         Constructor::Refl => format!(".refl_arg"),
@@ -259,38 +257,32 @@ impl MentionPath {
     fn from_path<'a>(
         path: impl IntoIterator<Item = &'a SubExprLocation> + Clone,
     ) -> Result<Vec<Self>, (ConstructorPath, SubExprLocation)> {
-        if path
-            .clone()
-            .into_iter()
-            .any(|pe| matches!(pe, SubExprLocation::AppArg(..) | SubExprLocation::LetVal))
-        {
-            // Compute all the possible combinations of paths.
-            path.into_iter()
-                .map(|pe| match pe {
-                    SubExprLocation::AppArg(Some(mentions)) => {
-                        // Each item here is a possible path we can take.
-                        mentions.iter().map(|m| Either::Left(*m)).collect_vec()
-                    }
-                    // We skip paths bound to a `let` because we'll explore them when we encounter
-                    // the binding instead.
-                    SubExprLocation::LetVal => vec![],
-                    pe => vec![Either::Right(pe.clone())],
-                })
-                .multi_cartesian_product()
-                .map(|vv: Vec<Either<MentionPath, SubExprLocation>>| {
-                    let path: Vec<SubExprLocation> = vv
-                        .into_iter()
-                        .flat_map(|either| match either {
-                            Either::Left(m) => Either::Left(m.to_path()),
-                            Either::Right(pe) => Either::Right([pe].into_iter()),
-                        })
-                        .collect_vec();
-                    Self::from_single_path(&path)
-                })
-                .try_collect()
-        } else {
-            Self::from_single_path(path).map(|x| vec![x])
-        }
+        // Compute all the possible combinations of paths.
+        path.into_iter()
+            .map(|pe| match pe {
+                SubExprLocation::AppArg(Some(mentions)) => {
+                    // Each item here is a possible path we can take.
+                    mentions.iter().map(|m| Either::Left(*m)).collect_vec()
+                }
+                // We skip paths bound to a `let` because we'll explore them when we encounter
+                // the binding instead.
+                SubExprLocation::LetVal => vec![],
+                // A type annotation is not subject to projections.
+                SubExprLocation::TypeAnnot(..) => vec![],
+                pe => vec![Either::Right(pe.clone())],
+            })
+            .multi_cartesian_product()
+            .map(|vv: Vec<Either<MentionPath, SubExprLocation>>| {
+                let path: Vec<SubExprLocation> = vv
+                    .into_iter()
+                    .flat_map(|either| match either {
+                        Either::Left(m) => Either::Left(m.to_path()),
+                        Either::Right(pe) => Either::Right([pe].into_iter()),
+                    })
+                    .collect_vec();
+                Self::from_single_path(&path)
+            })
+            .try_collect()
     }
     /// `from_path` but without support for function application.
     fn from_single_path<'a>(
@@ -506,6 +498,15 @@ impl Display for ProgressGraph {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, EnumAsInner)]
+pub enum TypeAnnotLocation {
+    Let,
+    LetRec,
+    StructMake,
+    /// A type constructed during typechecking.
+    TypeOf,
+}
+
 /// Describes which sub-expression position we are in within the expression tree.
 /// One variant per nested `Expr` location inside an `Expr`.
 #[derive(Debug, Clone, PartialEq, Eq, EnumAsInner)]
@@ -514,11 +515,11 @@ pub enum SubExprLocation {
     Construct(Constructor),
     /// We applied a destructor corresponding to this constructor.
     Destruct(Constructor),
+    /// We're checking a type annotation.
+    TypeAnnot(TypeAnnotLocation),
     // Let / LetRec
-    LetTy,
     LetVal,
     LetBody,
-    LetRecTy,
     LetRecVal(Variable),
     LetRecBody,
     // Pi / Lambda
@@ -526,8 +527,6 @@ pub enum SubExprLocation {
     LambdaType,
     // Argument of a function application. If known, stores the shape of the function.
     AppArg(Option<FunctionShape>),
-    // Struct / StructTy
-    StructAnnot,
     // Eq / Refl / Transport
     TransportFn,
     // Todo
@@ -568,7 +567,7 @@ impl EvalContext {
     /// Add a value to the environment. Used in tests.
     pub fn add_val(&mut self, x: &str, value: Expr) {
         let x = Variable::user(x);
-        let value = self.typecheck_inner(SubExprLocation::LetVal, &value);
+        let value = self.typecheck(&value);
         self.push_binding(x, Binding::with_value(&value));
     }
     /// Run `f` with a temporary scope where the given binding is declared.
@@ -721,7 +720,7 @@ impl EvalContext {
                         {
                             // We're inside a `let rec val` definition, and we found a recursive reference
                             // to `val`.
-                            match MentionPath::from_path(subpath) {
+                            match MentionPath::from_path(subpath.clone()) {
                                 Ok(mention_paths) => {
                                     // We can handle all the paths from the start of the `let rec` to here;
                                     // add them to the graph.
@@ -735,7 +734,7 @@ impl EvalContext {
                                     panic!(
                                         "failed to prove progress of {x}: \
                                         recursive mention found under a {pe:?}\n  \
-                                        location: {}",
+                                        location: {}\npath: {subpath:?}",
                                         ctor_path.display_on(*x),
                                     );
                                 }
@@ -746,19 +745,18 @@ impl EvalContext {
                 }
                 return Var(*x).with_ty(binding_ty);
             }
-            Type(k) => {
-                return Type(*k).with_ty(Type(k + 1).into_expr());
-            }
+            // `Expr::ty` already returns `Type(k+1)` for the type of this expression.
+            Type(_) => return e.clone(),
             Let(_, ty, e1, e2) => {
                 if let Some(ty) = ty {
                     ty.ty().unwrap_universe();
-                    self.assert_equal(&ty, e1.ty());
+                    self.assert_equal(&ty, &e1.ty());
                 }
                 e2.ty().clone()
             }
             LetRec(_, ty, e1, e2) => {
                 ty.ty().unwrap_universe();
-                self.assert_equal(&ty, e1.ty());
+                self.assert_equal(&ty, &e1.ty());
                 e2.ty().clone()
             }
             Pi(_, t1, t2, _) => {
@@ -797,10 +795,10 @@ impl EvalContext {
                 Pi(*x, t.clone(), body_ty, mentions).into_expr()
             }
             App(f, arg) => {
-                let Pi(x, s, t, _) = self.whnf_unfold(f.ty()).kind().clone() else {
+                let Pi(x, s, t, _) = self.whnf_unfold(&f.ty()).kind().clone() else {
                     panic!("Function expected.")
                 };
-                self.assert_equal(&s, arg.ty());
+                self.assert_equal(&s, &arg.ty());
                 t.subst1(x, &arg)
             }
             StructTy(_, fields) => {
@@ -832,7 +830,7 @@ impl EvalContext {
                 }
             }
             Field(e, name) => {
-                let te = self.whnf_unfold(e.ty());
+                let te = self.whnf_unfold(&e.ty());
                 let StructTy(self_var, fields) = te.kind().clone() else {
                     panic!("Struct type expected for field access, got `{te}`")
                 };
@@ -843,18 +841,20 @@ impl EvalContext {
                 field_ty.subst1(self_var, &e)
             }
             Eq(a, b) => {
-                self.assert_equal(a.ty(), b.ty());
-                let a_ty =
-                    self.typecheck_inner(SubExprLocation::Destruct(Constructor::TypeOf), a.ty());
+                self.assert_equal(&a.ty(), &b.ty());
+                let a_ty = self.typecheck_inner(
+                    SubExprLocation::TypeAnnot(TypeAnnotLocation::TypeOf),
+                    &a.ty(),
+                );
                 let k = a_ty.ty().unwrap_universe();
                 Type(k).into_expr()
             }
             Refl(a) => Eq(a.clone(), a.clone()).into_expr(),
             Transport(eq, f) => {
-                let Eq(a, b) = self.whnf_unfold(eq.ty()).kind().clone() else {
+                let Eq(a, b) = self.whnf_unfold(&eq.ty()).kind().clone() else {
                     panic!("Equality type expected for transport")
                 };
-                let Pi(..) = self.whnf_unfold(f.ty()).kind() else {
+                let Pi(..) = self.whnf_unfold(&f.ty()).kind() else {
                     panic!("Function expected for transport's second argument")
                 };
                 let transport_ty = Pi(
@@ -870,7 +870,7 @@ impl EvalContext {
         };
 
         // Recursively check the type is well-formed.
-        let _ = self.typecheck_inner(SubExprLocation::Destruct(Constructor::TypeOf), &ty);
+        let ty = self.typecheck_inner(SubExprLocation::TypeAnnot(TypeAnnotLocation::TypeOf), &ty);
         let ty = self.whnf(&ty);
         annotated_e.kind().clone().with_ty(ty)
     }
