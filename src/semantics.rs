@@ -41,6 +41,7 @@ impl Expr {
             fn under_abstraction<T>(
                 &mut self,
                 x: &mut Variable,
+                _val: Option<&Expr>,
                 _ty: Option<&Expr>,
                 f: impl FnOnce(&mut Self) -> T,
             ) -> T {
@@ -317,6 +318,8 @@ impl MentionPath {
                 SubExprLocation::Destruct(ctor) => {
                     dtor_path.push(ctor);
                 }
+                // A `let` body doesn't count wrt constructors
+                SubExprLocation::LetBody => {}
                 _ => return Err((ctor_path, pe)),
             }
         }
@@ -609,7 +612,94 @@ impl EvalContext {
     }
     /// Typechecks an expression and returns the expression with type annotations added.
     pub fn typecheck(&mut self, e: &Expr) -> Expr {
-        let (kind, ty): (ExprKind, Expr) = match e.kind() {
+        // Typecheck and annotate all subexpressions. Also keep the binding used, if any.
+        let (annotated_e, last_binding) = {
+            struct TypeChecker<'a> {
+                ctx: &'a mut EvalContext,
+                // Little bit of a hack to get a hold of the last binding used, which may contain some
+                // path info.
+                last_binding: Option<Binding>,
+            }
+
+            impl<'a> TypeChecker<'a> {
+                fn new(ctx: &'a mut EvalContext) -> Self {
+                    Self {
+                        ctx,
+                        last_binding: None,
+                    }
+                }
+                fn with_binding_in_scope<T>(
+                    &mut self,
+                    var: &mut Variable,
+                    f: impl FnOnce(&mut <TypeChecker<'a> as ExprMapper>::SelfWithNewLifetime<'_>) -> T,
+                    binding: Binding,
+                ) -> T {
+                    let (ret, binding) =
+                        self.ctx
+                            .with_binding_in_scope_keep_binding(*var, binding, |ctx| {
+                                f(&mut TypeChecker::new(ctx))
+                            });
+                    self.last_binding = Some(binding);
+                    ret
+                }
+            }
+
+            impl<'a> ExprMapper for TypeChecker<'a> {
+                fn map_expr(&mut self, l: SubExprLocation, e: &Expr) -> Expr {
+                    if let SubExprLocation::LetRecVal(var) = l {
+                        self.ctx
+                            .progress_graphs
+                            .insert(var, ProgressGraph::new(var));
+                        let e = self.ctx.typecheck_inner(l, e);
+
+                        let graph = self.ctx.progress_graphs.remove(&var).unwrap();
+                        eprintln!("dependency graph for {var}:\n{graph}");
+                        graph.check_progress();
+                        e
+                    } else {
+                        self.ctx.typecheck_inner(l, e)
+                    }
+                }
+
+                type SelfWithNewLifetime<'b> = TypeChecker<'b>;
+                fn under_abstraction<T>(
+                    &mut self,
+                    var: &mut Variable,
+                    val: Option<&Expr>,
+                    ty: Option<&Expr>,
+                    f: impl for<'b> FnOnce(&mut TypeChecker<'b>) -> T,
+                ) -> T {
+                    let binding = match val {
+                        Some(val) => Binding::with_value(val),
+                        None => Binding::abstrakt(ty.unwrap()),
+                    };
+                    self.with_binding_in_scope(var, f, binding)
+                }
+                fn under_recursive_abstraction<T>(
+                    &mut self,
+                    var: &mut Variable,
+                    // The not-yet-mapped value of `var`, if any.
+                    val: Option<&Expr>,
+                    // The not-yet-mapped type of `var`.
+                    ty: &Expr,
+                    f: impl for<'b> FnOnce(&mut Self::SelfWithNewLifetime<'b>) -> T,
+                ) -> T {
+                    // Push `var` with value immediately so it can reduce during its own
+                    // typechecking. Marked nominal so whnf doesn't unfold it .
+                    let binding = match val {
+                        Some(val) => Binding::nominal(val, ty),
+                        None => Binding::abstrakt(ty),
+                    };
+                    self.with_binding_in_scope(var, f, binding)
+                }
+            }
+
+            let mut type_checker_ctx = TypeChecker::new(self);
+            let e = e.without_ty().map(&mut type_checker_ctx);
+            (e, type_checker_ctx.last_binding)
+        };
+
+        let ty = match annotated_e.kind() {
             Var(x) => {
                 let binding = self
                     .lookup_binding(*x)
@@ -665,59 +755,26 @@ impl EvalContext {
             Type(k) => {
                 return Type(*k).with_ty(Type(k + 1).into_expr());
             }
-            Let(x, ty_ann, e1, e2) => {
-                let e1 = self.typecheck_inner(SubExprLocation::LetVal, e1);
-                let ty_ann = if let Some(ty) = ty_ann {
-                    let (ty, _) = self.typecheck_universe(SubExprLocation::LetTy, ty);
+            Let(_, ty, e1, e2) => {
+                if let Some(ty) = ty {
+                    ty.ty().unwrap_universe();
                     self.assert_equal(&ty, e1.ty());
-                    Some(ty)
-                } else {
-                    None
-                };
-                let e2 = self.with_binding_in_scope(*x, Binding::with_value(&e1), |ctx| {
-                    // No `PathElem` here: a `let` body doesn't count wrt constructors.
-                    ctx.typecheck(e2)
-                });
-                let e2_ty = e2.ty().clone();
-                (Let(*x, ty_ann, e1, e2), e2_ty)
+                }
+                e2.ty().clone()
             }
-            LetRec(var, ty, e1, e2) => {
-                let (ty, _) = self.typecheck_universe(SubExprLocation::LetRecTy, ty);
-                // Push `var` with value immediately so it can reduce during its own typechecking
-                // (needed for self-referential types like `Trait` whose fields reference `Trait`
-                // applied to args). Marked nominal so whnf doesn't unfold it.
-                let binding = Binding::nominal(e1, &ty);
-                let (e1, e2) = self.with_binding_in_scope(*var, binding, |ctx| {
-                    ctx.progress_graphs.insert(*var, ProgressGraph::new(*var));
-                    let e1 = ctx.typecheck_inner(SubExprLocation::LetRecVal(*var), e1);
-                    ctx.assert_equal(&ty, e1.ty());
-
-                    let graph = ctx.progress_graphs.remove(var).unwrap();
-                    eprintln!("dependency graph for {var}:\n{graph}");
-                    graph.check_progress();
-
-                    let e2 = ctx.typecheck_inner(SubExprLocation::LetRecBody, e2);
-                    (e1, e2)
-                });
-                let e2_ty = e2.ty().clone();
-                (LetRec(*var, ty, e1, e2), e2_ty)
+            LetRec(_, ty, e1, e2) => {
+                ty.ty().unwrap_universe();
+                self.assert_equal(&ty, e1.ty());
+                e2.ty().clone()
             }
-            Pi(x, t1, t2, mentions) => {
-                let (t1, k1) = self.typecheck_universe(SubExprLocation::PiType, t1);
-                let (t2, k2) = self.with_binding_in_scope(*x, Binding::abstrakt(&t1), |ctx| {
-                    ctx.typecheck_universe(SubExprLocation::Construct(Constructor::Pi), t2)
-                });
-                (
-                    Pi(*x, t1, t2, mentions.clone()),
-                    Type(k1.max(k2)).into_expr(),
-                )
+            Pi(_, t1, t2, _) => {
+                let k1 = t1.ty().unwrap_universe();
+                let k2 = t2.ty().unwrap_universe();
+                Type(k1.max(k2)).into_expr()
             }
             Lambda(x, t, body) => {
-                let (t, _) = self.typecheck_universe(SubExprLocation::LambdaType, t);
-                let (body, binding) =
-                    self.with_binding_in_scope_keep_binding(*x, Binding::abstrakt(&t), |ctx| {
-                        ctx.typecheck_inner(SubExprLocation::Construct(Constructor::Lambda), body)
-                    });
+                t.ty().unwrap_universe();
+                let binding = last_binding.unwrap();
                 let mentions = {
                     let BindingKind::Abstract { paths } = binding.kind else {
                         unreachable!()
@@ -743,49 +800,28 @@ impl EvalContext {
                         .ok()
                 };
                 let body_ty = body.ty().clone();
-                (
-                    Lambda(*x, t.clone(), body),
-                    Pi(*x, t, body_ty, mentions).into_expr(),
-                )
+                Pi(*x, t.clone(), body_ty, mentions).into_expr()
             }
             App(f, arg) => {
-                let f = self.typecheck_inner(SubExprLocation::Destruct(Constructor::Lambda), f);
-                let Pi(x, s, t, mentions) = self.whnf_unfold(f.ty()).kind().clone() else {
+                let Pi(x, s, t, _) = self.whnf_unfold(f.ty()).kind().clone() else {
                     panic!("Function expected.")
                 };
-                let arg = self.typecheck_inner(SubExprLocation::AppArg(mentions), arg);
                 self.assert_equal(&s, arg.ty());
-                let app_ty = t.subst1(x, &arg);
-                (App(f, arg), app_ty)
+                t.subst1(x, &arg)
             }
-            StructTy(x, fields) => {
-                let (fields, k) = self.with_binding_in_scope(*x, Binding::abstrakt(e), |ctx| {
-                    let mut max_k = 0usize;
-                    let fields: indexmap::IndexMap<Ustr, Expr> = fields
-                        .iter()
-                        .map(|(&f, t)| {
-                            let loc = SubExprLocation::Construct(Constructor::StructTyField(f));
-                            let (t, k) = ctx.typecheck_universe(loc, t);
-                            max_k = max_k.max(k);
-                            (f, t)
-                        })
-                        .collect();
-                    (Arc::new(fields), max_k)
-                });
-                (StructTy(*x, fields), Type(k).into_expr())
+            StructTy(_, fields) => {
+                let k = fields
+                    .iter()
+                    .map(|(_, t)| t.ty().unwrap_universe())
+                    .max()
+                    .unwrap_or(0);
+                Type(k).into_expr()
             }
             Struct(ty_ann, fields) => {
-                let (field_tys, fields) = fields
-                    .iter()
-                    .map(|(&n, e)| {
-                        let loc = SubExprLocation::Construct(Constructor::StructField(n));
-                        let e = self.typecheck_inner(loc, e);
-                        ((n, e.ty().clone()), (n, e))
-                    })
-                    .collect();
+                let field_tys = fields.iter().map(|(&n, e)| (n, e.ty().clone())).collect();
                 let actual = StructTy(Variable::user("self"), Arc::new(field_tys)).into_expr();
-                let (ty_ann, ty) = if let Some(ty_ann) = ty_ann {
-                    let (ty_ann, _) = self.typecheck_universe(SubExprLocation::StructAnnot, ty_ann);
+                if let Some(ty_ann) = ty_ann {
+                    ty_ann.ty().unwrap_universe();
                     {
                         let StructTy(self_var, field_tys) =
                             self.whnf_unfold(&ty_ann).kind().clone()
@@ -793,18 +829,15 @@ impl EvalContext {
                             panic!("Struct type expected for `make`")
                         };
                         let expected = StructTy(self_var.refresh(), field_tys).into_expr();
-                        let expected = expected.subst1(self_var, e);
+                        let expected = expected.subst1(self_var, &annotated_e);
                         self.assert_equal(&expected, &actual);
                     }
-                    (Some(ty_ann.clone()), ty_ann)
+                    ty_ann.clone()
                 } else {
-                    (None, actual)
-                };
-                (Struct(ty_ann, Arc::new(fields)), ty)
+                    actual
+                }
             }
             Field(e, name) => {
-                let loc = SubExprLocation::Destruct(Constructor::StructField(*name));
-                let e = self.typecheck_inner(loc, e);
                 let te = self.whnf_unfold(e.ty());
                 let StructTy(self_var, fields) = te.kind().clone() else {
                     panic!("Struct type expected for field access, got `{te}`")
@@ -813,26 +846,20 @@ impl EvalContext {
                     .get(name)
                     .unwrap_or_else(|| panic!("Field {name} not found"))
                     .clone();
-                let field_ty = field_ty.subst1(self_var, &e);
-                (Field(e, *name), field_ty)
+                field_ty.subst1(self_var, &e)
             }
             Eq(a, b) => {
-                let a = self.typecheck_inner(SubExprLocation::Construct(Constructor::EqLeft), a);
-                let b = self.typecheck_inner(SubExprLocation::Construct(Constructor::EqRight), b);
                 self.assert_equal(a.ty(), b.ty());
-                let k = self.infer_universe(SubExprLocation::Destruct(Constructor::TypeOf), a.ty());
-                (Eq(a, b), Type(k).into_expr())
+                let a_ty =
+                    self.typecheck_inner(SubExprLocation::Destruct(Constructor::TypeOf), a.ty());
+                let k = a_ty.ty().unwrap_universe();
+                Type(k).into_expr()
             }
-            Refl(a) => {
-                let a = self.typecheck_inner(SubExprLocation::Construct(Constructor::Refl), a);
-                (Refl(a.clone()), Eq(a.clone(), a).into_expr())
-            }
+            Refl(a) => Eq(a.clone(), a.clone()).into_expr(),
             Transport(eq, f) => {
-                let eq = self.typecheck_inner(SubExprLocation::Destruct(Constructor::Refl), eq);
                 let Eq(a, b) = self.whnf_unfold(eq.ty()).kind().clone() else {
                     panic!("Equality type expected for transport")
                 };
-                let f = self.typecheck_inner(SubExprLocation::TransportFn, f);
                 let Pi(..) = self.whnf_unfold(f.ty()).kind() else {
                     panic!("Function expected for transport's second argument")
                 };
@@ -843,29 +870,15 @@ impl EvalContext {
                     Some(Arc::new([MentionPath::identity()])), // it's an identity function
                 )
                 .into_expr();
-                (Transport(eq, f), transport_ty)
+                transport_ty
             }
-            Todo(t) => {
-                let t = self.typecheck_inner(SubExprLocation::TodoArg, t);
-                (Todo(t.clone()), t)
-            }
+            Todo(t) => t.clone(),
         };
+
         // Recursively check the type is well-formed.
         let _ = self.typecheck_inner(SubExprLocation::Destruct(Constructor::TypeOf), &ty);
         let ty = self.whnf(&ty);
-        kind.with_ty(ty)
-    }
-    /// Like `typecheck_inner` but also checks the result type is a universe and returns its level.
-    fn typecheck_universe(&mut self, loc: SubExprLocation, t: &Expr) -> (Expr, usize) {
-        let t = self.typecheck_inner(loc, t);
-        let k = match t.ty().kind() {
-            Type(k) => *k,
-            _ => panic!("Type expected, got {}.", t.ty()),
-        };
-        (t, k)
-    }
-    fn infer_universe(&mut self, loc: SubExprLocation, t: &Expr) -> usize {
-        self.typecheck_universe(loc, t).1
+        annotated_e.kind().clone().with_ty(ty)
     }
 
     /// Weak head normal form. Does not unfold nominal variables,
@@ -944,6 +957,7 @@ impl EvalContext {
             fn under_abstraction<T>(
                 &mut self,
                 var: &mut Variable,
+                _val: Option<&Expr>,
                 ty: Option<&Expr>,
                 f: impl for<'b> FnOnce(&mut Normalizer<'b>) -> T,
             ) -> T {
