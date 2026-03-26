@@ -331,3 +331,82 @@ fn non_orderable_gats() {
         {=}
     "));
 }
+
+#[test]
+fn binder_in_scope_of_its_type() {
+    let mut ctx = EvalContext::default();
+    ctx.typecheck(&p(r"
+        // trait Trait<T: Trait<T>> {}
+        let rec Trait(Self: Type, t: Type) -> Type(1) = {
+            t_trait: Trait(Self, t),
+        } in
+
+        // trait Trait<T: Trait<Self::Type>> { type Type; }
+        let rec Trait(Self: Type, t: Type) -> Type(1) = {
+            type: Type,
+            t_trait: Trait(Self, self.type),
+        } in
+
+        // impl<T> Trait<T> for T {
+        //   type Type = T;
+        // }
+        let rec Impl(t: Type) -> Trait(t, t) = make (Trait(t, t)) {
+            type = t,
+            t_trait = Impl(t),
+        } in
+
+        {=}
+    "));
+}
+
+#[test]
+#[should_panic(expected = "AppArg(None)")]
+fn diverging_assoc_item_bound() {
+    // From https://github.com/rust-lang/rust/issues/135011#issuecomment-2590368611
+    let mut ctx = EvalContext::default();
+    ctx.typecheck(&p(r"
+        let Unit = {} in
+        let mutual_rec_ty = {
+            Equal: fn(Self: Type, r: Type) -> Type(1),
+            Multi: fn(Self: Type, r: Type) -> Type(1),
+            EqualImpl: fn(l: Type, r: Type) -> self.Equal(l, r),
+            MultiImpl: fn(r: Type, l: Type, l_eq: self.Equal(l, r)) -> self.Multi(r, l),
+        } in
+        let rec mutual_rec: mutual_rec_ty = make (mutual_rec_ty) {
+            // trait Equal<R>: Sized {
+            //     type To: Multi<Self>;
+            // }
+            Equal = |Self: Type, R: Type| {
+                to: Type,
+                to_multi: mutual_rec.Multi(self.to, Self),
+            },
+
+            // impl<L, R> Equal<R> for L {
+            //     type To = R;
+            // }
+            EqualImpl = |l: Type, r: Type| make (mutual_rec.Equal(l, r)) {
+                to = r,
+                to_multi = mutual_rec.MultiImpl(r, l, mutual_rec.EqualImpl(l, r)),
+            },
+
+            // trait Multi<L>: Sized {
+            //     type Cyclic;
+            // }
+            Multi = |Self: Type, l: Type| {
+                cyclic: Type,
+            },
+
+            // impl<R, L> Multi<L> for R
+            // where
+            //     L: Equal<R>,
+            // {
+            //     type Cyclic = <L::To as Multi<L>>::Cyclic;
+            // }
+            MultiImpl = |r: Type, l: Type, l_eq: mutual_rec.Equal(l, r)| make (mutual_rec.Multi(r, l)) {
+                cyclic = l_eq.to_multi.cyclic,
+            },
+        } in
+
+        {=}
+    "));
+}

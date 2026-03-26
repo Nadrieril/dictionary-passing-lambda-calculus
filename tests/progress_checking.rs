@@ -26,6 +26,82 @@ fn magic_good() {
 }
 
 #[test]
+#[should_panic(expected = "AppArg(None)")]
+fn magic_crazy() {
+    let mut ctx = EvalContext::default();
+    ctx.normalize(&p(r"
+        let rec Copy(t: Type) -> Type = {} in
+
+        let rec Magic(t: Type) -> Type = {
+            supertrait1: Copy t,
+            supertrait2: Copy t,
+        } in
+
+        // impl<T: Magic> Magic for T {}
+        let rec MagicImpl(t: Type, t_copy: Copy t) -> Magic t = make (Magic t) {
+            supertrait1 = t_copy,
+            supertrait2 = (MagicImpl t (MagicImpl t t_copy).supertrait1).supertrait1, // that's productive!
+        } in
+
+        {=}
+        "));
+}
+
+#[test]
+#[should_panic(expected = "failed to prove progress")]
+fn progress_through_transport() {
+    let mut ctx = EvalContext::default();
+    ctx.normalize(&p(r"
+        let rec Copy(t: Type) -> Type = {} in
+
+        let Unit = {} in
+        let ref(t: Type) = t in
+
+        // trait Trait {
+        //     type Assoc;
+        //     type Assoc2;
+        // }
+        let Trait(t: Type) = {
+            assoc: Type,
+            // assoc2: Type,
+        } in
+
+        // impl Trait for () {
+        //     type Assoc = ();
+        // }
+        let UnitImpl = make (Trait Unit) {
+            assoc = Unit,
+            // assoc2 = Unit,
+        } in
+
+        // impl<T> Trait for Box<T>
+        // where
+        //     T: Trait,
+        //     T::Assoc: Trait,
+        // {
+        //    type Assoc = T;
+        //    type Assoc2 = T::Assoc::Assoc;
+        // }
+        let BoxImpl(t: Type, t_trait: Trait(t), t_assoc: Trait (t_trait.assoc)) = make (Trait(t)) {
+            // assoc = t,
+            assoc = t_assoc.assoc,
+            // assoc2 = t_assoc.assoc,
+        } in
+
+        // impl<T: Trait<Assoc=&()>> Trait for &T {
+        //     type Assoc = <Box<T> as Trait>::Assoc;
+        //     type Assoc2 = ();
+        // }
+        let rec RefImpl(t: Type, t_trait: Trait(t), unit_bound: ref Unit == t_trait.assoc) -> Trait(t) = make(Trait(ref t)) {
+            assoc = BoxImpl(t, t_trait, transport unit_bound Trait (RefImpl(Unit, UnitImpl, refl Unit))).assoc,
+            // assoc2 = Unit,
+        } in
+
+        {=}
+    "));
+}
+
+#[test]
 #[should_panic(expected = "depends on itself")]
 fn cycle() {
     let mut ctx = EvalContext::default();
