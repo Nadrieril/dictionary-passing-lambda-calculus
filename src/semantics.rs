@@ -254,15 +254,6 @@ pub struct MentionPath {
 pub type FunctionShape = Arc<[MentionPath]>;
 
 impl MentionPath {
-    /// The shape of the identity function: the variable is mentioned directly, with no
-    /// projections nor constructors.
-    fn identity() -> Self {
-        MentionPath {
-            ctor_path: ConstructorPath::Empty,
-            dtor_path: ConstructorPath::Empty,
-        }
-    }
-
     /// Convert a location to a number of `MentionPath`s. There can be several if we encounter a
     /// function application that uses its argument several times.
     fn from_path<'a>(
@@ -867,7 +858,7 @@ impl EvalContext {
                     Variable::anon(),
                     App(f.clone(), a).into_expr(),
                     App(f.clone(), b).into_expr(),
-                    Some(Arc::new([MentionPath::identity()])), // it's an identity function
+                    None,
                 )
                 .into_expr();
                 transport_ty
