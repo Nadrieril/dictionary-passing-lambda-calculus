@@ -86,6 +86,7 @@ fn comma_list<'a, O>(
 
 const KEYWORDS: &[&str] = &[
     "Type",
+    "and",
     "fn",
     "in",
     "let",
@@ -364,6 +365,72 @@ fn parse_eq(input: &str) -> IResult<'_, Expr> {
         .parse(input)
 }
 
+fn var_ustr(v: Variable) -> Ustr {
+    match v {
+        Variable::User(u) | Variable::SorryDeBruijn(u, _) => u,
+    }
+}
+
+/// Desugar `let rec name1: T1 = e1 and name2: T2 = e2 and ... in rest` into a single
+/// `let rec` over a combined record type, with field projections in the body and continuation.
+fn desugar_mutual_rec(bindings: Vec<(Variable, Expr, Expr)>, rest: Expr) -> Expr {
+    let mutual_rec = Variable::user("mutual_rec").refresh();
+
+    // Build the combined struct type: { name1: T1, name2: T2, ... }
+    let ty_fields: Vec<(Ustr, Expr)> = bindings
+        .iter()
+        .map(|(name, ty, _)| (var_ustr(*name), ty.clone()))
+        .collect();
+    let struct_ty = StructTy(Variable::user("self"), fields_from_vec(ty_fields)).into_expr();
+
+    // Build the body of `mutual_rec`:
+    //   let name1 = mutual_rec.name1 in
+    //   let name2 = mutual_rec.name2 in
+    //   make (struct_ty) { name1 = body1, name2 = body2, ... }
+    let val_fields: Vec<(Ustr, Expr)> = bindings
+        .iter()
+        .map(|(name, _, body)| (var_ustr(*name), body.clone()))
+        .collect();
+    let make_expr = Struct(Some(struct_ty.clone()), fields_from_vec(val_fields)).into_expr();
+    let struct_body = bindings.iter().rev().fold(make_expr, |acc, (name, _, _)| {
+        let field_acc = Field(Var(mutual_rec).into_expr(), var_ustr(*name)).into_expr();
+        Let(*name, None, field_acc, acc).into_expr()
+    });
+
+    // Build the outer continuation:
+    //   let name1 = mutual_rec.name1 in
+    //   let name2 = mutual_rec.name2 in
+    //   rest
+    let outer_rest = bindings.iter().rev().fold(rest, |acc, (name, _, _)| {
+        let field_acc = Field(Var(mutual_rec).into_expr(), var_ustr(*name)).into_expr();
+        Let(*name, None, field_acc, acc).into_expr()
+    });
+
+    LetRec(mutual_rec, struct_ty, struct_body, outer_rest).into_expr()
+}
+
+/// Parse a single `name: type = body` or `name(params) -> ret = body` binding (used after `and`).
+fn parse_rec_binding(input: &str) -> IResult<'_, (Variable, Expr, Expr)> {
+    let (input, (name, params)) = (variable, opt(parse_params)).parse(input)?;
+    if let Some(params) = params {
+        // Function sugar: name(params) -> ret = body
+        cut((
+            preceded(ws(tag("->")), parse_expr),
+            preceded(ws(nom_char('=')), parse_expr),
+        ))
+        .map(|(ret, body)| (name, wrap_pi(&params, ret), wrap_lambda(&params, body)))
+        .parse(input)
+    } else {
+        // Plain annotated: name: type = body
+        cut((
+            preceded(ws(nom_char(':')), parse_expr),
+            preceded(ws(nom_char('=')), parse_expr),
+        ))
+        .map(|(ty, body)| (name, ty, body))
+        .parse(input)
+    }
+}
+
 /// Parse `= body in rest`, cutting after `=`.
 fn parse_eq_body_in(input: &str) -> IResult<'_, (Expr, Expr)> {
     cut(preceded(
@@ -387,18 +454,36 @@ fn parse_let(input: &str) -> IResult<'_, Expr> {
     if let Some(params) = params {
         // Function sugar: committed to function form.
         if let Ok((input, _)) = ws(tag("->")).parse(input) {
-            // Committed to annotated function: let [rec] f(params) -> ret = body in rest
-            cut((parse_expr, parse_eq_body_in))
-                .map(|(ret, (body, rest))| {
+            if is_rec {
+                // let rec f(params) -> ret = body (and ...)* in rest
+                cut((
+                    parse_expr,
+                    preceded(ws(nom_char('=')), parse_expr),
+                    many0(preceded(keyword("and"), parse_rec_binding)),
+                    preceded(keyword("in"), parse_expr),
+                ))
+                .map(|(ret, body, extra, rest)| {
                     let ty = wrap_pi(&params, ret);
                     let body = wrap_lambda(&params, body);
-                    if is_rec {
+                    if extra.is_empty() {
                         LetRec(name, ty, body, rest).into_expr()
                     } else {
-                        Let(name, Some(ty), body, rest).into_expr()
+                        let mut bindings = vec![(name, ty, body)];
+                        bindings.extend(extra);
+                        desugar_mutual_rec(bindings, rest)
                     }
                 })
                 .parse(input)
+            } else {
+                // let f(params) -> ret = body in rest
+                cut((parse_expr, parse_eq_body_in))
+                    .map(|(ret, (body, rest))| {
+                        let ty = wrap_pi(&params, ret);
+                        let body = wrap_lambda(&params, body);
+                        Let(name, Some(ty), body, rest).into_expr()
+                    })
+                    .parse(input)
+            }
         } else if !is_rec {
             parse_eq_body_in
                 .map(|(body, rest)| Let(name, None, wrap_lambda(&params, body), rest).into_expr())
@@ -411,16 +496,30 @@ fn parse_let(input: &str) -> IResult<'_, Expr> {
             )))
         }
     } else if let Ok((input, _)) = ws(nom_char(':')).parse(input) {
-        // Committed to annotated form: let [rec] x: T = e1 in e2
-        cut((parse_expr, parse_eq_body_in))
-            .map(|(ty, (e1, e2))| {
-                if is_rec {
-                    LetRec(name, ty, e1, e2).into_expr()
+        if is_rec {
+            // let rec x: T = e1 (and y: U = e2)* in rest
+            cut((
+                parse_expr,
+                preceded(ws(nom_char('=')), parse_expr),
+                many0(preceded(keyword("and"), parse_rec_binding)),
+                preceded(keyword("in"), parse_expr),
+            ))
+            .map(|(ty, body, extra, rest)| {
+                if extra.is_empty() {
+                    LetRec(name, ty, body, rest).into_expr()
                 } else {
-                    Let(name, Some(ty), e1, e2).into_expr()
+                    let mut bindings = vec![(name, ty, body)];
+                    bindings.extend(extra);
+                    desugar_mutual_rec(bindings, rest)
                 }
             })
             .parse(input)
+        } else {
+            // Committed to annotated form: let x: T = e1 in e2
+            cut((parse_expr, parse_eq_body_in))
+                .map(|(ty, (e1, e2))| Let(name, Some(ty), e1, e2).into_expr())
+                .parse(input)
+        }
     } else {
         // Plain form: let x = e1 in e2
         if is_rec {
