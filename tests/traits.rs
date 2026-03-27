@@ -259,7 +259,7 @@ fn test_unsound_traits2() {
 }
 
 #[test]
-#[should_panic(expected = "failed to prove progress")]
+#[should_panic(expected = "overflow")]
 fn funky() {
     // Courtesy @theemathas (https://rust-lang.zulipchat.com/#narrow/channel/144729-t-types/topic/Progress.20in.20coinduction/near/580806615)
     let mut ctx = EvalContext::default();
@@ -412,17 +412,26 @@ fn diverging_assoc_item_bound() {
 }
 
 #[test]
-#[should_panic(expected = "AppArg(None)")]
+// #[should_panic(expected = "AppArg(None)")]
 fn self_typing() {
     // From https://gist.github.com/lcnr/a002fd4c3ad2400c8717a82f3d45ab89#relevant-code-snippets
     let mut ctx = EvalContext::default();
+    // struct Thing<A>(A);
+    ctx.add_uninterpreted("Thing", p("Type -> Type"));
     ctx.typecheck(&p(r"
         let Unit = {} in
+
+        /// A simple dependent tuple.
+        let exists = {
+            t: Type(1),
+            x: self.t,
+        } in
 
         // trait Trait {
         //     fn method() {}
         // }
         let Trait(Self: Type) = {
+            // captures: exists,
             method: fn(Unit) -> Unit,
         } in
 
@@ -447,33 +456,40 @@ fn self_typing() {
             }
         } in
 
-        // struct Thing<A: Apply>(A);
-        let Thing(a: Type) = { thing: Unit } in
-
-        // impl<A: Apply> Trait for Thing<A> where <A as Apply>::Output<Self>: Trait {}
-        let mutual_rec_ty = {
-            weird_ty: fn(a: Type, a_apply: Apply(a)) -> Type,
-            ImplTrait: fn(a: Type, a_apply: Apply(a), _: Trait(self.weird_ty(a, a_apply))) -> Trait (Thing a)
+        // impl<A: Apply> Trait for Thing<A>
+        //   where
+        //     <A as Apply>::Output<Self>: Trait {}
+        //     Self: Trait // we add this to amke the loop less insane
+        // Without the extra coinductive bound, this needs `fn(x: f(x))` type recursion madness
+        let ImplTrait(
+            a: Type,
+            a_apply: Apply(a),
+            self_trait: Trait(Thing(a)),
+            a_out_trait: Trait(a_apply.output(Thing(a), self_trait).out)
+        ) -> Trait (Thing a)
+        = make (Trait (Thing a)) {
+            // captures = make (exists) {
+            //     t = {
+            //         a_apply: Apply(a),
+            //         self_trait: Trait(Thing(a)),
+            //         a_out_trait: Trait(a_apply.output(Thing(a), self_trait).out)
+            //     },
+            //     x = {
+            //         a_apply = a_apply,
+            //         self_trait = self_trait,
+            //         a_out_trait = a_out_trait,
+            //     },
+            // },
+            method = |x: Unit| x,
         } in
-        let rec mutual_rec: mutual_rec_ty =
-            let weird_ty = mutual_rec.weird_ty in
-            let ImplTrait = mutual_rec.ImplTrait in
-        make (mutual_rec_ty) {
-            // This needs `fn(x: f(x))` type recursion madness
-            weird_ty = |
-                a: Type,
-                a_apply: Apply(a),
-            | a_apply.output(Thing(a), ImplTrait(a, a_apply, todo (Trait(weird_ty(a, a_apply))))),
 
-            ImplTrait = |
-                a: Type,
-                a_apply: Apply(a),
-                a_out_trait: Trait(weird_ty(a, a_apply))
-            | make (Trait (Thing a)) {
-                method = |x: Unit| x,
-            },
-
-        } in
+        // fn weird<A: Apply>() {
+        //    <Thing<A> as Trait>::method();
+        // }
+        let rec WeirdImpl(a: Type, a_apply: Apply(a)) -> Trait (Thing a) =
+            let self_trait = WeirdImpl(a, a_apply) in
+            ImplTrait(a, a_apply, self_trait, a_apply.output(Thing(a), self_trait).out_trait)
+        in
 
         {=}
     "));

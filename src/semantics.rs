@@ -284,7 +284,7 @@ impl MentionPath {
             })
             .try_collect()
     }
-    /// `from_path` but without support for function application.
+    /// `from_path` but after function application etc have been inlined.
     fn from_single_path<'a>(
         path: impl IntoIterator<Item = &'a SubExprLocation> + Clone,
     ) -> Result<Self, (ConstructorPath, SubExprLocation)> {
@@ -545,6 +545,9 @@ pub struct EvalContext {
     /// For each `let rec val` we're inside of, compute a map of which constructor paths depend on
     /// each other. We use this to compute progress.
     progress_graphs: HashMap<Variable, ProgressGraph>,
+    /// Count the number of steps we're doing, and abort (instead of stack overflow) if we went too
+    /// far.
+    steps: u32,
 }
 
 impl EvalContext {
@@ -592,6 +595,13 @@ impl EvalContext {
         (result, b)
     }
 
+    pub fn step(&mut self, action: &str) {
+        self.steps += 1;
+        if self.steps > 10000 || self.path.len() > 500 {
+            panic!("overflow encountered during {action}")
+        }
+    }
+
     /// Typecheck a sub-expression, tracking its position in the expression tree.
     /// Returns the expression with type annotation added.
     fn typecheck_inner(&mut self, loc: SubExprLocation, e: &Expr) -> Expr {
@@ -605,6 +615,7 @@ impl EvalContext {
     }
     /// Typechecks an expression and returns the expression with type annotations added.
     pub fn typecheck(&mut self, e: &Expr) -> Expr {
+        self.step("typechecking");
         // Typecheck and annotate all subexpressions. Also keep the binding used, if any.
         let (annotated_e, last_binding) = {
             struct TypeChecker<'a> {
@@ -639,19 +650,7 @@ impl EvalContext {
 
             impl<'a> ExprMapper for TypeChecker<'a> {
                 fn map_expr(&mut self, l: SubExprLocation, e: &Expr) -> Expr {
-                    if let SubExprLocation::LetRecVal(var) = l {
-                        self.ctx
-                            .progress_graphs
-                            .insert(var, ProgressGraph::new(var));
-                        let e = self.ctx.typecheck_inner(l, e);
-
-                        let graph = self.ctx.progress_graphs.remove(&var).unwrap();
-                        eprintln!("dependency graph for {var}:\n{graph}");
-                        graph.check_progress();
-                        e
-                    } else {
-                        self.ctx.typecheck_inner(l, e)
-                    }
+                    self.ctx.typecheck_inner(l, e)
                 }
 
                 type SelfWithNewLifetime<'b> = TypeChecker<'b>;
@@ -698,52 +697,7 @@ impl EvalContext {
                     .lookup_binding(*x)
                     .expect(&format!("Failed to find variable {x}!"))
                     .clone();
-                let binding_ty = binding.ty;
-                match binding.kind {
-                    BindingKind::Normal(v) => {
-                        if self
-                            .path
-                            .iter()
-                            .any(|e| matches!(e, SubExprLocation::LetRecVal(..)))
-                        {
-                            // A let-binding may contain recursive mentions of a recursive
-                            // variable, so we re-typecheck it here.
-                            let _ = self.typecheck(&v);
-                        }
-                    }
-                    BindingKind::Nominal(..) => {
-                        if let mut subpath = self.path.iter()
-                            && subpath
-                                .by_ref()
-                                .find(|e| matches!(e, SubExprLocation::LetRecVal(v) if v == x))
-                                .is_some()
-                        {
-                            // We're inside a `let rec val` definition, and we found a recursive reference
-                            // to `val`.
-                            match MentionPath::from_path(subpath.clone()) {
-                                Ok(mention_paths) => {
-                                    // We can handle all the paths from the start of the `let rec` to here;
-                                    // add them to the graph.
-                                    let graph = self.progress_graphs.get_mut(x).unwrap();
-                                    for mention_path in mention_paths {
-                                        graph.insert(mention_path);
-                                    }
-                                }
-                                Err((ctor_path, pe)) => {
-                                    // Some paths are of a shape we can't handle; error.
-                                    panic!(
-                                        "failed to prove progress of {x}: \
-                                        recursive mention found under a {pe:?}\n  \
-                                        location: {}\npath: {subpath:?}",
-                                        ctor_path.display_on(*x),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    _ => (),
-                }
-                return Var(*x).with_ty(binding_ty);
+                return Var(*x).with_ty(binding.ty);
             }
             // `Expr::ty` already returns `Type(k+1)` for the type of this expression.
             Type(_) => return e.clone(),
@@ -872,7 +826,149 @@ impl EvalContext {
         // Recursively check the type is well-formed.
         let ty = self.typecheck_inner(SubExprLocation::TypeAnnot(TypeAnnotLocation::TypeOf), &ty);
         let ty = self.whnf(&ty);
-        annotated_e.kind().clone().with_ty(ty)
+        let e = annotated_e.kind().clone().with_ty(ty);
+
+        // Progress-check starting from the top-level expression.
+        if self.path.is_empty() {
+            self.progress_check(&e);
+        }
+
+        e
+    }
+
+    fn progress_check_inner(&mut self, loc: SubExprLocation, e: &Expr) {
+        self.path.push(loc);
+        ensure_sufficient_stack(|| self.progress_check(e));
+        self.path.pop();
+    }
+    pub fn progress_check(&mut self, e: &Expr) {
+        self.step("progress checking");
+        match e.kind() {
+            Var(x) => {
+                let binding = self
+                    .lookup_binding(*x)
+                    .expect(&format!("Failed to find variable {x}!"))
+                    .clone();
+                match binding.kind {
+                    BindingKind::Normal(v) => {
+                        if self
+                            .path
+                            .iter()
+                            .any(|e| matches!(e, SubExprLocation::LetRecVal(..)))
+                        {
+                            // A let-binding may contain recursive mentions of a recursive
+                            // variable, so we re-progress-check it here.
+                            self.progress_check(&v);
+                        }
+                    }
+                    BindingKind::Nominal(..) => {
+                        if let Some(graph) = self.progress_graphs.get_mut(x)
+                            && let mut subpath = self.path.iter()
+                            && subpath
+                                .by_ref()
+                                .find(|e| matches!(e, SubExprLocation::LetRecVal(v) if v == x))
+                                .is_some()
+                        {
+                            // We're inside a `let rec val` definition, and we found a recursive reference
+                            // to `val`.
+                            match MentionPath::from_path(subpath.clone()) {
+                                Ok(mention_paths) => {
+                                    // We can handle all the paths from the start of the `let rec` to here;
+                                    // add them to the graph.
+                                    for mention_path in mention_paths {
+                                        graph.insert(mention_path);
+                                    }
+                                }
+                                Err((ctor_path, pe)) => {
+                                    // Some paths are of a shape we can't handle; error.
+                                    panic!(
+                                        "failed to prove progress of {x}: \
+                                        recursive mention found under a {pe:?}\n  \
+                                        location: {}\npath: {subpath:?}",
+                                        ctor_path.display_on(*x),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    _ => (),
+                }
+                return;
+            }
+            // Avoid checking an infinite stack of types.
+            Type(_) => return,
+            _ => {}
+        }
+
+        struct ProgressChecker<'a> {
+            ctx: &'a mut EvalContext,
+        }
+
+        impl<'a> ProgressChecker<'a> {
+            fn new(ctx: &'a mut EvalContext) -> Self {
+                Self { ctx }
+            }
+            fn with_binding_in_scope<T>(
+                &mut self,
+                var: &mut Variable,
+                f: impl FnOnce(&mut <ProgressChecker<'a> as ExprMapper>::SelfWithNewLifetime<'_>) -> T,
+                binding: Binding,
+            ) -> T {
+                self.ctx
+                    .with_binding_in_scope(*var, binding, |ctx| f(&mut ProgressChecker::new(ctx)))
+            }
+        }
+
+        impl<'a> ExprMapper for ProgressChecker<'a> {
+            fn map_expr(&mut self, l: SubExprLocation, e: &Expr) -> Expr {
+                if let SubExprLocation::LetRecVal(var) = l {
+                    self.ctx
+                        .progress_graphs
+                        .insert(var, ProgressGraph::new(var));
+                    self.ctx.progress_check_inner(l, e);
+
+                    let graph = self.ctx.progress_graphs.remove(&var).unwrap();
+                    eprintln!("dependency graph for {var}:\n{graph}");
+                    graph.check_progress();
+                } else {
+                    self.ctx.progress_check_inner(l, e)
+                }
+                e.clone()
+            }
+
+            type SelfWithNewLifetime<'b> = ProgressChecker<'b>;
+            fn under_abstraction<T>(
+                &mut self,
+                var: &mut Variable,
+                val: Option<&Expr>,
+                ty: Option<&Expr>,
+                f: impl for<'b> FnOnce(&mut ProgressChecker<'b>) -> T,
+            ) -> T {
+                let binding = match val {
+                    Some(val) => Binding::with_value(val),
+                    None => Binding::abstrakt(ty.unwrap()),
+                };
+                self.with_binding_in_scope(var, f, binding)
+            }
+            fn under_recursive_abstraction<T>(
+                &mut self,
+                var: &mut Variable,
+                // The not-yet-mapped value of `var`, if any.
+                val: Option<&Expr>,
+                // The not-yet-mapped type of `var`.
+                ty: &Expr,
+                f: impl for<'b> FnOnce(&mut Self::SelfWithNewLifetime<'b>) -> T,
+            ) -> T {
+                let binding = match val {
+                    Some(val) => Binding::nominal(val, ty),
+                    None => Binding::abstrakt(ty),
+                };
+                self.with_binding_in_scope(var, f, binding)
+            }
+        }
+
+        // Recursively progress-check by lightly abusing the `map` function.
+        e.map(&mut ProgressChecker::new(self));
     }
 
     /// Weak head normal form. Does not unfold nominal variables,
@@ -887,6 +983,7 @@ impl EvalContext {
         self.whnf_inner(e, true)
     }
     fn whnf_inner(&mut self, e: &Expr, unfold_nominal: bool) -> Expr {
+        self.step("normalization");
         match e.kind() {
             Var(x) => match self.lookup_binding(*x) {
                 Some(binding) if let Some(val) = binding.value(unfold_nominal).cloned() => {
@@ -971,11 +1068,13 @@ impl EvalContext {
             panic!(
                 "\nassertion `left == right` failed\n  \
                  left: {e1}\n \
-                 right: {e2}"
+                 right: {e2}\npath: {:?}",
+                self.path
             );
         }
     }
     pub fn equal(&mut self, e1: &Expr, e2: &Expr) -> bool {
+        self.step("equality checking");
         let e1 = self.whnf(e1);
         let e2 = self.whnf(e2);
         // Recurse into sub-expressions, applying whnf at each level.
