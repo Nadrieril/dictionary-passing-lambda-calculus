@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::ExprKind::*;
+use crate::syntax::Span;
 use crate::{Expr, Fields, Variable};
-use nom::Parser;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_while};
 use nom::character::complete::{char as nom_char, digit1};
@@ -12,27 +12,32 @@ use nom::combinator::{cut, opt};
 use nom::error::{ErrorKind, ParseError as _};
 use nom::multi::{many0, separated_list0, separated_list1};
 use nom::sequence::{delimited, pair, preceded};
+use nom::{Input as _, Offset, Parser};
+use nom_locate::LocatedSpan;
 use ustr::Ustr;
+
+/// Parser input type: a located span carrying the original source as extra data.
+type Input<'a> = LocatedSpan<&'a str, Arc<str>>;
 
 /// Custom error that always keeps the error at the deepest (furthest) position.
 #[derive(Debug)]
 struct DeepError<'a> {
-    input: &'a str,
+    input: Input<'a>,
 }
 
-impl<'a> nom::error::ParseError<&'a str> for DeepError<'a> {
-    fn from_error_kind(input: &'a str, _kind: ErrorKind) -> Self {
+impl<'a> nom::error::ParseError<Input<'a>> for DeepError<'a> {
+    fn from_error_kind(input: Input<'a>, _kind: ErrorKind) -> Self {
         DeepError { input }
     }
-    fn append(_input: &'a str, _kind: ErrorKind, other: Self) -> Self {
+    fn append(_input: Input<'a>, _kind: ErrorKind, other: Self) -> Self {
         other
     }
-    fn from_char(input: &'a str, _: char) -> Self {
+    fn from_char(input: Input<'a>, _: char) -> Self {
         DeepError { input }
     }
     fn or(self, other: Self) -> Self {
         // Keep whichever error is deeper (shorter remaining input = further into parse).
-        if self.input.len() <= other.input.len() {
+        if self.input.fragment().len() <= other.input.fragment().len() {
             self
         } else {
             other
@@ -40,22 +45,55 @@ impl<'a> nom::error::ParseError<&'a str> for DeepError<'a> {
     }
 }
 
-impl<'a> nom::error::ContextError<&'a str> for DeepError<'a> {}
+impl<'a> nom::error::ContextError<Input<'a>> for DeepError<'a> {}
 
-type IResult<'a, O> = nom::IResult<&'a str, O, DeepError<'a>>;
+type IResult<'a, O> = nom::IResult<Input<'a>, O, DeepError<'a>>;
+
+/// Convert a `LocatedSpan` fragment (as returned by `recognize` / `take`) into our `Span`.
+fn to_span(input: &Input<'_>) -> Span {
+    Span {
+        start: input.location_offset(),
+        end: input.location_offset() + input.fragment().len(),
+        source: input.extra.clone(),
+    }
+}
+
+/// Compute a span covering two sub-expressions (from the start of `a` to the end of `b`).
+fn span_of_union(a: &Expr, b: &Expr) -> Span {
+    Span {
+        start: a.span().start,
+        end: b.span().end,
+        source: a.span().source.clone(),
+    }
+}
+
+/// Wrap a parser to attach a source span to the resulting `Expr`.
+/// Uses nom-locate's `Offset` to compute the consumed input slice.
+fn spanned<'a>(
+    mut inner: impl Parser<Input<'a>, Output = Expr, Error = DeepError<'a>>,
+) -> impl Parser<Input<'a>, Output = Expr, Error = DeepError<'a>> {
+    move |input: Input<'a>| {
+        // Skip leading whitespace so the span starts at the first real token.
+        let (input, _) = skip_ws_and_comments(input)?;
+        let start = input.clone();
+        let (rest, expr) = inner.parse(input)?;
+        let span = to_span(&start.take(start.offset(&rest)));
+        Ok((rest, expr.with_span(span)))
+    }
+}
 
 /// Skip a single `// ...` line comment.
-fn line_comment(input: &str) -> IResult<'_, &str> {
+fn line_comment(input: Input<'_>) -> IResult<'_, Input<'_>> {
     recognize((tag("//"), take_while(|c| c != '\n'))).parse(input)
 }
 
 /// Skip whitespace and `//` comments.
-fn skip_ws_and_comments(input: &str) -> IResult<'_, ()> {
+fn skip_ws_and_comments(input: Input<'_>) -> IResult<'_, ()> {
     let mut input = input;
     loop {
         let (rest, _) = multispace0.parse(input)?;
         input = rest;
-        if let Ok((rest, _)) = line_comment(input) {
+        if let Ok((rest, _)) = line_comment(input.clone()) {
             input = rest;
         } else {
             break;
@@ -66,8 +104,8 @@ fn skip_ws_and_comments(input: &str) -> IResult<'_, ()> {
 
 /// Skip leading whitespace and comments before `inner`.
 fn ws<'a, O>(
-    inner: impl Parser<&'a str, Output = O, Error = DeepError<'a>>,
-) -> impl Parser<&'a str, Output = O, Error = DeepError<'a>> {
+    inner: impl Parser<Input<'a>, Output = O, Error = DeepError<'a>>,
+) -> impl Parser<Input<'a>, Output = O, Error = DeepError<'a>> {
     preceded(skip_ws_and_comments, inner)
 }
 
@@ -75,8 +113,8 @@ fn ws<'a, O>(
 fn comma_list<'a, O>(
     open: char,
     close: char,
-    item: impl Parser<&'a str, Output = O, Error = DeepError<'a>> + Copy,
-) -> impl Parser<&'a str, Output = Vec<O>, Error = DeepError<'a>> {
+    item: impl Parser<Input<'a>, Output = O, Error = DeepError<'a>> + Copy,
+) -> impl Parser<Input<'a>, Output = Vec<O>, Error = DeepError<'a>> {
     delimited(
         ws(nom_char(open)),
         separated_list1(ws(nom_char(',')), item),
@@ -98,12 +136,13 @@ const KEYWORDS: &[&str] = &[
 ];
 
 /// Identifier: [a-zA-Z_][a-zA-Z0-9_]*, rejecting keywords.
-fn ident<'a>(original: &'a str) -> IResult<'a, &'a str> {
+fn ident<'a>(original: Input<'a>) -> IResult<'a, &'a str> {
     let (rest, id) = ws(recognize(pair(
         satisfy(|c: char| c.is_alphabetic() || c == '_'),
         take_while(|c: char| c.is_alphanumeric() || c == '_'),
     )))
-    .parse(original)?;
+    .parse(original.clone())?;
+    let id = *id.fragment();
     if KEYWORDS.contains(&id) {
         return Err(nom::Err::Error(DeepError::from_error_kind(
             original,
@@ -113,15 +152,18 @@ fn ident<'a>(original: &'a str) -> IResult<'a, &'a str> {
     Ok((rest, id))
 }
 
-fn variable(input: &str) -> IResult<'_, Variable> {
+fn variable(input: Input<'_>) -> IResult<'_, Variable> {
     ident.map(|id| Variable::user(id)).parse(input)
 }
 
 /// Match a keyword with word boundary check.
-fn keyword<'a>(kw: &'static str) -> impl Parser<&'a str, Output = &'a str, Error = DeepError<'a>> {
-    move |input: &'a str| {
-        let (rest, matched) = ws(tag(kw)).parse(input)?;
+fn keyword<'a>(
+    kw: &'static str,
+) -> impl Parser<Input<'a>, Output = Input<'a>, Error = DeepError<'a>> {
+    move |input: Input<'a>| {
+        let (rest, matched) = ws(tag(kw)).parse(input.clone())?;
         if rest
+            .fragment()
             .chars()
             .next()
             .is_some_and(|c| c.is_alphanumeric() || c == '_')
@@ -136,7 +178,7 @@ fn keyword<'a>(kw: &'static str) -> impl Parser<&'a str, Output = &'a str, Error
 }
 
 /// A single `name = expr` field.
-fn field_val(input: &str) -> IResult<'_, (Ustr, Expr)> {
+fn field_val(input: Input<'_>) -> IResult<'_, (Ustr, Expr)> {
     (
         ident.map(|s| Ustr::from(s)),
         preceded(ws(nom_char('=')), parse_expr),
@@ -145,7 +187,7 @@ fn field_val(input: &str) -> IResult<'_, (Ustr, Expr)> {
 }
 
 /// A single `name: expr` field.
-fn field_ty(input: &str) -> IResult<'_, (Ustr, Expr)> {
+fn field_ty(input: Input<'_>) -> IResult<'_, (Ustr, Expr)> {
     (
         ident.map(|s| Ustr::from(s)),
         preceded(ws(nom_char(':')), parse_expr),
@@ -154,12 +196,12 @@ fn field_ty(input: &str) -> IResult<'_, (Ustr, Expr)> {
 }
 
 /// A single `variable: expr` parameter.
-fn param(input: &str) -> IResult<'_, (Variable, Expr)> {
+fn param(input: Input<'_>) -> IResult<'_, (Variable, Expr)> {
     (variable, preceded(ws(nom_char(':')), parse_expr)).parse(input)
 }
 
 /// Parse a parenthesized parameter list: `(x: A, y: B, ...)`
-fn parse_params(input: &str) -> IResult<'_, Vec<(Variable, Expr)>> {
+fn parse_params(input: Input<'_>) -> IResult<'_, Vec<(Variable, Expr)>> {
     comma_list('(', ')', param).parse(input)
 }
 
@@ -180,17 +222,19 @@ fn wrap_lambda(params: &[(Variable, Expr)], body: Expr) -> Expr {
 }
 
 /// `Type(n)` or `Type` (shorthand for `Type(0)`)
-fn parse_type(input: &str) -> IResult<'_, Expr> {
+fn parse_type(input: Input<'_>) -> IResult<'_, Expr> {
     preceded(
         keyword("Type"),
         opt(delimited(ws(nom_char('(')), ws(digit1), ws(nom_char(')')))),
     )
-    .map(|digits: Option<&str>| Type(digits.map_or(0, |d| d.parse::<usize>().unwrap())).into_expr())
+    .map(|digits: Option<Input>| {
+        Type(digits.map_or(0, |d| d.fragment().parse::<usize>().unwrap())).into_expr()
+    })
     .parse(input)
 }
 
 /// `|x: A| body` or `|x: A, y: B| body` (multi-param sugar)
-fn parse_lambda(input: &str) -> IResult<'_, Expr> {
+fn parse_lambda(input: Input<'_>) -> IResult<'_, Expr> {
     (
         delimited(
             ws(nom_char('|')),
@@ -205,7 +249,7 @@ fn parse_lambda(input: &str) -> IResult<'_, Expr> {
 }
 
 /// `fn(x: A) -> B`, `fn(x: A, y: B) -> C` (multi-param sugar), or `fn(A) -> B` (shorthand for `fn(_: A) -> B`)
-fn parse_pi(input: &str) -> IResult<'_, Expr> {
+fn parse_pi(input: Input<'_>) -> IResult<'_, Expr> {
     preceded(
         keyword("fn"),
         alt((
@@ -228,7 +272,7 @@ fn fields_from_vec(v: Vec<(Ustr, Expr)>) -> crate::Fields {
 }
 
 /// `{ a = e, b = e }` or `{ a: T, b: T }` or `{}` or `{=}`
-fn parse_struct(input: &str) -> IResult<'_, Expr> {
+fn parse_struct(input: Input<'_>) -> IResult<'_, Expr> {
     alt((
         // {=} — empty struct value
         (ws(nom_char('{')), ws(nom_char('=')), ws(nom_char('}')))
@@ -248,14 +292,14 @@ fn parse_struct(input: &str) -> IResult<'_, Expr> {
 }
 
 /// Atom: variable, Type(n), struct, or parenthesized expression.
-fn parse_atom(input: &str) -> IResult<'_, Expr> {
-    alt((
+fn parse_atom(input: Input<'_>) -> IResult<'_, Expr> {
+    spanned(alt((
         parse_type,
         parse_make,
         parse_struct,
         variable.map(|v| Var(v).into_expr()),
         delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
-    ))
+    )))
     .parse(input)
 }
 
@@ -265,8 +309,8 @@ enum PostfixOp {
 }
 
 /// A single postfix operation: `.field` or `(args)` (no whitespace before `(`).
-fn parse_postfix_op(input: &str) -> IResult<'_, PostfixOp> {
-    if input.starts_with('(') {
+fn parse_postfix_op(input: Input<'_>) -> IResult<'_, PostfixOp> {
+    if input.fragment().starts_with('(') {
         // No whitespace before '(' — parse as call syntax
         comma_list('(', ')', parse_expr)
             .map(PostfixOp::Call)
@@ -281,34 +325,58 @@ fn parse_postfix_op(input: &str) -> IResult<'_, PostfixOp> {
 /// Postfix: atom followed by zero or more `.field` accesses or `(args)` calls.
 /// Call syntax `f(a, b)` requires no whitespace before the `(` to distinguish
 /// from juxtaposition application `f (a)`.
-fn parse_postfix(input: &str) -> IResult<'_, Expr> {
-    (parse_atom, many0(parse_postfix_op))
-        .map(|(init, ops)| {
-            ops.into_iter().fold(init, |acc, op| match op {
-                PostfixOp::Field(name) => Field(acc, name).into_expr(),
-                PostfixOp::Call(args) => args
-                    .into_iter()
-                    .fold(acc, |acc, arg| App(acc, arg).into_expr()),
-            })
-        })
-        .parse(input)
+fn parse_postfix(input: Input<'_>) -> IResult<'_, Expr> {
+    let (mut rest, mut acc) = parse_atom(input)?;
+    loop {
+        match parse_postfix_op(rest.clone()) {
+            Ok((new_rest, op)) => {
+                acc = match op {
+                    PostfixOp::Field(name) => {
+                        // Extend span from acc's start to end of field name.
+                        let span = Span {
+                            start: acc.span().start,
+                            end: new_rest.location_offset(),
+                            source: acc.span().source.clone(),
+                        };
+                        Field(acc, name).into_expr().with_span(span)
+                    }
+                    PostfixOp::Call(args) => args.into_iter().fold(acc, |acc, arg| {
+                        let span = span_of_union(&acc, &arg);
+                        App(acc, arg).into_expr().with_span(span)
+                    }),
+                };
+                rest = new_rest;
+            }
+            Err(_) => break,
+        }
+    }
+    Ok((rest, acc))
 }
 
 /// Application: left-associative sequence of postfix expressions.
 /// Keyword expressions (`refl`, `todo`, `transport`) can appear as the head
 /// and are then followed by further arguments, e.g. `transport eq f x`.
-fn parse_app(input: &str) -> IResult<'_, Expr> {
-    let head = alt((parse_refl, parse_todo, parse_transport, parse_postfix));
-    (head, many0(parse_postfix))
+fn parse_app(input: Input<'_>) -> IResult<'_, Expr> {
+    (
+        alt((
+            spanned(parse_refl),
+            spanned(parse_todo),
+            spanned(parse_transport),
+            parse_postfix,
+        )),
+        many0(parse_postfix),
+    )
         .map(|(first, rest)| {
-            rest.into_iter()
-                .fold(first, |acc, arg| App(acc, arg).into_expr())
+            rest.into_iter().fold(first, |acc, arg| {
+                let span = span_of_union(&acc, &arg);
+                App(acc, arg).into_expr().with_span(span)
+            })
         })
         .parse(input)
 }
 
 /// `make (ty) { a = e, ... }` or `make (ty) {=}`
-fn parse_make(input: &str) -> IResult<'_, Expr> {
+fn parse_make(input: Input<'_>) -> IResult<'_, Expr> {
     (
         preceded(
             keyword("make"),
@@ -324,21 +392,21 @@ fn parse_make(input: &str) -> IResult<'_, Expr> {
 }
 
 /// `refl e`
-fn parse_refl(input: &str) -> IResult<'_, Expr> {
+fn parse_refl(input: Input<'_>) -> IResult<'_, Expr> {
     preceded(keyword("refl"), parse_postfix)
         .map(|e| Refl(e).into_expr())
         .parse(input)
 }
 
 /// `todo ty`
-fn parse_todo(input: &str) -> IResult<'_, Expr> {
+fn parse_todo(input: Input<'_>) -> IResult<'_, Expr> {
     preceded(keyword("todo"), parse_postfix)
         .map(|t| Todo(t).into_expr())
         .parse(input)
 }
 
 /// `transport eq f`
-fn parse_transport(input: &str) -> IResult<'_, Expr> {
+fn parse_transport(input: Input<'_>) -> IResult<'_, Expr> {
     preceded(keyword("transport"), (parse_postfix, parse_postfix))
         .map(|(eq, f)| Transport(eq, f).into_expr())
         .parse(input)
@@ -346,23 +414,25 @@ fn parse_transport(input: &str) -> IResult<'_, Expr> {
 
 /// Arrow: `eq -> arrow` (right-associative) or just `eq`.
 /// `A -> B` desugars to `fn(_: A) -> B`.
-fn parse_arrow(input: &str) -> IResult<'_, Expr> {
-    (parse_eq, opt(preceded(ws(tag("->")), cut(parse_arrow))))
-        .map(|(lhs, rhs)| match rhs {
+fn parse_arrow(input: Input<'_>) -> IResult<'_, Expr> {
+    spanned(
+        (parse_eq, opt(preceded(ws(tag("->")), cut(parse_arrow)))).map(|(lhs, rhs)| match rhs {
             Some(rhs) => Pi(Variable::anon(), lhs, rhs, None).into_expr(),
             None => lhs,
-        })
-        .parse(input)
+        }),
+    )
+    .parse(input)
 }
 
 /// Equality: `app == app` or just `app`.
-fn parse_eq(input: &str) -> IResult<'_, Expr> {
-    (parse_app, opt(preceded(ws(tag("==")), cut(parse_app))))
-        .map(|(lhs, rhs)| match rhs {
+fn parse_eq(input: Input<'_>) -> IResult<'_, Expr> {
+    spanned(
+        (parse_app, opt(preceded(ws(tag("==")), cut(parse_app)))).map(|(lhs, rhs)| match rhs {
             Some(rhs) => Eq(lhs, rhs).into_expr(),
             None => lhs,
-        })
-        .parse(input)
+        }),
+    )
+    .parse(input)
 }
 
 fn var_ustr(v: Variable) -> Ustr {
@@ -410,7 +480,7 @@ fn desugar_mutual_rec(bindings: Vec<(Variable, Expr, Expr)>, rest: Expr) -> Expr
 }
 
 /// Parse a single `name: type = body` or `name(params) -> ret = body` binding (used after `and`).
-fn parse_rec_binding(input: &str) -> IResult<'_, (Variable, Expr, Expr)> {
+fn parse_rec_binding(input: Input<'_>) -> IResult<'_, (Variable, Expr, Expr)> {
     let (input, (name, params)) = (variable, opt(parse_params)).parse(input)?;
     if let Some(params) = params {
         // Function sugar: name(params) -> ret = body
@@ -432,7 +502,7 @@ fn parse_rec_binding(input: &str) -> IResult<'_, (Variable, Expr, Expr)> {
 }
 
 /// Parse `= body in rest`, cutting after `=`.
-fn parse_eq_body_in(input: &str) -> IResult<'_, (Expr, Expr)> {
+fn parse_eq_body_in(input: Input<'_>) -> IResult<'_, (Expr, Expr)> {
     cut(preceded(
         ws(nom_char('=')),
         (parse_expr, preceded(keyword("in"), parse_expr)),
@@ -443,7 +513,7 @@ fn parse_eq_body_in(input: &str) -> IResult<'_, (Expr, Expr)> {
 /// All `let` forms: plain, annotated, rec, and function sugar variants.
 /// Uses `cut` after commitment points (`:`, `->`, `=`) so that deep errors
 /// propagate instead of being swallowed by backtracking.
-fn parse_let(input: &str) -> IResult<'_, Expr> {
+fn parse_let(input: Input<'_>) -> IResult<'_, Expr> {
     let (input, (_, is_rec, name, params)) = (
         keyword("let"),
         opt(keyword("rec")).map(|r| r.is_some()),
@@ -453,7 +523,7 @@ fn parse_let(input: &str) -> IResult<'_, Expr> {
         .parse(input)?;
     if let Some(params) = params {
         // Function sugar: committed to function form.
-        if let Ok((input, _)) = ws(tag("->")).parse(input) {
+        if let Ok((input, _)) = ws(tag("->")).parse(input.clone()) {
             if is_rec {
                 // let rec f(params) -> ret = body (and ...)* in rest
                 cut((
@@ -495,7 +565,7 @@ fn parse_let(input: &str) -> IResult<'_, Expr> {
                 ErrorKind::Tag,
             )))
         }
-    } else if let Ok((input, _)) = ws(nom_char(':')).parse(input) {
+    } else if let Ok((input, _)) = ws(nom_char(':')).parse(input.clone()) {
         if is_rec {
             // let rec x: T = e1 (and y: U = e2)* in rest
             cut((
@@ -535,8 +605,14 @@ fn parse_let(input: &str) -> IResult<'_, Expr> {
     }
 }
 
-fn parse_expr(input: &str) -> IResult<'_, Expr> {
-    alt((parse_let, parse_lambda, parse_pi, parse_arrow)).parse(input)
+fn parse_expr(input: Input<'_>) -> IResult<'_, Expr> {
+    alt((
+        spanned(parse_let),
+        spanned(parse_lambda),
+        spanned(parse_pi),
+        parse_arrow,
+    ))
+    .parse(input)
 }
 
 /// Parse error with position information. Uses `Display` for pretty-printing,
@@ -557,8 +633,7 @@ impl std::fmt::Debug for ParseError {
 }
 
 /// Format a parse error showing position in context.
-fn format_error(full_input: &str, err_input: &str) -> ParseError {
-    let offset = full_input.len() - err_input.len();
+fn format_error(full_input: &str, offset: usize) -> ParseError {
     let before = &full_input[..offset];
     let line_num = before.chars().filter(|&c| c == '\n').count() + 1;
     let last_newline = before.rfind('\n').map(|i| i + 1).unwrap_or(0);
@@ -577,16 +652,25 @@ fn format_error(full_input: &str, err_input: &str) -> ParseError {
 
 pub fn parse(input: &str) -> Result<Expr, ParseError> {
     let input = input.trim();
-    match parse_expr(input) {
+    let source: Arc<str> = Arc::from(input);
+    let span_input = LocatedSpan::new_extra(input, source);
+    match parse_expr(span_input) {
         Ok((rest, expr)) => {
-            let rest = skip_ws_and_comments(rest).map(|(r, _)| r).unwrap_or(rest);
-            if rest.is_empty() {
+            let rest_after_ws = skip_ws_and_comments(rest.clone())
+                .map(|(r, _)| r)
+                .unwrap_or(rest);
+            if rest_after_ws.fragment().is_empty() {
                 Ok(expr)
             } else {
-                Err(format_error(input, rest.trim_start()))
+                let trimmed = rest_after_ws.fragment().trim_start();
+                let trim_offset = rest_after_ws.location_offset()
+                    + (rest_after_ws.fragment().len() - trimmed.len());
+                Err(format_error(input, trim_offset))
             }
         }
-        Err(nom::Err::Error(e) | nom::Err::Failure(e)) => Err(format_error(input, e.input)),
+        Err(nom::Err::Error(e) | nom::Err::Failure(e)) => {
+            Err(format_error(input, e.input.location_offset()))
+        }
         Err(e) => Err(ParseError(format!("parse error: {e}"))),
     }
 }
@@ -727,5 +811,31 @@ mod tests {
         assert_eq!(parse("f // apply\n  x").unwrap().to_string(), "f x");
         // Trailing comment
         assert_eq!(parse("x\n// done").unwrap().to_string(), "x");
+    }
+
+    #[test]
+    fn test_spans() {
+        let expr = parse("f x").unwrap();
+        let span = expr.span();
+        assert!(!span.is_dummy());
+        assert_eq!(span.start, 0);
+        assert_eq!(span.end, 3);
+        assert_eq!(&*span.source, "f x");
+
+        // Sub-expression spans
+        if let App(f, x) = expr.kind() {
+            let fs = f.span();
+            assert_eq!(&span.source[fs.start..fs.end], "f");
+            let xs = x.span();
+            assert_eq!(&span.source[xs.start..xs.end], "x");
+        } else {
+            panic!("expected App");
+        }
+
+        // Let expression
+        let expr = parse("let x = y in x").unwrap();
+        let span = expr.span();
+        assert_eq!(span.start, 0);
+        assert_eq!(span.end, 14);
     }
 }

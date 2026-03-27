@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 
 use indexmap::IndexMap;
 use ustr::Ustr;
@@ -9,6 +9,32 @@ use ExprKind::*;
 use crate::semantics::{Constructor, FunctionShape, SubExprLocation, TypeAnnotLocation};
 
 pub type Fields = Arc<IndexMap<Ustr, Expr>>;
+
+/// Source span for a parsed expression.
+#[derive(Clone, Debug)]
+pub struct Span {
+    /// Byte offset of the start of the expression in the source.
+    pub start: usize,
+    /// Byte offset of the end of the expression in the source.
+    pub end: usize,
+    /// The original source string.
+    pub source: Arc<str>,
+}
+
+impl Span {
+    pub fn dummy() -> Span {
+        static DUMMY_SP: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from(""));
+        Span {
+            start: 0,
+            end: 0,
+            source: DUMMY_SP.clone(),
+        }
+    }
+
+    pub fn is_dummy(&self) -> bool {
+        self.start == 0 && self.end == 0
+    }
+}
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
 pub enum Variable {
@@ -73,6 +99,7 @@ pub enum ExprKind {
 pub struct ExprContents {
     pub kind: ExprKind,
     pub ty: Option<Expr>,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug)]
@@ -106,7 +133,24 @@ pub trait ExprMapper {
 
 impl Expr {
     fn new(kind: ExprKind, ty: Option<Expr>) -> Expr {
-        Expr(Arc::new(ExprContents { kind, ty }))
+        Expr(Arc::new(ExprContents {
+            kind,
+            ty,
+            span: Span::dummy(),
+        }))
+    }
+
+    /// Attach a source span to this expression.
+    pub fn with_span(self, span: Span) -> Expr {
+        Expr(Arc::new(ExprContents {
+            kind: self.0.kind.clone(),
+            ty: self.0.ty.clone(),
+            span,
+        }))
+    }
+
+    pub fn span(&self) -> &Span {
+        &self.0.span
     }
 
     pub fn kind(&self) -> &ExprKind {
@@ -134,7 +178,11 @@ impl Expr {
 
     pub fn without_ty(&self) -> Expr {
         if self.opt_ty().is_some() {
-            Expr::new(self.kind().clone(), None)
+            Expr(Arc::new(ExprContents {
+                kind: self.kind().clone(),
+                ty: None,
+                span: self.span().clone(),
+            }))
         } else {
             self.clone()
         }
@@ -245,7 +293,11 @@ impl Expr {
             .ty
             .as_ref()
             .map(|ty| v.map_expr(SubExprLocation::TypeAnnot(TypeAnnotLocation::TypeOf), ty));
-        Expr::new(new_kind, new_ty)
+        Expr(Arc::new(ExprContents {
+            kind: new_kind,
+            ty: new_ty,
+            span: self.span().clone(),
+        }))
     }
 }
 
