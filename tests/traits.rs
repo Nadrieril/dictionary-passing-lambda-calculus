@@ -410,3 +410,71 @@ fn diverging_assoc_item_bound() {
         {=}
     "));
 }
+
+#[test]
+#[should_panic(expected = "AppArg(None)")]
+fn self_typing() {
+    // From https://gist.github.com/lcnr/a002fd4c3ad2400c8717a82f3d45ab89#relevant-code-snippets
+    let mut ctx = EvalContext::default();
+    ctx.typecheck(&p(r"
+        let Unit = {} in
+
+        // trait Trait {
+        //     fn method() {}
+        // }
+        let Trait(Self: Type) = {
+            method: fn(Unit) -> Unit,
+        } in
+
+        // trait Apply {
+        //     type Output<T: Trait>: Trait;
+        // }
+        let apply_out = { out: Type, out_trait: Trait(self.out) } in
+        let Apply(Self: Type) = {
+            output: fn(t: Type, t_trait: Trait(t)) -> apply_out,
+        } in
+
+        // struct Identity;
+        let Identity = {} in
+
+        // impl Apply for Identity {
+        //     type Output<T: Trait> = T;
+        // }
+        let ApplyImpl = make (Apply(Identity)) {
+            output = |t: Type, t_trait: Trait(t)| make (apply_out) {
+                out = t,
+                out_trait = t_trait,
+            }
+        } in
+
+        // struct Thing<A: Apply>(A);
+        let Thing(a: Type) = { thing: Unit } in
+
+        // impl<A: Apply> Trait for Thing<A> where <A as Apply>::Output<Self>: Trait {}
+        let mutual_rec_ty = {
+            weird_ty: fn(a: Type, a_apply: Apply(a)) -> Type,
+            ImplTrait: fn(a: Type, a_apply: Apply(a), _: Trait(self.weird_ty(a, a_apply))) -> Trait (Thing a)
+        } in
+        let rec mutual_rec: mutual_rec_ty =
+            let weird_ty = mutual_rec.weird_ty in
+            let ImplTrait = mutual_rec.ImplTrait in
+        make (mutual_rec_ty) {
+            // This needs `fn(x: f(x))` type recursion madness
+            weird_ty = |
+                a: Type,
+                a_apply: Apply(a),
+            | a_apply.output(Thing(a), ImplTrait(a, a_apply, todo (Trait(weird_ty(a, a_apply))))),
+
+            ImplTrait = |
+                a: Type,
+                a_apply: Apply(a),
+                a_out_trait: Trait(weird_ty(a, a_apply))
+            | make (Trait (Thing a)) {
+                method = |x: Unit| x,
+            },
+
+        } in
+
+        {=}
+    "));
+}
