@@ -391,3 +391,38 @@ fn infinite_chain_no_increasing_suffix() {
         {=}
     "));
 }
+
+#[test]
+#[should_panic(expected = "recursive mention found under a PiType")]
+fn negative_recursion() {
+    let mut ctx = EvalContext::default();
+    ctx.normalize(&p(r"
+        let Unit = {} in
+
+        // trait Trait {
+        //     type Assoc
+        //     where
+        //         Self: Trait;
+        // }
+        let rec Trait: Type(1) = {
+            // size: Size,
+            // // makes it into a family of non-recursive types
+            // assoc: fn(t_trait: Trait, t_trait.size < self.size) -> Type,
+            assoc: fn(t_trait: Trait) -> Type,
+        } in
+
+        // type Gaming<T: Trait> = T::Assoc;
+        // impl Trait for () {
+        //     type Assoc = Gaming<()>;
+        // }
+        // an impl<T> is exists<i> for<T> impl<T>: Trait(i) ?
+        // a T: Trait is exists<i> Trait(i)
+        let TraitImpl = make (Trait) {
+            // size = pick_size,
+            assoc = |t_trait: Trait| t_trait.assoc(t_trait),
+        } in
+
+        TraitImpl.assoc(TraitImpl)
+        // {=}
+    "));
+}
