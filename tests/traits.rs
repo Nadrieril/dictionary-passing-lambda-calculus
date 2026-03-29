@@ -1,7 +1,5 @@
 use dictionary_passing_lambda_calculus::*;
 
-use ExprKind::*;
-
 fn p(s: &str) -> Expr {
     parse(s).unwrap()
 }
@@ -116,7 +114,7 @@ fn test_sound_traits2() {
 fn test_unsound_traits() {
     // Reproduce https://github.com/rust-lang/rust/issues/135246#issuecomment-4066328421
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.normalize(&p(
         r"
         // Helpers
@@ -263,9 +261,9 @@ fn test_unsound_traits2() {
 fn funky() {
     // Courtesy @theemathas (https://rust-lang.zulipchat.com/#narrow/channel/144729-t-types/topic/Progress.20in.20coinduction/near/580806615)
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("i32", Type(0).into_expr());
+    ctx.add_uninterpreted("i32", p("Type"));
     // struct Identity;
-    ctx.add_uninterpreted("Identity", Type(0).into_expr());
+    ctx.add_uninterpreted("Identity", p("Type"));
     // struct Dummy<A>(A);
     ctx.add_uninterpreted("Dummy", p("Type -> Type"));
     ctx.normalize(&p(r"

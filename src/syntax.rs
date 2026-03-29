@@ -37,8 +37,23 @@ impl Span {
     pub fn or<'a>(&'a self, other: &'a Self) -> &'a Self {
         if self.is_dummy() { other } else { self }
     }
+    /// Compute a span covering both `self` and `other`.
+    pub fn union(&self, other: &Self) -> Self {
+        if self.is_dummy() {
+            return other.clone();
+        }
+        if other.is_dummy() {
+            return self.clone();
+        }
+        Span {
+            start: self.start.min(other.start),
+            end: self.end.max(other.end),
+            source: self.source.clone(),
+        }
+    }
 
     /// Display a formatted error message with source context, then panic.
+    #[track_caller]
     pub fn error(&self, msg: &str) -> ! {
         use annotate_snippets::{AnnotationKind, Level, Renderer, Snippet};
         if !self.is_dummy() {
@@ -128,6 +143,7 @@ pub trait ExprMapper {
     type SelfWithNewLifetime<'a>: ExprMapper;
     fn under_abstraction<T>(
         &mut self,
+        span: &Span,
         var: &mut Variable,
         // The already-mapped value of `var`, if any.
         val: Option<&Expr>,
@@ -137,6 +153,7 @@ pub trait ExprMapper {
     ) -> T;
     fn under_recursive_abstraction<T>(
         &mut self,
+        span: &Span,
         var: &mut Variable,
         // The not-yet-mapped value of `var`, if any.
         val: Option<&Expr>,
@@ -144,45 +161,29 @@ pub trait ExprMapper {
         ty: &Expr,
         f: impl for<'a> FnOnce(&mut Self::SelfWithNewLifetime<'a>) -> T,
     ) -> T {
-        self.under_abstraction(var, val, Some(ty), f)
+        self.under_abstraction(span, var, val, Some(ty), f)
     }
 }
 
 impl Expr {
-    fn new(kind: ExprKind, ty: Option<Expr>) -> Expr {
-        Expr(Arc::new(ExprContents {
-            kind,
-            ty,
-            span: Span::dummy(),
-        }))
+    fn new(kind: ExprKind, ty: Option<Expr>, span: Span) -> Expr {
+        Expr(Arc::new(ExprContents { kind, ty, span }))
     }
 
     /// Attach a type to this expression.
     pub fn with_ty(self, ty: Expr) -> Expr {
-        Expr(Arc::new(ExprContents {
-            kind: self.kind().clone(),
-            ty: Some(ty),
-            span: self.span().clone(),
-        }))
+        Expr::new(self.kind().clone(), Some(ty), self.span().clone())
     }
     pub fn without_ty(&self) -> Expr {
         if self.opt_ty().is_some() {
-            Expr(Arc::new(ExprContents {
-                kind: self.kind().clone(),
-                ty: None,
-                span: self.span().clone(),
-            }))
+            Expr::new(self.kind().clone(), None, self.span().clone())
         } else {
             self.clone()
         }
     }
     /// Attach a source span to this expression.
     pub fn with_span(self, span: Span) -> Expr {
-        Expr(Arc::new(ExprContents {
-            kind: self.kind().clone(),
-            ty: self.0.ty.clone(),
-            span,
-        }))
+        Expr::new(self.kind().clone(), self.0.ty.clone(), span)
     }
 
     pub fn span(&self) -> &Span {
@@ -209,7 +210,7 @@ impl Expr {
         // To avoid infinite recursion, we don't store the type of `Type`s, so we recover that info
         // here.
         match self.kind() {
-            Type(k) => Some(Type(k + 1).into_expr()),
+            Type(k) => Some(Type(k + 1).into_expr(self.span())),
             _ => self.0.ty.clone(),
         }
     }
@@ -235,7 +236,7 @@ impl Expr {
             Pi(x, t, e, mentions) => {
                 let mut x = *x;
                 let t = v.map_expr(SubExprLocation::PiType, t);
-                let e = v.under_abstraction(&mut x, None, Some(&t), |v| {
+                let e = v.under_abstraction(self.span(), &mut x, None, Some(&t), |v| {
                     v.map_expr(SubExprLocation::Construct(Constructor::Pi), e)
                 });
                 Pi(x, t, e, mentions.clone())
@@ -243,7 +244,7 @@ impl Expr {
             Lambda(x, t, e) => {
                 let mut x = *x;
                 let t = v.map_expr(SubExprLocation::LambdaType, t);
-                let e = v.under_abstraction(&mut x, None, Some(&t), |v| {
+                let e = v.under_abstraction(self.span(), &mut x, None, Some(&t), |v| {
                     v.map_expr(SubExprLocation::Construct(Constructor::Lambda), e)
                 });
                 Lambda(x, t, e)
@@ -255,7 +256,7 @@ impl Expr {
                 });
                 let e1 = v.map_expr(SubExprLocation::LetVal, e1);
                 let mut x = *x;
-                let e2 = v.under_abstraction(&mut x, Some(&e1), ty.as_ref(), |ctx| {
+                let e2 = v.under_abstraction(self.span(), &mut x, Some(&e1), ty.as_ref(), |ctx| {
                     ctx.map_expr(SubExprLocation::LetBody, e2)
                 });
                 Let(x, ty, e1, e2)
@@ -263,13 +264,17 @@ impl Expr {
             LetRec(x, ty, e1, e2) => {
                 let orig_x = *x;
                 let mut x = *x;
-                let (ty, e1, e2) = v.under_recursive_abstraction(&mut x, Some(&e1), &ty, |ctx| {
-                    (
-                        ctx.map_expr(SubExprLocation::TypeAnnot(TypeAnnotLocation::LetRec), &ty),
-                        ctx.map_expr(SubExprLocation::LetRecVal(orig_x), &e1),
-                        ctx.map_expr(SubExprLocation::LetRecBody, &e2),
-                    )
-                });
+                let (ty, e1, e2) =
+                    v.under_recursive_abstraction(self.span(), &mut x, Some(&e1), &ty, |ctx| {
+                        (
+                            ctx.map_expr(
+                                SubExprLocation::TypeAnnot(TypeAnnotLocation::LetRec),
+                                &ty,
+                            ),
+                            ctx.map_expr(SubExprLocation::LetRecVal(orig_x), &e1),
+                            ctx.map_expr(SubExprLocation::LetRecBody, &e2),
+                        )
+                    });
                 LetRec(x, ty, e1, e2)
             }
             Struct(ty, fields) => Struct(
@@ -289,18 +294,19 @@ impl Expr {
             ),
             StructTy(x, fields) => {
                 let mut x = *x;
-                let fields = v.under_recursive_abstraction(&mut x, None, self, |ctx| {
-                    Arc::new(
-                        fields
-                            .iter()
-                            .map(|(n, e)| {
-                                let loc =
-                                    SubExprLocation::Construct(Constructor::StructTyField(*n));
-                                (*n, ctx.map_expr(loc, e))
-                            })
-                            .collect(),
-                    )
-                });
+                let fields =
+                    v.under_recursive_abstraction(self.span(), &mut x, None, self, |ctx| {
+                        Arc::new(
+                            fields
+                                .iter()
+                                .map(|(n, e)| {
+                                    let loc =
+                                        SubExprLocation::Construct(Constructor::StructTyField(*n));
+                                    (*n, ctx.map_expr(loc, e))
+                                })
+                                .collect(),
+                        )
+                    });
                 StructTy(x, fields)
             }
             Field(e, name) => {
@@ -339,7 +345,7 @@ impl ExprKind {
         }
     }
 
-    pub fn into_expr(self) -> Expr {
-        Expr::new(self, None)
+    pub fn into_expr(self, span: &Span) -> Expr {
+        Expr::new(self, None, span.clone())
     }
 }

@@ -1,7 +1,5 @@
 use dictionary_passing_lambda_calculus::*;
 
-use ExprKind::*;
-
 fn p(s: &str) -> Expr {
     parse(s).unwrap()
 }
@@ -9,7 +7,7 @@ fn p(s: &str) -> Expr {
 #[test]
 fn test_application() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.add_uninterpreted("z", p("N"));
     ctx.add_uninterpreted("s", p("N -> N"));
     ctx.add_val("three", p(r"|f: N -> N, x: N| f(f(f(x)))"));
@@ -27,7 +25,7 @@ fn test_application() {
 #[test]
 fn test_types() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.add_uninterpreted("z", p("N"));
 
     let sty = p("(N -> N) -> N -> N");
@@ -37,7 +35,7 @@ fn test_types() {
 #[test]
 fn test_structs() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.add_uninterpreted("z", p("N"));
 
     // Struct type has a type
@@ -63,8 +61,8 @@ fn test_structs() {
 #[test]
 fn test_equality() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
-    ctx.add_uninterpreted("M", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
+    ctx.add_uninterpreted("M", p("Type"));
     ctx.add_val("f", p(r"|t: Type| t == N"));
 
     // Eq type has a type
@@ -93,8 +91,8 @@ fn test_equality() {
 #[test]
 fn test_scoping() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
-    ctx.add_uninterpreted("M", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
+    ctx.add_uninterpreted("M", p("Type"));
     ctx.add_uninterpreted("x", p("N"));
 
     // Type-checking a lambda that shadows x should not leak x:M
@@ -114,7 +112,7 @@ fn test_scoping() {
 #[test]
 fn test_capture_avoidance() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.add_uninterpreted("x", p("N"));
     ctx.add_uninterpreted("y", p("N"));
     ctx.add_uninterpreted("z", p("N"));
@@ -149,8 +147,8 @@ fn test_capture_avoidance() {
 #[test]
 fn test_equality_capture() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
-    ctx.add_uninterpreted("x", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
+    ctx.add_uninterpreted("x", p("Type"));
 
     let id_ty = p("fn(x: Type) -> x");
     let const_ty = p("fn(y: Type) -> x");
@@ -160,7 +158,7 @@ fn test_equality_capture() {
 #[test]
 fn test_rec() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.add_uninterpreted("z", p("N"));
 
     let r = p("make ({ a: N }) { a = z }");
@@ -181,7 +179,7 @@ fn test_rec() {
 #[test]
 fn test_let() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.add_uninterpreted("z", p("N"));
     ctx.add_uninterpreted("s", p("fn(N) -> N"));
 
@@ -200,7 +198,7 @@ fn test_let() {
 #[test]
 fn test_let_rec() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.add_uninterpreted("z", p("N"));
 
     // let rec with self-referential struct — field access through the fixpoint
@@ -221,7 +219,7 @@ fn test_let_rec() {
 #[test]
 fn test_todo() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
 
     // todo has the declared type
     assert_eq!(ctx.typecheck(&p("todo N")).ty().to_string(), "N");
@@ -236,7 +234,7 @@ fn test_todo() {
 #[should_panic(expected = "tried to normalize")]
 fn test_reject_normalize_todo() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.normalize(&p("todo N"));
 }
 
@@ -244,8 +242,8 @@ fn test_reject_normalize_todo() {
 #[should_panic(expected = "assertion `left == right` failed")]
 fn test_reject_rec_self_mismatch() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
-    ctx.add_uninterpreted("M", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
+    ctx.add_uninterpreted("M", p("Type"));
     ctx.add_uninterpreted("z", p("N"));
     ctx.add_uninterpreted("m", p("M"));
     ctx.add_val("T", p("{ a: Type, b: Type, eq: self.a == self.b }"));
@@ -256,7 +254,7 @@ fn test_reject_rec_self_mismatch() {
 #[should_panic(expected = "Function expected")]
 fn test_reject_apply_non_function() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.add_uninterpreted("z", p("N"));
     ctx.typecheck(&p("z z"));
 }
@@ -265,8 +263,8 @@ fn test_reject_apply_non_function() {
 #[should_panic(expected = "assertion `left == right` failed")]
 fn test_reject_arg_type_mismatch() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
-    ctx.add_uninterpreted("M", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
+    ctx.add_uninterpreted("M", p("Type"));
     ctx.add_uninterpreted("f", p("N -> N"));
     ctx.add_uninterpreted("m", p("M"));
     // f expects N but gets M
@@ -277,7 +275,7 @@ fn test_reject_arg_type_mismatch() {
 #[should_panic(expected = "Type expected")]
 fn test_reject_value_as_type() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.add_uninterpreted("z", p("N"));
     // z is a value, not a type — can't use as binder type
     ctx.typecheck(&p(r"|x: z| x"));
@@ -287,7 +285,7 @@ fn test_reject_value_as_type() {
 #[should_panic(expected = "Struct type expected")]
 fn test_reject_field_on_non_struct() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.add_uninterpreted("z", p("N"));
     ctx.typecheck(&p("z.a"));
 }
@@ -296,7 +294,7 @@ fn test_reject_field_on_non_struct() {
 #[should_panic(expected = "Field `b` not found")]
 fn test_reject_missing_field() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.add_uninterpreted("z", p("N"));
     ctx.typecheck(&p("{ a = z }.b"));
 }
@@ -305,7 +303,7 @@ fn test_reject_missing_field() {
 #[should_panic(expected = "Struct type expected")]
 fn test_reject_make_non_struct_type() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.add_uninterpreted("z", p("N"));
     // Annotation is N, not a struct type
     ctx.typecheck(&p("make (N) { a = z }"));
@@ -315,8 +313,8 @@ fn test_reject_make_non_struct_type() {
 #[should_panic(expected = "assertion `left == right` failed")]
 fn test_reject_make_field_type_mismatch() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
-    ctx.add_uninterpreted("M", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
+    ctx.add_uninterpreted("M", p("Type"));
     ctx.add_uninterpreted("z", p("N"));
     // Field a has type N but annotation says M
     ctx.typecheck(&p("make ({ a: M }) { a = z }"));
@@ -326,7 +324,7 @@ fn test_reject_make_field_type_mismatch() {
 #[should_panic(expected = "assertion `left == right` failed")]
 fn test_reject_make_missing_field() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.add_uninterpreted("z", p("N"));
     // Annotation expects two fields but value only has one
     ctx.typecheck(&p("make ({ a: N, b: N }) { a = z }"));
@@ -336,7 +334,7 @@ fn test_reject_make_missing_field() {
 #[should_panic(expected = "assertion `left == right` failed")]
 fn test_reject_make_extra_field() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.add_uninterpreted("z", p("N"));
     // Value has extra field not in annotation
     ctx.typecheck(&p("make ({ a: N }) { a = z, b = z }"));
@@ -346,7 +344,7 @@ fn test_reject_make_extra_field() {
 #[should_panic(expected = "assertion `left == right` failed")]
 fn test_reject_eq_different_types() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.add_uninterpreted("z", p("N"));
     // z : N and N : Type — different types
     ctx.typecheck(&p("z == N"));
@@ -356,7 +354,7 @@ fn test_reject_eq_different_types() {
 #[should_panic(expected = "Equality type expected")]
 fn test_reject_transport_non_eq() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.add_uninterpreted("z", p("N"));
     ctx.add_uninterpreted("f", p("N -> N"));
     ctx.typecheck(&p("transport z f"));
@@ -366,7 +364,7 @@ fn test_reject_transport_non_eq() {
 #[should_panic(expected = "Function expected for transport")]
 fn test_reject_transport_non_function() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.add_uninterpreted("x", p("N"));
     ctx.add_uninterpreted("eq", p("x == x"));
     // second arg must be a function
@@ -377,8 +375,8 @@ fn test_reject_transport_non_function() {
 #[should_panic(expected = "assertion `left == right` failed")]
 fn test_reject_transport_domain_mismatch() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
-    ctx.add_uninterpreted("M", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
+    ctx.add_uninterpreted("M", p("Type"));
     ctx.add_uninterpreted("x", p("N"));
     ctx.add_uninterpreted("eq", p("x == x"));
     ctx.add_uninterpreted("f", p("M -> M"));

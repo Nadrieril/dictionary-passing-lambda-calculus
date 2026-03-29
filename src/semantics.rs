@@ -40,13 +40,14 @@ impl Expr {
             type SelfWithNewLifetime<'a> = Self;
             fn under_abstraction<T>(
                 &mut self,
+                span: &Span,
                 x: &mut Variable,
                 _val: Option<&Expr>,
                 _ty: Option<&Expr>,
                 f: impl FnOnce(&mut Self) -> T,
             ) -> T {
                 let x_fresh = x.refresh();
-                self.0.push((*x, Var(x_fresh).into_expr()));
+                self.0.push((*x, Var(x_fresh).into_expr(span)));
                 *x = x_fresh;
                 let result = f(self);
                 self.0.pop();
@@ -656,6 +657,7 @@ impl EvalContext {
                 type SelfWithNewLifetime<'b> = TypeChecker<'b>;
                 fn under_abstraction<T>(
                     &mut self,
+                    _span: &Span,
                     var: &mut Variable,
                     val: Option<&Expr>,
                     ty: Option<&Expr>,
@@ -669,6 +671,7 @@ impl EvalContext {
                 }
                 fn under_recursive_abstraction<T>(
                     &mut self,
+                    _span: &Span,
                     var: &mut Variable,
                     // The not-yet-mapped value of `var`, if any.
                     val: Option<&Expr>,
@@ -691,6 +694,7 @@ impl EvalContext {
             (e, type_checker_ctx.last_binding)
         };
 
+        let span = e.span();
         let ty = match e.kind() {
             Var(x) => {
                 let binding = self
@@ -716,7 +720,7 @@ impl EvalContext {
             Pi(_, t1, t2, _) => {
                 let k1 = t1.ty().unwrap_universe();
                 let k2 = t2.ty().unwrap_universe();
-                Type(k1.max(k2)).into_expr()
+                Type(k1.max(k2)).into_expr(span)
             }
             Lambda(x, t, body) => {
                 t.ty().unwrap_universe();
@@ -746,7 +750,7 @@ impl EvalContext {
                         .ok()
                 };
                 let body_ty = body.ty().clone();
-                Pi(*x, t.clone(), body_ty, mentions).into_expr()
+                Pi(*x, t.clone(), body_ty, mentions).into_expr(span)
             }
             App(f, arg) => {
                 let Pi(x, s, t, _) = self.whnf_unfold(&f.ty()).kind().clone() else {
@@ -761,11 +765,11 @@ impl EvalContext {
                     .map(|(_, t)| t.ty().unwrap_universe())
                     .max()
                     .unwrap_or(0);
-                Type(k).into_expr()
+                Type(k).into_expr(span)
             }
             Struct(ty_ann, fields) => {
                 let field_tys = fields.iter().map(|(&n, e)| (n, e.ty().clone())).collect();
-                let actual = StructTy(Variable::user("self"), Arc::new(field_tys)).into_expr();
+                let actual = StructTy(Variable::user("self"), Arc::new(field_tys)).into_expr(span);
                 if let Some(ty_ann) = ty_ann {
                     ty_ann.ty().unwrap_universe();
                     {
@@ -774,7 +778,7 @@ impl EvalContext {
                         else {
                             ty_ann.error("Struct type expected for `make`")
                         };
-                        let expected = StructTy(self_var.refresh(), field_tys).into_expr();
+                        let expected = StructTy(self_var.refresh(), field_tys).into_expr(span);
                         let expected = expected.subst1(self_var, &e);
                         self.assert_equal(&expected, &actual);
                     }
@@ -803,9 +807,9 @@ impl EvalContext {
                     &a.ty(),
                 );
                 let k = a_ty.ty().unwrap_universe();
-                Type(k).into_expr()
+                Type(k).into_expr(span)
             }
-            Refl(a) => Eq(a.clone(), a.clone()).into_expr(),
+            Refl(a) => Eq(a.clone(), a.clone()).into_expr(span),
             Transport(eq, f) => {
                 let Eq(a, b) = self.whnf_unfold(&eq.ty()).kind().clone() else {
                     eq.error("Equality type expected for transport")
@@ -813,14 +817,13 @@ impl EvalContext {
                 let Pi(..) = self.whnf_unfold(&f.ty()).kind() else {
                     f.error("Function expected for transport's second argument")
                 };
-                let transport_ty = Pi(
+                Pi(
                     Variable::anon(),
-                    App(f.clone(), a).into_expr(),
-                    App(f.clone(), b).into_expr(),
+                    App(f.clone(), a).into_expr(span),
+                    App(f.clone(), b).into_expr(span),
                     None,
                 )
-                .into_expr();
-                transport_ty
+                .into_expr(span)
             }
             Todo(t) => t.clone(),
         };
@@ -941,6 +944,7 @@ impl EvalContext {
             type SelfWithNewLifetime<'b> = ProgressChecker<'b>;
             fn under_abstraction<T>(
                 &mut self,
+                _span: &Span,
                 var: &mut Variable,
                 val: Option<&Expr>,
                 ty: Option<&Expr>,
@@ -954,6 +958,7 @@ impl EvalContext {
             }
             fn under_recursive_abstraction<T>(
                 &mut self,
+                _span: &Span,
                 var: &mut Variable,
                 // The not-yet-mapped value of `var`, if any.
                 val: Option<&Expr>,
@@ -986,19 +991,20 @@ impl EvalContext {
     }
     fn whnf_inner(&mut self, e: &Expr, unfold_nominal: bool) -> Expr {
         self.step("normalization");
+        let span = e.span();
         match e.kind() {
             Var(x) => match self.lookup_binding(*x) {
                 Some(binding) if let Some(val) = binding.value(unfold_nominal).cloned() => {
                     self.whnf_inner(&val, unfold_nominal)
                 }
-                _ => Var(*x).into_expr(),
+                _ => Var(*x).into_expr(span),
             },
             App(e1, e2) => match self.whnf_inner(e1, unfold_nominal).kind() {
                 Lambda(x, _, body) => {
                     let body = body.clone();
                     self.whnf_inner(&body.subst1(*x, e2), unfold_nominal)
                 }
-                _ => App(self.whnf_inner(e1, unfold_nominal), e2.clone()).into_expr(),
+                _ => App(self.whnf_inner(e1, unfold_nominal), e2.clone()).into_expr(span),
             },
             Field(e, name) => match self.whnf_inner(e, true).kind() {
                 Struct(_, fields) => {
@@ -1008,11 +1014,12 @@ impl EvalContext {
                         .clone();
                     self.whnf_inner(&val, unfold_nominal)
                 }
-                _ => Field(self.whnf_inner(e, true), *name).into_expr(),
+                _ => Field(self.whnf_inner(e, true), *name).into_expr(span),
             },
             Let(x, _, e1, e2) => self.whnf_inner(&e2.subst1(*x, e1), unfold_nominal),
             LetRec(x, ty, e1, e2) => {
-                let fixpoint = LetRec(*x, ty.clone(), e1.clone(), Var(*x).into_expr()).into_expr();
+                let fixpoint =
+                    LetRec(*x, ty.clone(), e1.clone(), Var(*x).into_expr(span)).into_expr(span);
                 let e1_unrolled = e1.subst1(*x, &fixpoint);
                 self.whnf_inner(&e2.subst1(*x, &e1_unrolled), unfold_nominal)
             }
@@ -1022,9 +1029,10 @@ impl EvalContext {
                     Refl(x) => {
                         let x = x.clone();
                         let y = Variable::anon().refresh();
-                        Lambda(y, App(f.clone(), x).into_expr(), Var(y).into_expr()).into_expr()
+                        Lambda(y, App(f.clone(), x).into_expr(span), Var(y).into_expr(span))
+                            .into_expr(span)
                     }
-                    _ => Transport(self.whnf_inner(eq, unfold_nominal), f.clone()).into_expr(),
+                    _ => Transport(self.whnf_inner(eq, unfold_nominal), f.clone()).into_expr(span),
                 }
             }
             Todo(t) => e.error(&format!("tried to normalize `todo {t}`")),
@@ -1049,6 +1057,7 @@ impl EvalContext {
             type SelfWithNewLifetime<'b> = Normalizer<'b>;
             fn under_abstraction<T>(
                 &mut self,
+                _span: &Span,
                 var: &mut Variable,
                 _val: Option<&Expr>,
                 ty: Option<&Expr>,
@@ -1076,6 +1085,7 @@ impl EvalContext {
         self.step("equality checking");
         let e1 = self.whnf(e1);
         let e2 = self.whnf(e2);
+        let span = e1.span();
         // Recurse into sub-expressions, applying whnf at each level.
         match (e1.kind(), e2.kind()) {
             (Var(x1), Var(x2)) => x1 == x2,
@@ -1083,12 +1093,12 @@ impl EvalContext {
             (Lambda(x, t1, body1), Lambda(y, t2, body2)) => {
                 // A little bit of alpha-equivalence.
                 let z = x.refresh();
-                let zv: Expr = Var(z).into_expr();
+                let zv: Expr = Var(z).into_expr(span);
                 self.equal(t1, t2) && self.equal(&body1.subst1(*x, &zv), &body2.subst1(*y, &zv))
             }
             (Pi(x, t1, body1, _), Pi(y, t2, body2, _)) => {
                 let z = x.refresh();
-                let zv: Expr = Var(z).into_expr();
+                let zv: Expr = Var(z).into_expr(span);
                 self.equal(t1, t2) && self.equal(&body1.subst1(*x, &zv), &body2.subst1(*y, &zv))
             }
             (App(f1, a1), App(f2, a2)) => self.equal(f1, f2) && self.equal(a1, a2),
@@ -1104,7 +1114,7 @@ impl EvalContext {
                 }
                 // Fields are under the self-binder; compare syntactically.
                 let z = x1.refresh();
-                let zv: Expr = Var(z).into_expr();
+                let zv: Expr = Var(z).into_expr(span);
                 f1.iter().all(|(n, e)| {
                     f2.get(n)
                         .is_some_and(|e2| self.equal(&e.subst1(*x1, &zv), &e2.subst1(*x2, &zv)))

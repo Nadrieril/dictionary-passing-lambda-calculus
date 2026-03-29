@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::ExprKind::*;
+use crate::ExprKind::{self, *};
 use crate::syntax::Span;
 use crate::{Expr, Fields, Variable};
 use nom::branch::alt;
@@ -58,19 +58,15 @@ fn to_span(input: &Input<'_>) -> Span {
     }
 }
 
-/// Compute a span covering two sub-expressions (from the start of `a` to the end of `b`).
+/// Compute a span covering two sub-expressions.
 fn span_of_union(a: &Expr, b: &Expr) -> Span {
-    Span {
-        start: a.span().start,
-        end: b.span().end,
-        source: a.span().source.clone(),
-    }
+    a.span().union(b.span())
 }
 
 /// Wrap a parser to attach a source span to the resulting `Expr`.
 /// Uses nom-locate's `Offset` to compute the consumed input slice.
 fn spanned<'a>(
-    mut inner: impl Parser<Input<'a>, Output = Expr, Error = DeepError<'a>>,
+    mut inner: impl Parser<Input<'a>, Output = ExprKind, Error = DeepError<'a>>,
 ) -> impl Parser<Input<'a>, Output = Expr, Error = DeepError<'a>> {
     move |input: Input<'a>| {
         // Skip leading whitespace so the span starts at the first real token.
@@ -78,8 +74,14 @@ fn spanned<'a>(
         let start = input.clone();
         let (rest, expr) = inner.parse(input)?;
         let span = to_span(&start.take(start.offset(&rest)));
-        Ok((rest, expr.with_span(span)))
+        Ok((rest, expr.into_expr(&span)))
     }
+}
+
+fn forget_span<'a>(
+    inner: impl Parser<Input<'a>, Output = Expr, Error = DeepError<'a>>,
+) -> impl Parser<Input<'a>, Output = ExprKind, Error = DeepError<'a>> {
+    inner.map(|e| e.kind().clone())
 }
 
 /// Skip a single `// ...` line comment.
@@ -207,29 +209,29 @@ fn parse_params(input: Input<'_>) -> IResult<'_, Vec<(Variable, Expr)>> {
 
 /// Wrap a return type in nested Pi types for each parameter.
 fn wrap_pi(params: &[(Variable, Expr)], ret: Expr) -> Expr {
-    params
-        .iter()
-        .rev()
-        .fold(ret, |acc, (x, t)| Pi(*x, t.clone(), acc, None).into_expr())
+    params.iter().rev().fold(ret, |acc, (x, t)| {
+        let span = t.span().union(acc.span());
+        Pi(*x, t.clone(), acc, None).into_expr(&span)
+    })
 }
 
 /// Wrap a body in nested lambdas for each parameter.
 fn wrap_lambda(params: &[(Variable, Expr)], body: Expr) -> Expr {
-    params
-        .iter()
-        .rev()
-        .fold(body, |acc, (x, t)| Lambda(*x, t.clone(), acc).into_expr())
+    params.iter().rev().fold(body, |acc, (x, t)| {
+        let span = t.span().union(acc.span());
+        Lambda(*x, t.clone(), acc).into_expr(&span)
+    })
 }
 
 /// `Type(n)` or `Type` (shorthand for `Type(0)`)
-fn parse_type(input: Input<'_>) -> IResult<'_, Expr> {
-    preceded(
+fn parse_type(input: Input<'_>) -> IResult<'_, ExprKind> {
+    (preceded(
         keyword("Type"),
         opt(delimited(ws(nom_char('(')), ws(digit1), ws(nom_char(')')))),
     )
     .map(|digits: Option<Input>| {
-        Type(digits.map_or(0, |d| d.fragment().parse::<usize>().unwrap())).into_expr()
-    })
+        Type(digits.map_or(0, |d| d.fragment().parse::<usize>().unwrap()))
+    }))
     .parse(input)
 }
 
@@ -261,7 +263,10 @@ fn parse_pi(input: Input<'_>) -> IResult<'_, Expr> {
                 delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
                 preceded(ws(tag("->")), parse_expr),
             )
-                .map(|(t, e)| Pi(Variable::anon(), t, e, None).into_expr()),
+                .map(|(t, e)| {
+                    let span = t.span().union(e.span());
+                    Pi(Variable::anon(), t, e, None).into_expr(&span)
+                }),
         )),
     )
     .parse(input)
@@ -272,21 +277,20 @@ fn fields_from_vec(v: Vec<(Ustr, Expr)>) -> crate::Fields {
 }
 
 /// `{ a = e, b = e }` or `{ a: T, b: T }` or `{}` or `{=}`
-fn parse_struct(input: Input<'_>) -> IResult<'_, Expr> {
+fn parse_struct(input: Input<'_>) -> IResult<'_, ExprKind> {
     alt((
         // {=} — empty struct value
         (ws(nom_char('{')), ws(nom_char('=')), ws(nom_char('}')))
-            .map(|_| Struct(None, Fields::default()).into_expr()),
+            .map(|_| Struct(None, Fields::default())),
         // { a = e, ... } — struct value
-        comma_list('{', '}', field_val)
-            .map(|fields| Struct(None, fields_from_vec(fields)).into_expr()),
+        comma_list('{', '}', field_val).map(|fields| Struct(None, fields_from_vec(fields))),
         // { a: T, ... } or {} — struct type
         delimited(
             ws(nom_char('{')),
             separated_list0(ws(nom_char(',')), field_ty),
             (opt(ws(nom_char(','))), ws(nom_char('}'))),
         )
-        .map(|fields| StructTy(Variable::user("self"), fields_from_vec(fields)).into_expr()),
+        .map(|fields| StructTy(Variable::user("self"), fields_from_vec(fields))),
     ))
     .parse(input)
 }
@@ -297,8 +301,12 @@ fn parse_atom(input: Input<'_>) -> IResult<'_, Expr> {
         parse_type,
         parse_make,
         parse_struct,
-        variable.map(|v| Var(v).into_expr()),
-        delimited(ws(nom_char('(')), parse_expr, ws(nom_char(')'))),
+        variable.map(|v| Var(v)),
+        delimited(
+            ws(nom_char('(')),
+            forget_span(parse_expr),
+            ws(nom_char(')')),
+        ),
     )))
     .parse(input)
 }
@@ -338,11 +346,11 @@ fn parse_postfix(input: Input<'_>) -> IResult<'_, Expr> {
                             end: new_rest.location_offset(),
                             source: acc.span().source.clone(),
                         };
-                        Field(acc, name).into_expr().with_span(span)
+                        Field(acc, name).into_expr(&span)
                     }
                     PostfixOp::Call(args) => args.into_iter().fold(acc, |acc, arg| {
                         let span = span_of_union(&acc, &arg);
-                        App(acc, arg).into_expr().with_span(span)
+                        App(acc, arg).into_expr(&span)
                     }),
                 };
                 rest = new_rest;
@@ -369,14 +377,14 @@ fn parse_app(input: Input<'_>) -> IResult<'_, Expr> {
         .map(|(first, rest)| {
             rest.into_iter().fold(first, |acc, arg| {
                 let span = span_of_union(&acc, &arg);
-                App(acc, arg).into_expr().with_span(span)
+                App(acc, arg).into_expr(&span)
             })
         })
         .parse(input)
 }
 
 /// `make (ty) { a = e, ... }` or `make (ty) {=}`
-fn parse_make(input: Input<'_>) -> IResult<'_, Expr> {
+fn parse_make(input: Input<'_>) -> IResult<'_, ExprKind> {
     (
         preceded(
             keyword("make"),
@@ -387,52 +395,56 @@ fn parse_make(input: Input<'_>) -> IResult<'_, Expr> {
             comma_list('{', '}', field_val).map(fields_from_vec),
         )),
     )
-        .map(|(ty, fields)| Struct(Some(ty), fields).into_expr())
+        .map(|(ty, fields)| Struct(Some(ty), fields))
         .parse(input)
 }
 
 /// `refl e`
-fn parse_refl(input: Input<'_>) -> IResult<'_, Expr> {
+fn parse_refl(input: Input<'_>) -> IResult<'_, ExprKind> {
     preceded(keyword("refl"), parse_postfix)
-        .map(|e| Refl(e).into_expr())
+        .map(|e| Refl(e))
         .parse(input)
 }
 
 /// `todo ty`
-fn parse_todo(input: Input<'_>) -> IResult<'_, Expr> {
+fn parse_todo(input: Input<'_>) -> IResult<'_, ExprKind> {
     preceded(keyword("todo"), parse_postfix)
-        .map(|t| Todo(t).into_expr())
+        .map(|t| Todo(t))
         .parse(input)
 }
 
 /// `transport eq f`
-fn parse_transport(input: Input<'_>) -> IResult<'_, Expr> {
+fn parse_transport(input: Input<'_>) -> IResult<'_, ExprKind> {
     preceded(keyword("transport"), (parse_postfix, parse_postfix))
-        .map(|(eq, f)| Transport(eq, f).into_expr())
+        .map(|(eq, f)| Transport(eq, f))
         .parse(input)
 }
 
 /// Arrow: `eq -> arrow` (right-associative) or just `eq`.
 /// `A -> B` desugars to `fn(_: A) -> B`.
 fn parse_arrow(input: Input<'_>) -> IResult<'_, Expr> {
-    spanned(
-        (parse_eq, opt(preceded(ws(tag("->")), cut(parse_arrow)))).map(|(lhs, rhs)| match rhs {
-            Some(rhs) => Pi(Variable::anon(), lhs, rhs, None).into_expr(),
+    (parse_eq, opt(preceded(ws(tag("->")), cut(parse_arrow))))
+        .map(|(lhs, rhs)| match rhs {
+            Some(rhs) => {
+                let span = span_of_union(&lhs, &rhs);
+                Pi(Variable::anon(), lhs, rhs, None).into_expr(&span)
+            }
             None => lhs,
-        }),
-    )
-    .parse(input)
+        })
+        .parse(input)
 }
 
 /// Equality: `app == app` or just `app`.
 fn parse_eq(input: Input<'_>) -> IResult<'_, Expr> {
-    spanned(
-        (parse_app, opt(preceded(ws(tag("==")), cut(parse_app)))).map(|(lhs, rhs)| match rhs {
-            Some(rhs) => Eq(lhs, rhs).into_expr(),
+    (parse_app, opt(preceded(ws(tag("==")), cut(parse_app))))
+        .map(|(lhs, rhs)| match rhs {
+            Some(rhs) => {
+                let span = span_of_union(&lhs, &rhs);
+                Eq(lhs, rhs).into_expr(&span)
+            }
             None => lhs,
-        }),
-    )
-    .parse(input)
+        })
+        .parse(input)
 }
 
 fn var_ustr(v: Variable) -> Ustr {
@@ -443,15 +455,21 @@ fn var_ustr(v: Variable) -> Ustr {
 
 /// Desugar `let rec name1: T1 = e1 and name2: T2 = e2 and ... in rest` into a single
 /// `let rec` over a combined record type, with field projections in the body and continuation.
-fn desugar_mutual_rec(bindings: Vec<(Variable, Expr, Expr)>, rest: Expr) -> Expr {
+fn desugar_mutual_rec(bindings: Vec<(Variable, Expr, Expr)>, rest: Expr) -> ExprKind {
     let mutual_rec = Variable::user("mutual_rec").refresh();
+
+    // Compute the overall span covering all bindings.
+    let full_span = bindings.iter().fold(Span::dummy(), |acc, (_, ty, body)| {
+        acc.union(ty.span()).union(body.span())
+    });
 
     // Build the combined struct type: { name1: T1, name2: T2, ... }
     let ty_fields: Vec<(Ustr, Expr)> = bindings
         .iter()
         .map(|(name, ty, _)| (var_ustr(*name), ty.clone()))
         .collect();
-    let struct_ty = StructTy(Variable::user("self"), fields_from_vec(ty_fields)).into_expr();
+    let struct_ty =
+        StructTy(Variable::user("self"), fields_from_vec(ty_fields)).into_expr(&full_span);
 
     // Build the body of `mutual_rec`:
     //   let name1 = mutual_rec.name1 in
@@ -461,22 +479,27 @@ fn desugar_mutual_rec(bindings: Vec<(Variable, Expr, Expr)>, rest: Expr) -> Expr
         .iter()
         .map(|(name, _, body)| (var_ustr(*name), body.clone()))
         .collect();
-    let make_expr = Struct(Some(struct_ty.clone()), fields_from_vec(val_fields)).into_expr();
-    let struct_body = bindings.iter().rev().fold(make_expr, |acc, (name, _, _)| {
-        let field_acc = Field(Var(mutual_rec).into_expr(), var_ustr(*name)).into_expr();
-        Let(*name, None, field_acc, acc).into_expr()
+    let make_expr =
+        Struct(Some(struct_ty.clone()), fields_from_vec(val_fields)).into_expr(&full_span);
+    let struct_body = bindings.iter().rev().fold(make_expr, |acc, (name, ty, _)| {
+        let span = acc.span().union(ty.span());
+        let field_acc =
+            Field(Var(mutual_rec).into_expr(ty.span()), var_ustr(*name)).into_expr(ty.span());
+        Let(*name, None, field_acc, acc).into_expr(&span)
     });
 
     // Build the outer continuation:
     //   let name1 = mutual_rec.name1 in
     //   let name2 = mutual_rec.name2 in
     //   rest
-    let outer_rest = bindings.iter().rev().fold(rest, |acc, (name, _, _)| {
-        let field_acc = Field(Var(mutual_rec).into_expr(), var_ustr(*name)).into_expr();
-        Let(*name, None, field_acc, acc).into_expr()
+    let outer_rest = bindings.iter().rev().fold(rest, |acc, (name, ty, _)| {
+        let span = acc.span().union(ty.span());
+        let field_acc =
+            Field(Var(mutual_rec).into_expr(ty.span()), var_ustr(*name)).into_expr(ty.span());
+        Let(*name, None, field_acc, acc).into_expr(&span)
     });
 
-    LetRec(mutual_rec, struct_ty, struct_body, outer_rest).into_expr()
+    LetRec(mutual_rec, struct_ty, struct_body, outer_rest)
 }
 
 /// Parse a single `name: type = body` or `name(params) -> ret = body` binding (used after `and`).
@@ -513,7 +536,7 @@ fn parse_eq_body_in(input: Input<'_>) -> IResult<'_, (Expr, Expr)> {
 /// All `let` forms: plain, annotated, rec, and function sugar variants.
 /// Uses `cut` after commitment points (`:`, `->`, `=`) so that deep errors
 /// propagate instead of being swallowed by backtracking.
-fn parse_let(input: Input<'_>) -> IResult<'_, Expr> {
+fn parse_let(input: Input<'_>) -> IResult<'_, ExprKind> {
     let (input, (_, is_rec, name, params)) = (
         keyword("let"),
         opt(keyword("rec")).map(|r| r.is_some()),
@@ -536,7 +559,7 @@ fn parse_let(input: Input<'_>) -> IResult<'_, Expr> {
                     let ty = wrap_pi(&params, ret);
                     let body = wrap_lambda(&params, body);
                     if extra.is_empty() {
-                        LetRec(name, ty, body, rest).into_expr()
+                        LetRec(name, ty, body, rest)
                     } else {
                         let mut bindings = vec![(name, ty, body)];
                         bindings.extend(extra);
@@ -550,13 +573,13 @@ fn parse_let(input: Input<'_>) -> IResult<'_, Expr> {
                     .map(|(ret, (body, rest))| {
                         let ty = wrap_pi(&params, ret);
                         let body = wrap_lambda(&params, body);
-                        Let(name, Some(ty), body, rest).into_expr()
+                        Let(name, Some(ty), body, rest)
                     })
                     .parse(input)
             }
         } else if !is_rec {
             parse_eq_body_in
-                .map(|(body, rest)| Let(name, None, wrap_lambda(&params, body), rest).into_expr())
+                .map(|(body, rest)| Let(name, None, wrap_lambda(&params, body), rest))
                 .parse(input)
         } else {
             // No return type: let f(params) = body in rest
@@ -576,7 +599,7 @@ fn parse_let(input: Input<'_>) -> IResult<'_, Expr> {
             ))
             .map(|(ty, body, extra, rest)| {
                 if extra.is_empty() {
-                    LetRec(name, ty, body, rest).into_expr()
+                    LetRec(name, ty, body, rest)
                 } else {
                     let mut bindings = vec![(name, ty, body)];
                     bindings.extend(extra);
@@ -587,7 +610,7 @@ fn parse_let(input: Input<'_>) -> IResult<'_, Expr> {
         } else {
             // Committed to annotated form: let x: T = e1 in e2
             cut((parse_expr, parse_eq_body_in))
-                .map(|(ty, (e1, e2))| Let(name, Some(ty), e1, e2).into_expr())
+                .map(|(ty, (e1, e2))| Let(name, Some(ty), e1, e2))
                 .parse(input)
         }
     } else {
@@ -599,7 +622,7 @@ fn parse_let(input: Input<'_>) -> IResult<'_, Expr> {
             )))
         } else {
             parse_eq_body_in
-                .map(|(e1, e2)| Let(name, None, e1, e2).into_expr())
+                .map(|(e1, e2)| Let(name, None, e1, e2))
                 .parse(input)
         }
     }
@@ -608,8 +631,8 @@ fn parse_let(input: Input<'_>) -> IResult<'_, Expr> {
 fn parse_expr(input: Input<'_>) -> IResult<'_, Expr> {
     alt((
         spanned(parse_let),
-        spanned(parse_lambda),
-        spanned(parse_pi),
+        spanned(forget_span(parse_lambda)),
+        spanned(forget_span(parse_pi)),
         parse_arrow,
     ))
     .parse(input)

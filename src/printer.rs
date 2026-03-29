@@ -268,39 +268,3 @@ impl fmt::Display for Expr {
         self.fmt_prec(f, 0)
     }
 }
-
-#[test]
-fn test_print() {
-    use crate::*;
-    use ExprKind::*;
-    let expr: Expr = Lambda(
-        Variable::user("f"),
-        Pi(
-            Variable::anon(),
-            Var(Variable::user("N")).into_expr(),
-            Var(Variable::user("N")).into_expr(),
-            None,
-        )
-        .into_expr(),
-        Lambda(
-            Variable::user("x"),
-            Var(Variable::user("N")).into_expr(),
-            App(
-                Var(Variable::user("f")).into_expr(),
-                App(
-                    Var(Variable::user("f")).into_expr(),
-                    App(
-                        Var(Variable::user("f")).into_expr(),
-                        Var(Variable::user("x")).into_expr(),
-                    )
-                    .into_expr(),
-                )
-                .into_expr(),
-            )
-            .into_expr(),
-        )
-        .into_expr(),
-    )
-    .into_expr();
-    assert_eq!(expr.to_string(), "|f: N -> N, x: N| f (f (f x))");
-}

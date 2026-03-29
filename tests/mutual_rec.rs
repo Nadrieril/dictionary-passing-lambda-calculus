@@ -1,7 +1,5 @@
 use dictionary_passing_lambda_calculus::*;
 
-use ExprKind::*;
-
 fn p(s: &str) -> Expr {
     parse(s).unwrap()
 }
@@ -9,7 +7,7 @@ fn p(s: &str) -> Expr {
 #[test]
 fn test_mutual_rec_types() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.normalize(&p(r"
         let rec EvenList: Type = { val: N, next: OddList }
         and OddList: Type = { val: N, next: EvenList }
@@ -20,7 +18,7 @@ fn test_mutual_rec_types() {
 #[test]
 fn test_mutual_rec_three_types() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.normalize(&p(r"
         let rec A: Type = { b: B, val: N }
         and B: Type = { c: C, val: N }
@@ -32,7 +30,7 @@ fn test_mutual_rec_three_types() {
 #[test]
 fn test_mutual_rec_function_sugar() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.normalize(&p(r"
         let rec Foo(n: N) -> Type = { val: N, link: Bar n }
         and Bar(n: N) -> Type = { val: N, link: Foo n }
@@ -43,7 +41,7 @@ fn test_mutual_rec_function_sugar() {
 #[test]
 fn test_mutual_rec_self_type() {
     let mut ctx = EvalContext::default();
-    ctx.add_uninterpreted("N", Type(0).into_expr());
+    ctx.add_uninterpreted("N", p("Type"));
     ctx.add_uninterpreted("z", p("N"));
     let result = ctx.normalize(&p(r"
         let rec my_a: self.my_b = { val = z }
