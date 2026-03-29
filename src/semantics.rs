@@ -357,7 +357,7 @@ impl ProgressGraph {
         self.next.insert(mention.ctor_path, mention.dtor_path);
     }
 
-    fn check_progress(&self) {
+    fn check_progress(&self, span: &Span) {
         // Progress means that all the subplaces (i.e. repeated destructor applications) of our
         // coinductive value can be reduced to whnf. In the graph we computed which subplaces
         // depend on which other ones.
@@ -456,22 +456,22 @@ impl ProgressGraph {
                 };
 
                 if !seen.insert(next) {
-                    panic!(
+                    span.error(&format!(
                         "failed to prove progress of {var}: \
                         `{}` depends on itself",
                         next.display_on(var)
-                    );
+                    ));
                 }
 
                 if let Some(next_trunc) = next.truncate(mu)
                     && current.len() <= next.len()
                 {
                     if !increasing_path.insert(next_trunc) {
-                        panic!(
+                        span.error(&format!(
                             "failed to prove progress of {var}: \
                             {} leads to a diverging cycle",
                             current.display_on(var)
-                        );
+                        ));
                     }
                 } else {
                     increasing_path.clear();
@@ -617,7 +617,7 @@ impl EvalContext {
     pub fn typecheck(&mut self, e: &Expr) -> Expr {
         self.step("typechecking");
         // Typecheck and annotate all subexpressions. Also keep the binding used, if any.
-        let (annotated_e, last_binding) = {
+        let (e, last_binding) = {
             struct TypeChecker<'a> {
                 ctx: &'a mut EvalContext,
                 // Little bit of a hack to get a hold of the last binding used, which may contain some
@@ -691,13 +691,13 @@ impl EvalContext {
             (e, type_checker_ctx.last_binding)
         };
 
-        let ty = match annotated_e.kind() {
+        let ty = match e.kind() {
             Var(x) => {
                 let binding = self
                     .lookup_binding(*x)
-                    .expect(&format!("Failed to find variable {x}!"))
+                    .unwrap_or_else(|| e.error(&format!("Failed to find variable `{x}`")))
                     .clone();
-                return Var(*x).with_ty(binding.ty);
+                return e.with_ty(binding.ty);
             }
             // `Expr::ty` already returns `Type(k+1)` for the type of this expression.
             Type(_) => return e.clone(),
@@ -750,7 +750,7 @@ impl EvalContext {
             }
             App(f, arg) => {
                 let Pi(x, s, t, _) = self.whnf_unfold(&f.ty()).kind().clone() else {
-                    panic!("Function expected.")
+                    f.error("Function expected")
                 };
                 self.assert_equal(&s, &arg.ty());
                 t.subst1(x, &arg)
@@ -772,10 +772,10 @@ impl EvalContext {
                         let StructTy(self_var, field_tys) =
                             self.whnf_unfold(&ty_ann).kind().clone()
                         else {
-                            panic!("Struct type expected for `make`")
+                            ty_ann.error("Struct type expected for `make`")
                         };
                         let expected = StructTy(self_var.refresh(), field_tys).into_expr();
-                        let expected = expected.subst1(self_var, &annotated_e);
+                        let expected = expected.subst1(self_var, &e);
                         self.assert_equal(&expected, &actual);
                     }
                     ty_ann.clone()
@@ -786,11 +786,13 @@ impl EvalContext {
             Field(e, name) => {
                 let te = self.whnf_unfold(&e.ty());
                 let StructTy(self_var, fields) = te.kind().clone() else {
-                    panic!("Struct type expected for field access, got `{te}`")
+                    e.error(&format!(
+                        "Struct type expected for field access, got `{te}`"
+                    ))
                 };
                 let field_ty = fields
                     .get(name)
-                    .unwrap_or_else(|| panic!("Field {name} not found"))
+                    .unwrap_or_else(|| e.error(&format!("Field `{name}` not found")))
                     .clone();
                 field_ty.subst1(self_var, &e)
             }
@@ -806,10 +808,10 @@ impl EvalContext {
             Refl(a) => Eq(a.clone(), a.clone()).into_expr(),
             Transport(eq, f) => {
                 let Eq(a, b) = self.whnf_unfold(&eq.ty()).kind().clone() else {
-                    panic!("Equality type expected for transport")
+                    eq.error("Equality type expected for transport")
                 };
                 let Pi(..) = self.whnf_unfold(&f.ty()).kind() else {
-                    panic!("Function expected for transport's second argument")
+                    f.error("Function expected for transport's second argument")
                 };
                 let transport_ty = Pi(
                     Variable::anon(),
@@ -826,7 +828,7 @@ impl EvalContext {
         // Recursively check the type is well-formed.
         let ty = self.typecheck_inner(SubExprLocation::TypeAnnot(TypeAnnotLocation::TypeOf), &ty);
         let ty = self.whnf(&ty);
-        let e = annotated_e.kind().clone().with_ty(ty);
+        let e = e.with_ty(ty);
 
         // Progress-check starting from the top-level expression.
         if self.path.is_empty() {
@@ -847,7 +849,7 @@ impl EvalContext {
             Var(x) => {
                 let binding = self
                     .lookup_binding(*x)
-                    .expect(&format!("Failed to find variable {x}!"))
+                    .unwrap_or_else(|| e.error(&format!("Failed to find variable `{x}`")))
                     .clone();
                 match binding.kind {
                     BindingKind::Normal(v) => {
@@ -881,12 +883,12 @@ impl EvalContext {
                                 }
                                 Err((ctor_path, pe)) => {
                                     // Some paths are of a shape we can't handle; error.
-                                    panic!(
+                                    e.error(&format!(
                                         "failed to prove progress of {x}: \
                                         recursive mention found under a {pe:?}\n  \
-                                        location: {}\npath: {subpath:?}",
+                                        location: {}",
                                         ctor_path.display_on(*x),
-                                    );
+                                    ));
                                 }
                             }
                         }
@@ -929,7 +931,7 @@ impl EvalContext {
 
                     let graph = self.ctx.progress_graphs.remove(&var).unwrap();
                     eprintln!("dependency graph for {var}:\n{graph}");
-                    graph.check_progress();
+                    graph.check_progress(e.span());
                 } else {
                     self.ctx.progress_check_inner(l, e)
                 }
@@ -1002,7 +1004,7 @@ impl EvalContext {
                 Struct(_, fields) => {
                     let val = fields
                         .get(name)
-                        .unwrap_or_else(|| panic!("Field {name} not found"))
+                        .unwrap_or_else(|| e.error(&format!("Field `{name}` not found")))
                         .clone();
                     self.whnf_inner(&val, unfold_nominal)
                 }
@@ -1025,7 +1027,7 @@ impl EvalContext {
                     _ => Transport(self.whnf_inner(eq, unfold_nominal), f.clone()).into_expr(),
                 }
             }
-            Todo(t) => panic!("tried to normalize `todo {t}`"),
+            Todo(t) => e.error(&format!("tried to normalize `todo {t}`")),
             _ => e.clone(),
         }
     }
@@ -1065,12 +1067,9 @@ impl EvalContext {
 
     pub fn assert_equal(&mut self, e1: &Expr, e2: &Expr) {
         if !self.equal(e1, e2) {
-            panic!(
-                "\nassertion `left == right` failed\n  \
-                 left: {e1}\n \
-                 right: {e2}\npath: {:?}",
-                self.path
-            );
+            e1.span().or(e2.span()).error(&format!(
+                "assertion `left == right` failed\n  left: {e1}\n  right: {e2}"
+            ));
         }
     }
     pub fn equal(&mut self, e1: &Expr, e2: &Expr) -> bool {

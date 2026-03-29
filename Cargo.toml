@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+annotate-snippets = "0.12.13"
 enum-as-inner = "0.7.0"
 fallible-iterator = "0.3.0"
 indexmap = "2.13.0"

@@ -34,6 +34,23 @@ impl Span {
     pub fn is_dummy(&self) -> bool {
         self.start == 0 && self.end == 0
     }
+    pub fn or<'a>(&'a self, other: &'a Self) -> &'a Self {
+        if self.is_dummy() { other } else { self }
+    }
+
+    /// Display a formatted error message with source context, then panic.
+    pub fn error(&self, msg: &str) -> ! {
+        use annotate_snippets::{AnnotationKind, Level, Renderer, Snippet};
+        if !self.is_dummy() {
+            let report = &[Level::ERROR.primary_title(msg).element(
+                Snippet::source(&*self.source)
+                    .line_start(1)
+                    .annotation(AnnotationKind::Primary.span(self.start..self.end)),
+            )];
+            eprintln!("{}", Renderer::styled().render(report));
+        }
+        panic!("{msg}");
+    }
 }
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy, Debug)]
@@ -140,10 +157,29 @@ impl Expr {
         }))
     }
 
+    /// Attach a type to this expression.
+    pub fn with_ty(self, ty: Expr) -> Expr {
+        Expr(Arc::new(ExprContents {
+            kind: self.kind().clone(),
+            ty: Some(ty),
+            span: self.span().clone(),
+        }))
+    }
+    pub fn without_ty(&self) -> Expr {
+        if self.opt_ty().is_some() {
+            Expr(Arc::new(ExprContents {
+                kind: self.kind().clone(),
+                ty: None,
+                span: self.span().clone(),
+            }))
+        } else {
+            self.clone()
+        }
+    }
     /// Attach a source span to this expression.
     pub fn with_span(self, span: Span) -> Expr {
         Expr(Arc::new(ExprContents {
-            kind: self.0.kind.clone(),
+            kind: self.kind().clone(),
             ty: self.0.ty.clone(),
             span,
         }))
@@ -161,7 +197,12 @@ impl Expr {
     }
     pub fn unwrap_universe(&self) -> usize {
         self.as_type()
-            .unwrap_or_else(|| panic!("Type expected, got {self}."))
+            .unwrap_or_else(|| self.error(&format!("Type expected, got `{self}`")))
+    }
+
+    /// Display a formatted error message with source context, then panic.
+    pub fn error(&self, msg: &str) -> ! {
+        self.span().error(msg)
     }
 
     pub fn opt_ty(&self) -> Option<Expr> {
@@ -173,19 +214,8 @@ impl Expr {
         }
     }
     pub fn ty(&self) -> Expr {
-        self.opt_ty().expect("type annotation missing")
-    }
-
-    pub fn without_ty(&self) -> Expr {
-        if self.opt_ty().is_some() {
-            Expr(Arc::new(ExprContents {
-                kind: self.kind().clone(),
-                ty: None,
-                span: self.span().clone(),
-            }))
-        } else {
-            self.clone()
-        }
+        self.opt_ty()
+            .unwrap_or_else(|| self.error("type annotation missing"))
     }
 
     /// Apply a transformation to all direct subexpressions of this expression.
@@ -311,9 +341,5 @@ impl ExprKind {
 
     pub fn into_expr(self) -> Expr {
         Expr::new(self, None)
-    }
-
-    pub fn with_ty(self, ty: Expr) -> Expr {
-        Expr::new(self, Some(ty))
     }
 }

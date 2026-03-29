@@ -293,7 +293,7 @@ fn test_reject_field_on_non_struct() {
 }
 
 #[test]
-#[should_panic(expected = "Field b not found")]
+#[should_panic(expected = "Field `b` not found")]
 fn test_reject_missing_field() {
     let mut ctx = EvalContext::default();
     ctx.add_uninterpreted("N", Type(0).into_expr());
