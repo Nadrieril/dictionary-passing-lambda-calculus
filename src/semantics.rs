@@ -886,9 +886,15 @@ impl EvalContext {
                                 }
                                 Err((ctor_path, pe)) => {
                                     // Some paths are of a shape we can't handle; error.
+                                    let location = match pe {
+                                        SubExprLocation::AppArg(None) => {
+                                            format!("an unknown function application")
+                                        }
+                                        _ => format!("a {pe:?}"),
+                                    };
                                     e.error(&format!(
                                         "failed to prove progress of {x}: \
-                                        recursive mention found under a {pe:?}\n  \
+                                        recursive mention found under {location}\n  \
                                         location: {}",
                                         ctor_path.display_on(*x),
                                     ));

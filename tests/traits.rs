@@ -358,7 +358,7 @@ fn binder_in_scope_of_its_type() {
 }
 
 #[test]
-#[should_panic(expected = "AppArg(None)")]
+#[should_panic(expected = "unknown function application")]
 fn diverging_assoc_item_bound() {
     // From https://github.com/rust-lang/rust/issues/135011#issuecomment-2590368611
     let mut ctx = EvalContext::default();
@@ -410,7 +410,7 @@ fn diverging_assoc_item_bound() {
 }
 
 #[test]
-// #[should_panic(expected = "AppArg(None)")]
+// #[should_panic(expected = "unknown function application")]
 fn self_typing() {
     // From https://gist.github.com/lcnr/a002fd4c3ad2400c8717a82f3d45ab89#relevant-code-snippets
     let mut ctx = EvalContext::default();
@@ -488,6 +488,41 @@ fn self_typing() {
             let self_trait = WeirdImpl(a, a_apply) in
             ImplTrait(a, a_apply, self_trait, a_apply.output(Thing(a), self_trait).out_trait)
         in
+
+        {=}
+    "));
+}
+
+#[test]
+#[should_panic(expected = "unknown function application")]
+fn cycle_outside_of_eq() {
+    let mut ctx = EvalContext::default();
+    ctx.add_uninterpreted("Unit", p("Type"));
+    ctx.add_uninterpreted("u32", p("Type"));
+    ctx.add_uninterpreted("i32", p("Type"));
+    ctx.typecheck(&p(r"
+        // trait Trait {
+        //     type Assoc;
+        // }
+        let Trait(Self: Type) = {
+            assoc: Type,
+        } in
+
+        // impl Trait for i32 {
+        //     type Assoc = <u32 as Trait>::Assoc;
+        // }
+        let rec i32Impl: Trait i32 = {
+            assoc = u32Impl(i32Impl, refl Unit).assoc
+        }
+        // impl Trait for u32
+        // where
+        //     i32: Trait<Assoc = ()>,
+        // {
+        //     type Assoc = ();
+        // }
+        and u32Impl(i32_trait: Trait(i32), eq: i32_trait.assoc == Unit) -> Trait u32 = {
+            assoc = Unit,
+        } in
 
         {=}
     "));

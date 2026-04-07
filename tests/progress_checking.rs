@@ -26,7 +26,7 @@ fn magic_good() {
 }
 
 #[test]
-#[should_panic(expected = "AppArg(None)")]
+#[should_panic(expected = "unknown function application")]
 fn magic_crazy() {
     let mut ctx = EvalContext::default();
     ctx.normalize(&p(r"
