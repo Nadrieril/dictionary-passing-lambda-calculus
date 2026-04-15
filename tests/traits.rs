@@ -493,6 +493,54 @@ fn self_typing() {
     "));
 }
 
+// #[test]
+// // #[should_panic(expected = "unknown function application")]
+// fn unused_rec_where_clause() {
+//     // From https://gist.github.com/lcnr/a002fd4c3ad2400c8717a82f3d45ab89#relevant-code-snippets
+//     let mut ctx = EvalContext::default();
+//     ctx.add_uninterpreted("u32", p("Type"));
+//     ctx.add_uninterpreted("i32", p("Type"));
+//     ctx.add_uninterpreted("Bound", p("Type -> Type"));
+//     ctx.add_uninterpreted("BoundImpl", p("Bound u32"));
+//     ctx.typecheck(&p(r"
+//         let Unit = {} in
+
+//         // trait Trait {
+//         //     type IsU32;
+//         // }
+//         let Trait(Self: Type) = {
+//             is_u32: Type,
+//         } in
+
+//         // trait Foo {
+//         //     type Assoc<T: Bound>;
+//         // }
+//         let Foo(Self: Type) = {
+//             assoc: fn(t: Type, t_bound: Bound t) -> Type,
+//         } in
+
+//         // impl Foo for i32 {
+//         //     type Assoc<T: Bound> = i32;
+//         // }
+//         let FooImpl = make (Foo i32) {
+//             assoc = |t: Type, t_bound: Bound t| i32,
+//         } in
+
+//         // impl<T: Foo> Trait for T
+//         // where
+//         //     <T as Foo>::Assoc<<T as Trait>::IsU32>: Bound
+//         // {
+//         //     // Safety: ok because of the crazy where bound
+//         //     type IsU32 = u32;
+//         // }
+//         let rec TraitImpl(t: Type, t_foo: Foo t, assoc_bound: Bound(t_foo.assoc(TraitImpl(t_type, t_foo, assoc_bound).is_u32, BoundImpl))) = {
+//             is_u32 = u32,
+//         } in
+
+//         {=}
+//     "));
+// }
+
 #[test]
 #[should_panic(expected = "unknown function application")]
 fn cycle_outside_of_eq() {
@@ -523,6 +571,51 @@ fn cycle_outside_of_eq() {
         and u32Impl(i32_trait: Trait(i32), eq: i32_trait.assoc == Unit) -> Trait u32 = {
             assoc = Unit,
         } in
+
+        {=}
+    "));
+}
+
+#[test]
+#[should_panic(expected = "Failed to find variable `clause`")]
+fn clause_justifies_itself() {
+    let mut ctx = EvalContext::default();
+    // struct Vec;
+    ctx.add_uninterpreted("Vec", p("Type"));
+    ctx.typecheck(&p(r"
+        // trait Iterator {}
+        let Iterator(t: Type) = {
+            item_ty: Type,
+        } in
+
+        // trait IntoIterator {
+        //     type IntoIter: Iterator;
+        // }
+        let IntoIterator(t: Type) = {
+            into_iter_ty: Type,
+            iterator_bound: Iterator self.into_iter_ty,
+        } in
+
+        // impl<T: Iterator> IntoIterator for T {
+        //     type IntoIter = T;
+        // }
+        let IntoIteratorImpl(t: Type, t_iter: Iterator t) -> IntoIterator t =
+            make (IntoIterator t) {
+                into_iter_ty = t,
+                iterator_bound = t_iter,
+            }
+        in
+
+        // fn test()
+        // where
+        //     <Vec as IntoIterator>::IntoIter: Iterator,
+        // {
+        // }
+        let test(clause: Iterator ((IntoIteratorImpl(Vec, clause)).into_iter_ty)) = {} in
+
+        let rec Impl: Iterator ((IntoIteratorImpl(Vec, Impl)).into_iter_ty)
+            = (IntoIteratorImpl(Vec, Impl)).iterator_bound
+        in
 
         {=}
     "));
