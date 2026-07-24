@@ -620,3 +620,156 @@ fn clause_justifies_itself() {
         {=}
     "));
 }
+
+#[test]
+fn idk() {
+    let mut ctx = EvalContext::default();
+    ctx.add_uninterpreted("Unit", p("Type"));
+    ctx.typecheck(&p(r"
+        // trait TypeIs<T> {
+        //     type Is;
+        // }
+        // impl<_Self, T> TypeIs<T> for _Self {
+        //     type Is = T;
+        // }
+        //
+        // trait TyEq: TyEqImpl {
+        //     type ProofDef: TypeIs<Self::RHS, Is = Self::LHS>;
+        // }
+        //
+        // trait TyEqImpl: TyEqImplPrf<()> {
+        //     type ProofValue;
+        //     type ProofIsProofValue: TyEq<LHS = Self::Proof, RHS = Self::ProofValue>;
+        // }
+        //
+        // trait TyEqImplPrf<_D> {
+        //     type LHS;
+        //     type RHS;
+        //     type Proof: TyEq<LHS = Self::LHS, RHS = Self::RHS>;
+        // }
+        //
+        // trait DeriveEqFromImpl {}
+        // impl<P: TyEqImpl + DeriveEqFromImpl> TyEq for P {
+        //     type ProofDef = <P::Proof as TyEq>::ProofDef;
+        // }
+        //
+        // struct Refl<T>(T);
+        // impl<_D, T> TyEqImplPrf<_D> for Refl<T> {
+        //     type LHS = T;
+        //     type RHS = T;
+        //     type Proof = Refl<T>;
+        // }
+        // impl<T> TyEqImpl for Refl<T> {
+        //     type ProofValue = Refl<T>;
+        //     type ProofIsProofValue = Refl<Refl<T>>;
+        // }
+        // impl<T> TyEq for Refl<T> {
+        //     type ProofDef = ();
+        // }
+        //
+        // struct FakeRefl<L, R>(L, R);
+        // impl<L, R> DeriveEqFromImpl for FakeRefl<L, R> {}
+        // impl<_D, L, R> TyEqImplPrf<_D> for FakeRefl<L, R> {
+        //     type LHS = L;
+        //     type RHS = R;
+        //     type Proof = FakeRefl<L, R>;
+        // }
+        // impl<L, R> TyEqImpl for FakeRefl<L, R> {
+        //     type ProofValue = FakeRefl<L, R>;
+        //     type ProofIsProofValue = Refl<FakeRefl<L, R>>;
+        // }
+        //
+        // struct RewriteReflRight<P, PR>(P, PR);
+        // impl<P, PR> DeriveEqFromImpl for RewriteReflRight<P, PR> {}
+        // impl<_D, P, PR, L, R> TyEqImplPrf<_D> for RewriteReflRight<P, PR>
+        // where
+        //     P: TyEq<LHS = L, RHS = L>,
+        //     PR: TyEq<LHS = L, RHS = R>,
+        //     _D: RewriteReflRightHelper3<P, L, R, PR>,
+        // {
+        //     type LHS = L;
+        //     type RHS = R;
+        //     type Proof = _D::RewriteRight;
+        // }
+        // impl<P, PR, L, R> TyEqImpl for RewriteReflRight<P, PR>
+        // where
+        //     P: TyEq<LHS = L, RHS = L>,
+        //     PR: TyEq<LHS = L, RHS = R>,
+        // {
+        //     type ProofValue = P;
+        //     type ProofIsProofValue = Refl<P>;
+        // }
+        //
+        // trait RewriteReflRightHelper3<P, L, R, PR>
+        // where
+        //     P: TyEq<LHS = L, RHS = L>,
+        //     PR: TyEq<LHS = L, RHS = R>,
+        // {
+        //     type RewriteRight: TyEq<LHS = L, RHS = R>;
+        // }
+        //
+        // impl<_Dummy, P, L, R, PR> RewriteReflRightHelper3<P, L, R, PR> for _Dummy
+        // where
+        //     P: TyEq<LHS = L, RHS = L>,
+        //     PR: TyEq<LHS = L, RHS = R>,
+        //     _Dummy: RewriteReflRightHelper2<P, L, R, PR>,
+        // {
+        //     type RewriteRight = <_Dummy::Helper as RewriteReflRightHelper<P, L, R, PR::ProofDef>>::RewriteRight;
+        // }
+        //
+        // trait RewriteReflRightHelper2<P, L, R, PR>
+        // where
+        //     P: TyEq<LHS = L, RHS = L>,
+        //     PR: TyEq<LHS = L, RHS = R>,
+        // {
+        //     type Helper: RewriteReflRightHelper<P, L, R, PR::ProofDef>;
+        // }
+        //
+        // impl<_Dummy, P, L, R, PR> RewriteReflRightHelper2<P, L, R, PR> for _Dummy
+        // where
+        //     P: TyEq<LHS = L, RHS = L>,
+        //     PR: TyEq<LHS = L, RHS = R>,
+        // {
+        //     type Helper = _Dummy;
+        // }
+        //
+        // trait RewriteReflRightHelper<P, L, R, Rw>
+        // where
+        //     P: TyEq<LHS = L, RHS = <Rw as TypeIs<R>>::Is>,
+        // {
+        //     type RewriteRight: TyEq<LHS = L, RHS = R>;
+        // }
+        //
+        // impl<_Dummy, P, L, R, Rw> RewriteReflRightHelper<P, L, R, Rw> for _Dummy
+        // where
+        //     P: TyEq<LHS = L, RHS = <Rw as TypeIs<R>>::Is>,
+        // {
+        //     type RewriteRight = P;
+        // }
+        //
+        // fn transmute<L, R>(x: L) -> R {
+        //     transmute_inner_1::<L, R, RewriteReflRight<Refl<L>, FakeRefl<L, R>>>(x)
+        // }
+        //
+        // fn transmute_inner_1<L, R, P: TyEq<LHS = L, RHS = R>>(x: L) -> R {
+        //     transmute_inner_2::<<P::ProofIsProofValue as TyEq>::ProofDef, L, R, P::ProofValue, P>(x)
+        // }
+        //
+        // fn transmute_inner_2<Rw, L, R, Actual, P: TyEq<LHS = L, RHS = R, ProofValue = Actual>>(x: L) -> R
+        // where
+        //     <Rw as TypeIs<P::ProofValue>>::Is: TyEq<LHS = L, RHS = R>,
+        // {
+        //     transmute_inner_3::<L, R, Actual>(x)
+        // }
+        //
+        // fn transmute_inner_3<L, R, P: TyEq<LHS = L, RHS = R>>(x: L) -> R {
+        //     transmute_inner_4::<R, P::ProofDef>(x)
+        // }
+        //
+        // fn transmute_inner_4<R, Rw>(x: <Rw as TypeIs<R>>::Is) -> R {
+        //     x
+        // }
+
+        {=}
+    "));
+}
